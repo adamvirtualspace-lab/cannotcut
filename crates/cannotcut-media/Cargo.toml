@@ -1,5 +1,5 @@
 [package]
-name = "cantcut-media"
+name = "cannotcut-media"
 version.workspace = true
 edition.workspace = true
 

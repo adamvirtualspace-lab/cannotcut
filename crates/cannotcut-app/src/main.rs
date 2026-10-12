@@ -1,4 +1,4 @@
-//! cantcut: a timeline of clips, a viewer showing the frame under the playhead, and live latency
+//! cannotcut: a timeline of clips, a viewer showing the frame under the playhead, and live latency
 //! and memory readouts.
 
 mod timeline_panel;
@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cantcut_media::{ClipInfo, Event, Options, Output, Pixels, Scrubber};
-use cantcut_timeline::{Edit, History, Media as TimelineMedia, NewClip, Placement, Rate, Timeline};
+use cannotcut_media::{ClipInfo, Event, Options, Output, Pixels, Scrubber};
+use cannotcut_timeline::{Edit, History, Media as TimelineMedia, NewClip, Placement, Rate, Timeline};
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
 use iced::widget::{button, center, column, container, image, row, sensor, shader, stack, text};
@@ -42,7 +42,7 @@ const EMPTY_PROJECT_RATE: Rate = Rate::new(30, 1);
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
-        .title("cantcut")
+        .title("cannotcut")
         .subscription(App::subscription)
         .theme(Theme::Dark)
         // Maximized, as an editor wants every pixel; the size is what "restore" goes back to,

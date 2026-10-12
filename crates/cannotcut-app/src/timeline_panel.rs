@@ -1,7 +1,7 @@
 //! The timeline as the user sees it: a ruler, a lane per track with its clips, and the playhead.
 //! Clicking or dragging anywhere moves the playhead; the wheel scrolls, and zooms with Ctrl.
 
-use cantcut_timeline::{Item, Rate, Timeline, TrackKind};
+use cannotcut_timeline::{Item, Rate, Timeline, TrackKind};
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer, text};
 use iced::advanced::{Renderer as _, text::Renderer as _};

@@ -1,11 +1,11 @@
-//! Loads a timeline, prints what cantcut understood of it, and optionally saves it again. For
+//! Loads a timeline, prints what cannotcut understood of it, and optionally saves it again. For
 //! checking files against other OpenTimelineIO tools.
 //!
-//! Usage: `cargo run -p cantcut-timeline --example otio_resave -- <in.otio> [<out.otio>]`
+//! Usage: `cargo run -p cannotcut-timeline --example otio_resave -- <in.otio> [<out.otio>]`
 
 use std::path::PathBuf;
 
-use cantcut_timeline::{Item, Timeline};
+use cannotcut_timeline::{Item, Timeline};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1).map(PathBuf::from);

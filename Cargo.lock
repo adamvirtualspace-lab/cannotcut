@@ -423,11 +423,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "cantcut-app"
+name = "cannotcut-app"
 version = "0.1.0"
 dependencies = [
- "cantcut-media",
- "cantcut-timeline",
+ "cannotcut-media",
+ "cannotcut-timeline",
  "iced",
  "iced_runtime",
  "memory-stats",
@@ -435,7 +435,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cantcut-media"
+name = "cannotcut-media"
 version = "0.1.0"
 dependencies = [
  "ffmpeg-next",
@@ -443,7 +443,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cantcut-timeline"
+name = "cannotcut-timeline"
 version = "0.1.0"
 dependencies = [
  "serde_json",

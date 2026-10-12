@@ -1,6 +1,6 @@
 //! Reading and writing timelines as OpenTimelineIO JSON.
 //!
-//! The file is the standard format, so other tools can open it. What cantcut cannot edit yet
+//! The file is the standard format, so other tools can open it. What cannotcut cannot edit yet
 //! (transitions, nested compositions, generated media) is refused by name when reading, instead
 //! of being dropped quietly. Metadata, effects and markers it does not understand are carried
 //! through unchanged.
@@ -16,8 +16,8 @@ use crate::model::{
     Clip, Extras, FrameRange, Item, Media, Rate, Timeline, Track, TrackKind, new_id,
 };
 
-/// The metadata key under which cantcut keeps what the format has no field for.
-const OWN_METADATA: &str = "cantcut";
+/// The metadata key under which cannotcut keeps what the format has no field for.
+const OWN_METADATA: &str = "cannotcut";
 /// The name OpenTimelineIO gives a clip's media reference when there is only one.
 const DEFAULT_MEDIA: &str = "DEFAULT_MEDIA";
 /// The rate of a timeline whose file gives no hint of one.
@@ -197,7 +197,7 @@ fn read_track(track: &Object, rate: Rate, next_id: &mut u64) -> Result<Track, Er
     let kind = match text_of(track, "kind").as_str() {
         "Video" | "" => TrackKind::Video,
         "Audio" => TrackKind::Audio,
-        other => return Err(Error(format!("cantcut has no {other} tracks yet"))),
+        other => return Err(Error(format!("cannotcut has no {other} tracks yet"))),
     };
     let mut items = Vec::new();
     for child in children(track) {
@@ -412,7 +412,7 @@ fn extras(object: &Object) -> Extras {
 fn refuse_source_range(object: &Object, what: &str) -> Result<(), Error> {
     match object.get("source_range") {
         Some(range) if !range.is_null() => Err(Error(format!(
-            "{what} is trimmed as a whole, which cantcut cannot open yet"
+            "{what} is trimmed as a whole, which cannotcut cannot open yet"
         ))),
         _ => Ok(()),
     }
@@ -420,7 +420,7 @@ fn refuse_source_range(object: &Object, what: &str) -> Result<(), Error> {
 
 fn unsupported(schema: &str, place: &str) -> Error {
     Error(format!(
-        "the project has a {schema} {place}, which cantcut cannot open yet"
+        "the project has a {schema} {place}, which cannotcut cannot open yet"
     ))
 }
 
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn projects_are_saved_to_disk_and_loaded_back() {
-        let path = std::env::temp_dir().join(format!("cantcut-test-{}.otio", std::process::id()));
+        let path = std::env::temp_dir().join(format!("cannotcut-test-{}.otio", std::process::id()));
         let timeline = Timeline::from_otio(FOREIGN).unwrap();
         timeline.save(&path).unwrap();
         // Saving over an existing project replaces it.

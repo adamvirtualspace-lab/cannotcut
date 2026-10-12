@@ -1,5 +1,5 @@
 [package]
-name = "cantcut-timeline"
+name = "cannotcut-timeline"
 version.workspace = true
 edition.workspace = true
 

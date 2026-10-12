@@ -76,7 +76,7 @@ pub struct FrameRange {
     pub duration: i64,
 }
 
-/// The parts of an OpenTimelineIO object cantcut does not interpret. They are kept, so a file
+/// The parts of an OpenTimelineIO object cannotcut does not interpret. They are kept, so a file
 /// from another tool does not lose them by passing through.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Extras {

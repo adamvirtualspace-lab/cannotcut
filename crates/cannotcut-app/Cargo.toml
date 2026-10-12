@@ -1,15 +1,15 @@
 [package]
-name = "cantcut-app"
+name = "cannotcut-app"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "cantcut"
+name = "cannotcut"
 path = "src/main.rs"
 
 [dependencies]
-cantcut-media.workspace = true
-cantcut-timeline.workspace = true
+cannotcut-media.workspace = true
+cannotcut-timeline.workspace = true
 iced.workspace = true
 # iced only re-exports image allocation together with its image codecs, which we don't need.
 iced_runtime.workspace = true

@@ -1,4 +1,4 @@
-//! The timeline cantcut edits, and its file format.
+//! The timeline cannotcut edits, and its file format.
 //!
 //! A [`Timeline`] is a stack of tracks; a track is a row of clips and gaps, measured in whole
 //! frames at the timeline's rate. It only changes through [`Edit`]s, and a [`History`] of them

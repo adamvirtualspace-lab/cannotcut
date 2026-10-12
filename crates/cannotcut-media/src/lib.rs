@@ -1,4 +1,4 @@
-//! Media access for cantcut: opening clips and decoding pictures for interactive scrubbing.
+//! Media access for cannotcut: opening clips and decoding pictures for interactive scrubbing.
 //!
 //! Scrubbing works straight from the source file, without proxies. A [`Scrubber`] owns a decode
 //! thread that always chases the most recent request: after a seek it first shows the keyframe it
@@ -253,7 +253,7 @@ impl Scrubber {
     ) -> Result<Self, Error> {
         let mailbox = Arc::new(Mailbox::default());
         thread::Builder::new()
-            .name("cantcut-scrub".to_string())
+            .name("cannotcut-scrub".to_string())
             .spawn({
                 let mailbox = mailbox.clone();
                 let path = path.to_path_buf();

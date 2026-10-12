@@ -1,7 +1,7 @@
 //! Headless scrubbing benchmark: measures how quickly pictures arrive for the playhead moves an
 //! editor makes (random jumps, a fast drag, single-frame steps).
 //!
-//! Usage: `cargo run -p cantcut-media --example scrub_bench -- <clip> [--software] [--yuv]
+//! Usage: `cargo run -p cannotcut-media --example scrub_bench -- <clip> [--software] [--yuv]
 //! [--fit=<width>x<height>] [--verbose]`
 //!
 //! `--yuv` asks for pictures the way the GPU viewer takes them, without the conversion to RGB.
@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cantcut_media::{Event, Options, Output, Picture, Scrubber};
+use cannotcut_media::{Event, Options, Output, Picture, Scrubber};
 
 const RANDOM_JUMPS: usize = 40;
 const STEPS_FORWARD: u64 = 60;

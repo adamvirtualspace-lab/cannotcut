@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cantcut_media::{Colors, Matrix};
+use cannotcut_media::{Colors, Matrix};
 use iced::advanced::widget::Tree;
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
 use iced::widget::shader::{self, Viewport};
@@ -128,7 +128,7 @@ impl shader::Pipeline for Pipeline {
             count: None,
         };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("cantcut viewer"),
+            label: Some("cannotcut viewer"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -151,16 +151,16 @@ impl shader::Pipeline for Pipeline {
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cantcut viewer"),
+            label: Some("cannotcut viewer"),
             source: wgpu::ShaderSource::Wgsl(include_str!("viewer.wgsl").into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cantcut viewer"),
+            label: Some("cannotcut viewer"),
             bind_group_layouts: &[&layout],
             push_constant_ranges: &[],
         });
         let render = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("cantcut viewer"),
+            label: Some("cannotcut viewer"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &module,
@@ -188,13 +188,13 @@ impl shader::Pipeline for Pipeline {
             cache: None,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("cantcut viewer"),
+            label: Some("cannotcut viewer"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cantcut viewer"),
+            label: Some("cannotcut viewer"),
             size: UNIFORM_BYTES as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -222,7 +222,7 @@ impl Pipeline {
                 texture.create_view(&wgpu::TextureViewDescriptor::default())
             };
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cantcut viewer"),
+                label: Some("cannotcut viewer"),
                 layout: &self.layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -280,7 +280,7 @@ fn plane_texture(
     (width, height): (u32, u32),
 ) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("cantcut viewer plane"),
+        label: Some("cannotcut viewer plane"),
         size: wgpu::Extent3d {
             width,
             height,
