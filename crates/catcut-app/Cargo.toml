@@ -1,0 +1,16 @@
+[package]
+name = "catcut-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "catcut"
+path = "src/main.rs"
+
+[dependencies]
+catcut-media.workspace = true
+iced.workspace = true
+# iced only re-exports image allocation together with its image codecs, which we don't need.
+iced_runtime.workspace = true
+memory-stats.workspace = true
+rfd.workspace = true

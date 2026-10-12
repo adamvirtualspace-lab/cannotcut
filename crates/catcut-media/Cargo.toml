@@ -1,0 +1,10 @@
+[package]
+name = "catcut-media"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ffmpeg-next.workspace = true
+
+[dev-dependencies]
+memory-stats.workspace = true
