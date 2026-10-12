@@ -423,10 +423,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "catcut-app"
+name = "cantcut-app"
 version = "0.1.0"
 dependencies = [
- "catcut-media",
+ "cantcut-media",
  "iced",
  "iced_runtime",
  "memory-stats",
@@ -434,7 +434,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "catcut-media"
+name = "cantcut-media"
 version = "0.1.0"
 dependencies = [
  "ffmpeg-next",

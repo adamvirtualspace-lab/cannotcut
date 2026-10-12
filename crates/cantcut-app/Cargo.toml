@@ -1,14 +1,14 @@
 [package]
-name = "catcut-app"
+name = "cantcut-app"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "catcut"
+name = "cantcut"
 path = "src/main.rs"
 
 [dependencies]
-catcut-media.workspace = true
+cantcut-media.workspace = true
 iced.workspace = true
 # iced only re-exports image allocation together with its image codecs, which we don't need.
 iced_runtime.workspace = true

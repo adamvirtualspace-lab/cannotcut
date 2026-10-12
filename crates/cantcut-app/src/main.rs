@@ -1,9 +1,9 @@
-//! catcut scrubbing spike: one clip, a viewer, a scrub bar, and live latency and memory readouts.
+//! cantcut scrubbing spike: one clip, a viewer, a scrub bar, and live latency and memory readouts.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use catcut_media::{ClipInfo, Event, Options, Ratio, Scrubber};
+use cantcut_media::{ClipInfo, Event, Options, Ratio, Scrubber};
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
 use iced::widget::{button, center, column, container, image, row, slider, space, text};
@@ -16,7 +16,7 @@ const BYTES_PER_MB: usize = 1024 * 1024;
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
-        .title("catcut")
+        .title("cantcut")
         .subscription(App::subscription)
         .theme(Theme::Dark)
         .window_size((1280.0, 820.0))

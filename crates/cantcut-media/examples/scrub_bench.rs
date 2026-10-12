@@ -1,7 +1,7 @@
 //! Headless scrubbing benchmark: measures how quickly pictures arrive for the playhead moves an
 //! editor makes (random jumps, a fast drag, single-frame steps).
 //!
-//! Usage: `cargo run -p catcut-media --example scrub_bench -- <clip> [--software] [--verbose]`
+//! Usage: `cargo run -p cantcut-media --example scrub_bench -- <clip> [--software] [--verbose]`
 //!
 //! `--sweep` replaces the timing runs with a frame-accuracy check of every frame in the clip.
 
@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use catcut_media::{Event, Options, Picture, Scrubber};
+use cantcut_media::{Event, Options, Picture, Scrubber};
 
 const RANDOM_JUMPS: usize = 40;
 const STEPS_FORWARD: u64 = 60;

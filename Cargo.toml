@@ -1,13 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/catcut-media", "crates/catcut-app"]
+members = ["crates/cantcut-media", "crates/cantcut-app"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-catcut-media = { path = "crates/catcut-media" }
+cantcut-media = { path = "crates/cantcut-media" }
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-scaling"] }
 iced = { version = "0.14.0", features = ["image-without-codecs", "tokio"] }
 iced_runtime = "0.14.0"
