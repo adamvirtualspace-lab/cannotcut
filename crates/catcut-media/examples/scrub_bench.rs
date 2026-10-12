@@ -15,6 +15,8 @@ use catcut_media::{Event, Options, Picture, Scrubber};
 const RANDOM_JUMPS: usize = 40;
 const STEPS_FORWARD: u64 = 60;
 const STEPS_BACKWARD: u64 = 30;
+const STEPS_AFTER_REST: u64 = 100;
+const REST: Duration = Duration::from_millis(1000);
 const DRAG_DURATION: Duration = Duration::from_secs(4);
 /// Roughly one pointer event per display refresh.
 const DRAG_INTERVAL: Duration = Duration::from_millis(16);
@@ -135,6 +137,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nsingle-frame steps");
     println!("  forward  ({STEPS_FORWARD})   {}", summary(&mut forward));
     println!("  backward ({STEPS_BACKWARD})   {}", summary(&mut backward));
+
+    // Backward from a frame reached by a jump, after resting on it: nothing behind it has been
+    // shown yet, so this is what the look-behind is for. Going on past what it prepared shows
+    // the cost of refilling while stepping.
+    let rest_frame = info.frame_count / 3;
+    jump(&mut scrubber, rest_frame)?;
+    thread::sleep(REST);
+    let (mut rested, mut from_cache) = (Vec::new(), 0u64);
+    for step in 1..=STEPS_AFTER_REST.min(rest_frame) {
+        let result = jump(&mut scrubber, rest_frame - step)?;
+        rested.push(result.picture.timing.latency);
+        from_cache += u64::from(result.picture.timing.cached);
+    }
+    println!(
+        "  backward after a {} ms rest ({})   {}",
+        REST.as_millis(),
+        rested.len(),
+        summary(&mut rested)
+    );
+    println!("    {from_cache} of {} came from the cache", rested.len());
 
     // A fast drag across the whole clip without waiting for pictures.
     let drag_started = Instant::now();

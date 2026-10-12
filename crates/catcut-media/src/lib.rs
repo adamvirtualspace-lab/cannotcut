@@ -12,7 +12,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use session::Session;
+use session::{Converted, Session};
+
+/// How many frames behind the playhead are decoded ahead of need, for stepping backwards.
+const LOOKBEHIND_FRAMES: u64 = 48;
+/// A request at most this many frames behind the previous one counts as stepping backwards.
+const STEP_BACK_REACH: u64 = 8;
+/// How long the playhead must rest before the frames behind it are decoded.
+const SETTLE_TIME: Duration = Duration::from_millis(150);
 
 #[derive(Debug)]
 pub struct Error(String);
@@ -43,6 +50,8 @@ pub struct Options {
     pub hardware: bool,
     /// Pictures are scaled down to fit inside this size; they are never scaled up.
     pub max_preview: (u32, u32),
+    /// Memory for pictures of frames near the playhead, which makes revisiting them instant.
+    pub cache_bytes: usize,
 }
 
 impl Default for Options {
@@ -50,6 +59,7 @@ impl Default for Options {
         Self {
             hardware: true,
             max_preview: (1280, 720),
+            cache_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -91,6 +101,8 @@ pub struct Timing {
     pub convert: Duration,
     pub seeked: bool,
     pub frames_decoded: u32,
+    /// The picture was already in the cache; nothing was decoded for it.
+    pub cached: bool,
     pub hardware: bool,
 }
 
@@ -148,9 +160,37 @@ impl Mailbox {
         }
     }
 
+    /// Blocks until a request arrives or `quiet` passes without one.
+    fn wait_for(&self, quiet: Duration) -> Waited {
+        let deadline = Instant::now() + quiet;
+        let mut slot = self.slot.lock().expect("mailbox lock poisoned");
+        loop {
+            if slot.closed {
+                return Waited::Closed;
+            }
+            if let Some(request) = slot.pending.take() {
+                return Waited::Request(request);
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Waited::Quiet;
+            };
+            slot = self
+                .arrived
+                .wait_timeout(slot, remaining)
+                .expect("mailbox lock poisoned")
+                .0;
+        }
+    }
+
     fn is_closed(&self) -> bool {
         self.slot.lock().expect("mailbox lock poisoned").closed
     }
+}
+
+enum Waited {
+    Request(Request),
+    Quiet,
+    Closed,
 }
 
 pub struct Scrubber {
@@ -177,12 +217,7 @@ impl Scrubber {
                 move || match Session::open(&path, options) {
                     Ok(session) => {
                         sink(Event::Opened(session.info().clone()));
-                        Worker {
-                            session,
-                            mailbox,
-                            sink: Box::new(sink),
-                        }
-                        .run();
+                        Worker::new(session, mailbox, Box::new(sink)).run();
                     }
                     Err(error) => sink(Event::Failed(error.to_string())),
                 }
@@ -219,30 +254,125 @@ enum Served {
     Superseded(Request),
 }
 
+/// What it took to produce a picture.
+#[derive(Clone, Copy, Default)]
+struct Work {
+    seeked: bool,
+    frames_decoded: u32,
+    cached: bool,
+}
+
 struct Worker {
     session: Session,
     mailbox: Arc<Mailbox>,
     sink: Box<dyn FnMut(Event) + Send>,
+    /// Frame of the request served before the current one.
+    previous: Option<u64>,
+    /// Where the playhead came to rest: the timestamp whose exact frame was last delivered.
+    rested_at: Option<i64>,
 }
 
 impl Worker {
+    fn new(session: Session, mailbox: Arc<Mailbox>, sink: Box<dyn FnMut(Event) + Send>) -> Self {
+        Self {
+            session,
+            mailbox,
+            sink,
+            previous: None,
+            rested_at: None,
+        }
+    }
+
     fn run(mut self) {
-        while let Some(mut request) = self.mailbox.wait() {
-            loop {
-                match self.serve(&request) {
-                    Ok(Served::Done) => break,
-                    Ok(Served::Superseded(next)) => request = next,
-                    Err(error) => {
-                        (self.sink)(Event::Failed(error.to_string()));
-                        break;
-                    }
+        let mut next = None;
+        loop {
+            let request = match next.take() {
+                Some(request) => request,
+                None => match self.mailbox.wait() {
+                    Some(request) => request,
+                    None => return,
+                },
+            };
+            match self.serve(&request) {
+                Ok(Served::Superseded(newer)) => {
+                    next = Some(newer);
+                    continue;
                 }
+                Ok(Served::Done) => {}
+                Err(error) => {
+                    (self.sink)(Event::Failed(error.to_string()));
+                    continue;
+                }
+            }
+            // Looking behind moves the decoder, which would slow down a drag that is still going
+            // on, so it waits until the playhead has been still for a moment.
+            match self.mailbox.wait_for(SETTLE_TIME) {
+                Waited::Request(request) => next = Some(request),
+                Waited::Closed => return,
+                Waited::Quiet => match self.look_behind() {
+                    Ok(interrupted_by) => next = interrupted_by,
+                    Err(error) => (self.sink)(Event::Failed(error.to_string())),
+                },
+            }
+        }
+    }
+
+    /// Decodes the frames just behind the resting playhead into the cache, so that stepping
+    /// backwards from here is instant. Returns the request that interrupted it, if any.
+    fn look_behind(&mut self) -> Result<Option<Request>, Error> {
+        let Some(start) = self
+            .rested_at
+            .and_then(|rested_at| self.session.remembered_start(rested_at))
+        else {
+            return Ok(None);
+        };
+        let before = start - 1;
+        if before < self.session.start() || self.session.remembers(before) {
+            return Ok(None);
+        }
+        let keep_from = self.session.frames_before(start, LOOKBEHIND_FRAMES);
+        if !self.session.seek(before)? {
+            return Ok(None);
+        }
+        loop {
+            if self.session.position().is_some_and(|pts| pts >= keep_from) {
+                self.session.remember()?;
+            }
+            if self.session.reached(before) || self.mailbox.is_closed() {
+                return Ok(None);
+            }
+            if let Some(request) = self.mailbox.take() {
+                return Ok(Some(request));
+            }
+            if !self.session.advance()? {
+                return Ok(None);
             }
         }
     }
 
     fn serve(&mut self, request: &Request) -> Result<Served, Error> {
         let target = self.session.frame_to_pts(request.frame);
+        let stepping_back = self.previous.is_some_and(|previous| {
+            request.frame < previous && previous - request.frame <= STEP_BACK_REACH
+        });
+        self.previous = Some(request.frame);
+        self.rested_at = None;
+        self.session.set_focus(target);
+
+        let started = Instant::now();
+        if let Some(converted) = self.session.recall(target)? {
+            let work = Work {
+                cached: true,
+                ..Work::default()
+            };
+            self.send(request, converted, true, started.elapsed(), work);
+            self.rested_at = Some(target);
+            return Ok(Served::Done);
+        }
+
+        // When stepping backwards, the frames just before the target are the ones asked for next,
+        // and they pass through the decoder on the way to it: keep them.
+        let keep_from = stepping_back.then(|| self.session.frames_before(target, LOOKBEHIND_FRAMES));
         let mut seeked = false;
         let mut decoded = 0;
         if !self.session.shows(target) {
@@ -270,9 +400,18 @@ impl Worker {
                 if self.session.reached(target) {
                     break;
                 }
+                let work = Work {
+                    seeked,
+                    frames_decoded: decoded,
+                    cached: false,
+                };
                 if preview_owed {
-                    self.deliver(request, false, seeked, decoded)?;
+                    self.deliver(request, false, work)?;
                     preview_owed = false;
+                } else if keep_from
+                    .is_some_and(|from| self.session.position().is_some_and(|pts| pts >= from))
+                {
+                    self.session.remember()?;
                 }
                 if let Some(next) = self.mailbox.take() {
                     return Ok(Served::Superseded(next));
@@ -282,19 +421,32 @@ impl Worker {
                 }
             }
         }
-        self.deliver(request, true, seeked, decoded)?;
+        let work = Work {
+            seeked,
+            frames_decoded: decoded,
+            cached: false,
+        };
+        self.deliver(request, true, work)?;
+        self.rested_at = Some(target);
         Ok(Served::Done)
     }
 
-    fn deliver(
-        &mut self,
-        request: &Request,
-        exact: bool,
-        seeked: bool,
-        frames_decoded: u32,
-    ) -> Result<(), Error> {
+    /// Converts the decoder's current frame and hands it to the sink.
+    fn deliver(&mut self, request: &Request, exact: bool, work: Work) -> Result<(), Error> {
         let started = Instant::now();
         let converted = self.session.picture()?;
+        self.send(request, converted, exact, started.elapsed(), work);
+        Ok(())
+    }
+
+    fn send(
+        &mut self,
+        request: &Request,
+        converted: Converted,
+        exact: bool,
+        convert: Duration,
+        work: Work,
+    ) {
         (self.sink)(Event::Picture(Picture {
             request: request.id,
             requested_frame: request.frame,
@@ -305,12 +457,12 @@ impl Worker {
             rgba: converted.rgba,
             timing: Timing {
                 latency: request.at.elapsed(),
-                convert: started.elapsed(),
-                seeked,
-                frames_decoded,
+                convert,
+                seeked: work.seeked,
+                frames_decoded: work.frames_decoded,
+                cached: work.cached,
                 hardware: converted.hardware,
             },
         }));
-        Ok(())
     }
 }
