@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 cantcut-media.workspace = true
+cantcut-timeline.workspace = true
 iced.workspace = true
 # iced only re-exports image allocation together with its image codecs, which we don't need.
 iced_runtime.workspace = true

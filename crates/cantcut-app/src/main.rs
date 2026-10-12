@@ -1,24 +1,31 @@
-//! cantcut scrubbing spike: one clip, a viewer, a scrub bar, and live latency and memory readouts.
+//! cantcut: a timeline of clips, a viewer showing the frame under the playhead, and live latency
+//! and memory readouts.
 
+mod timeline_panel;
 mod viewer;
 
-use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cantcut_media::{ClipInfo, Event, Options, Output, Pixels, Ratio, Scrubber};
+use cantcut_media::{ClipInfo, Event, Options, Output, Pixels, Scrubber};
+use cantcut_timeline::{Edit, History, Media as TimelineMedia, NewClip, Placement, Rate, Timeline};
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
-use iced::widget::{
-    button, center, column, container, image, row, sensor, shader, slider, stack, text,
-};
+use iced::widget::{button, center, column, container, image, row, sensor, shader, stack, text};
 use iced::{
     Center, Color, ContentFit, Element, Fill, Size, Subscription, Task, Theme, time, window,
 };
 use iced_runtime::image::{Allocation, allocate};
+use timeline_panel::{View, timecode_base, timeline_panel};
 use viewer::{YuvPicture, renderer_probe};
 
 /// Keeps the viewer off the shader path, to try the fallback on a machine with a working GPU.
 const CPU_VIEWER_FLAG: &str = "--cpu-viewer";
+/// Starts with the playhead on a frame, to look at a spot without touching the mouse.
+const PLAYHEAD_FLAG: &str = "--at=";
+const PROJECT_EXTENSION: &str = "otio";
 const MEMORY_REFRESH: Duration = Duration::from_secs(1);
 /// How long the viewer's size has to hold still before pictures are made for it. While a window
 /// edge is being dragged the picture on screen is stretched instead, which costs nothing.
@@ -26,20 +33,33 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 const RESIZE_POLL: Duration = Duration::from_millis(50);
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm", "m4v", "avi", "ts"];
 const BYTES_PER_MB: usize = 1024 * 1024;
+/// Media files kept open at once. Each holds a decoder and its cached pictures, so going back
+/// and forth across a cut stays quick without every file of the project staying in memory.
+const MAX_OPEN_SOURCES: usize = 3;
+const SOURCE_CACHE_BYTES: usize = 96 * BYTES_PER_MB;
+/// The rate of a project until its first clip sets it.
+const EMPTY_PROJECT_RATE: Rate = Rate::new(30, 1);
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
         .title("cantcut")
         .subscription(App::subscription)
         .theme(Theme::Dark)
-        .window_size((1280.0, 820.0))
+        // Maximized, as an editor wants every pixel; the size is what "restore" goes back to,
+        // and fits a laptop screen.
+        .window(window::Settings {
+            size: Size::new(1280.0, 720.0),
+            maximized: true,
+            min_size: Some(Size::new(640.0, 480.0)),
+            ..window::Settings::default()
+        })
         .run()
 }
 
 #[derive(Clone)]
 enum Message {
-    OpenRequested,
-    FileChosen(Option<PathBuf>),
+    AddRequested,
+    FilesChosen(Vec<PathBuf>),
     /// Whether the window is drawn on the GPU, which decides the viewer's path.
     RendererProbed(bool),
     /// The viewer's area was laid out at this size, in logical pixels.
@@ -47,7 +67,7 @@ enum Message {
     /// Physical pixels per logical pixel in the window.
     Rescaled(f32),
     ResizeTick,
-    /// An event from the decode thread of the clip with this generation.
+    /// An event from the decode thread of the source with this generation.
     Media(u64, Media),
     /// A picture finished uploading to the GPU (or failed to) and can be shown.
     Uploaded {
@@ -56,8 +76,11 @@ enum Message {
         picture: PictureInfo,
         allocation: Option<Allocation>,
     },
-    Scrubbed(u32),
+    /// The playhead was put on this timeline frame.
+    Scrubbed(i64),
     Stepped(i64),
+    /// The timeline panel was zoomed or scrolled; None shows everything.
+    TimelineViewed(Option<View>),
     Key(keyboard::Event),
     MemoryTick,
 }
@@ -152,9 +175,27 @@ impl From<Event> for Media {
     }
 }
 
-#[derive(Default)]
 struct App {
-    clip: Option<Clip>,
+    history: History,
+    /// Where the project file is; relative media paths start from here.
+    project_folder: Option<PathBuf>,
+    /// The timeline frame the viewer shows.
+    playhead: i64,
+    /// The media files that are open, the one used longest ago first.
+    sources: Vec<Source>,
+    /// Counts opened sources, so events from one that was since closed can be told apart.
+    generation: u64,
+    /// Files waiting to go on the timeline, in the order they were chosen.
+    adding: VecDeque<PathBuf>,
+    /// The source being opened for the first file in `adding`.
+    opening: Option<u64>,
+    /// The source of the clip under the playhead; pictures from any other are out of date.
+    active: Option<u64>,
+    pending: Option<Pending>,
+    /// Pictures accepted from decoders so far; gives each one its place in line.
+    arrivals: u64,
+    shown: Option<Shown>,
+    latency: Latency,
     /// Unknown until the window's renderer has been probed; chosen once.
     viewer: Option<ViewerPath>,
     /// The viewer's area in logical pixels, as last laid out.
@@ -162,32 +203,41 @@ struct App {
     scale_factor: Option<f32>,
     /// When the viewer last changed while the pictures have not followed yet.
     resized_at: Option<Instant>,
-    /// What the decoder is asked for; unknown until the viewer's path and size both are.
+    /// What decoders are asked for; unknown until the viewer's path and size both are.
     form: Option<Form>,
-    /// Counts opened clips so events from a clip that was since replaced can be told apart.
-    generation: u64,
+    /// The part of the timeline its panel shows; None shows all of it.
+    timeline_view: Option<View>,
     notice: Option<String>,
     memory_mb: Option<usize>,
 }
 
-struct Clip {
+/// An open media file: a decode thread that makes pictures of its frames.
+struct Source {
     generation: u64,
+    /// The file's location as the clips on the timeline give it.
+    target: String,
     name: String,
     scrubber: Scrubber,
     /// Unknown until the decode thread has opened the file.
     info: Option<ClipInfo>,
-    playhead: u64,
     /// The form last asked of the decoder.
     form: Option<Form>,
-    pending: Option<Pending>,
-    /// Pictures received from the decoder so far; gives each one its place in line.
-    arrivals: u64,
-    shown: Option<Shown>,
-    latency: Latency,
+}
+
+impl Source {
+    fn request(&mut self, frame: u64, form: Form) -> u64 {
+        if self.form != Some(form) {
+            self.form = Some(form);
+            self.scrubber.set_output(form.output);
+            self.scrubber.set_max_preview(form.max_size);
+        }
+        self.scrubber.request(frame)
+    }
 }
 
 /// The newest request, kept to time how long its pictures take to reach the UI.
 struct Pending {
+    generation: u64,
     request: u64,
     at: Instant,
     seen: bool,
@@ -215,57 +265,213 @@ struct Latency {
 
 impl App {
     fn boot() -> (Self, Task<Message>) {
-        let mut app = Self::default();
-        let mut path = None;
+        let mut app = Self {
+            history: History::new(Timeline::new("Untitled", EMPTY_PROJECT_RATE)),
+            project_folder: None,
+            playhead: 0,
+            sources: Vec::new(),
+            generation: 0,
+            adding: VecDeque::new(),
+            opening: None,
+            active: None,
+            pending: None,
+            arrivals: 0,
+            shown: None,
+            latency: Latency::default(),
+            viewer: None,
+            viewer_area: None,
+            scale_factor: None,
+            resized_at: None,
+            form: None,
+            timeline_view: None,
+            notice: None,
+            memory_mb: None,
+        };
         for argument in std::env::args_os().skip(1) {
-            if argument == CPU_VIEWER_FLAG {
+            let path = PathBuf::from(&argument);
+            let text = argument.to_string_lossy();
+            if text == CPU_VIEWER_FLAG {
                 app.viewer = Some(ViewerPath::Cpu);
+            } else if let Some(frame) = text.strip_prefix(PLAYHEAD_FLAG) {
+                app.playhead = frame.parse().unwrap_or(0);
+            } else if path.extension().is_some_and(|extension| extension == PROJECT_EXTENSION) {
+                app.open_project(&path);
             } else {
-                path = Some(PathBuf::from(argument));
+                app.adding.push_back(path);
             }
         }
-        let task = match path {
-            Some(path) => app.open(path),
-            None => Task::none(),
-        };
+        let task = app.add_next();
         (app, task)
     }
 
-    fn open(&mut self, path: PathBuf) -> Task<Message> {
-        self.generation += 1;
-        let generation = self.generation;
-        let (sender, events) = mpsc::unbounded();
-        let opened = Scrubber::open(&path, Options::default(), move |event| {
-            let _ = sender.unbounded_send(event);
-        });
-        match opened {
-            Ok(scrubber) => {
-                let mut clip = Clip {
+    fn open_project(&mut self, path: &Path) {
+        match Timeline::load(path) {
+            Ok(timeline) => {
+                self.history = History::new(timeline);
+                self.project_folder = path.parent().map(Path::to_path_buf);
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    /// Starts on the next file waiting to go on the timeline. Its length has to be known first,
+    /// which takes opening it; files go on one at a time so they keep the order they were
+    /// chosen in.
+    fn add_next(&mut self) -> Task<Message> {
+        if self.opening.is_some() {
+            return Task::none();
+        }
+        while let Some(path) = self.adding.front().cloned() {
+            let target = TimelineMedia::target_for(&path);
+            let (index, task) = match self.source(&target, &path) {
+                Ok(found) => found,
+                Err(error) => {
+                    self.notice = Some(error);
+                    self.adding.pop_front();
+                    continue;
+                }
+            };
+            match self.sources[index].info.clone() {
+                // Already open: a file can be on the timeline more than once.
+                Some(info) => {
+                    self.adding.pop_front();
+                    self.place_at_end(&path, &info);
+                }
+                None => {
+                    self.opening = Some(self.sources[index].generation);
+                    // What is on the timeline already does not wait for the rest.
+                    let shown = self.show_playhead();
+                    return Task::batch([task, shown]);
+                }
+            }
+        }
+        self.show_playhead()
+    }
+
+    /// Puts all of a media file on the main track, after what is there.
+    fn place_at_end(&mut self, path: &Path, info: &ClipInfo) {
+        let media_rate = Rate::new(
+            info.frame_rate.num.max(1) as u32,
+            info.frame_rate.den.max(1) as u32,
+        );
+        let media = TimelineMedia::from_path(path, media_rate, info.frame_count as i64);
+        // The first clip decides the project's frame rate.
+        let empty = |timeline: &Timeline| timeline.tracks().all(|track| track.items().is_empty());
+        if empty(self.history.timeline()) && self.history.timeline().rate() != media_rate {
+            let name = self.history.timeline().name.clone();
+            self.history = History::new(Timeline::new(name, media_rate));
+        }
+        let timeline = self.history.timeline();
+        let name = path
+            .file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Some(clip) = NewClip::whole(name, Arc::new(media), timeline.rate()) else {
+            self.notice = Some(format!("{} has no frames", path.display()));
+            return;
+        };
+        let edit = Edit::Place {
+            track: 0,
+            at: timeline.track(0).map_or(0, |track| track.duration()),
+            clip,
+            mode: Placement::Insert,
+        };
+        match self.history.apply(&edit) {
+            Ok(_) => self.notice = None,
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    /// The open source for a media file, opening it if need be. Returns its place in
+    /// `sources` and the task that brings in its events.
+    fn source(&mut self, target: &str, path: &Path) -> Result<(usize, Task<Message>), String> {
+        let mut task = Task::none();
+        match self.sources.iter().position(|source| source.target == target) {
+            Some(index) => {
+                let source = self.sources.remove(index);
+                self.sources.push(source);
+            }
+            None => {
+                self.generation += 1;
+                let generation = self.generation;
+                let (sender, events) = mpsc::unbounded();
+                let options = Options {
+                    cache_bytes: SOURCE_CACHE_BYTES,
+                    ..Options::default()
+                };
+                let scrubber = Scrubber::open(path, options, move |event| {
+                    let _ = sender.unbounded_send(event);
+                })
+                .map_err(|error| error.to_string())?;
+                self.sources.push(Source {
                     generation,
+                    target: target.to_string(),
                     name: path
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                     scrubber,
                     info: None,
-                    playhead: 0,
                     form: None,
-                    pending: None,
-                    arrivals: 0,
-                    shown: None,
-                    latency: Latency::default(),
-                };
-                // The file opens meanwhile, but the first picture waits until the viewer knows
-                // what it wants.
-                if let Some(form) = self.form {
-                    clip.set_form(form);
+                });
+                task = Task::run(events, move |event| Message::Media(generation, event.into()));
+                // Closing a source ends its decode thread and frees its pictures.
+                while self.sources.len() > MAX_OPEN_SOURCES {
+                    let idle = self.sources.iter().position(|source| {
+                        ![self.active, self.opening, Some(generation)]
+                            .contains(&Some(source.generation))
+                    });
+                    match idle {
+                        Some(index) => drop(self.sources.remove(index)),
+                        None => break,
+                    }
                 }
-                self.clip = Some(clip);
-                self.notice = None;
-                Task::run(events, move |event| Message::Media(generation, event.into()))
+            }
+        }
+        Ok((self.sources.len() - 1, task))
+    }
+
+    /// Asks for the picture of the frame under the playhead.
+    fn show_playhead(&mut self) -> Task<Message> {
+        let Some(form) = self.form else {
+            // The first picture waits until the viewer knows what it wants.
+            return Task::none();
+        };
+        let timeline = self.history.timeline();
+        let Some((clip, offset)) = timeline.picture_at(self.playhead) else {
+            // Nothing plays here: the viewer goes black.
+            self.active = None;
+            self.pending = None;
+            self.shown = None;
+            return Task::none();
+        };
+        let frame = clip.media_frame(offset, timeline.rate()).max(0) as u64;
+        let (Some(target), Some(path)) = (clip.media.target.clone(), clip.media.path()) else {
+            self.notice = Some(format!("the media of \"{}\" is missing", clip.name));
+            self.active = None;
+            self.shown = None;
+            return Task::none();
+        };
+        let path = match &self.project_folder {
+            Some(folder) if path.is_relative() => folder.join(path),
+            _ => path,
+        };
+        match self.source(&target, &path) {
+            Ok((index, task)) => {
+                let source = &mut self.sources[index];
+                self.active = Some(source.generation);
+                self.pending = Some(Pending {
+                    generation: source.generation,
+                    request: source.request(frame, form),
+                    at: Instant::now(),
+                    seen: false,
+                });
+                task
             }
             Err(error) => {
-                self.notice = Some(error.to_string());
+                self.notice = Some(error);
+                self.active = None;
+                self.shown = None;
                 Task::none()
             }
         }
@@ -273,9 +479,11 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::OpenRequested => return Task::perform(pick_clip(), Message::FileChosen),
-            Message::FileChosen(Some(path)) => return self.open(path),
-            Message::FileChosen(None) => {}
+            Message::AddRequested => return Task::perform(pick_clips(), Message::FilesChosen),
+            Message::FilesChosen(paths) => {
+                self.adding.extend(paths);
+                return self.add_next();
+            }
             Message::RendererProbed(on_gpu) => {
                 if self.viewer.is_none() {
                     self.viewer = Some(if on_gpu {
@@ -283,7 +491,7 @@ impl App {
                     } else {
                         ViewerPath::Cpu
                     });
-                    self.viewer_changed();
+                    return self.viewer_changed();
                 }
             }
             Message::ViewerResized(area) => {
@@ -293,11 +501,11 @@ impl App {
                         .and_then(window::scale_factor)
                         .map(Message::Rescaled);
                 }
-                self.viewer_changed();
+                return self.viewer_changed();
             }
             Message::Rescaled(scale_factor) => {
                 self.scale_factor = Some(scale_factor);
-                self.viewer_changed();
+                return self.viewer_changed();
             }
             Message::ResizeTick => {
                 if self
@@ -305,73 +513,61 @@ impl App {
                     .is_some_and(|at| at.elapsed() >= RESIZE_SETTLE)
                 {
                     self.resized_at = None;
-                    self.adopt_form();
+                    return self.adopt_form();
                 }
             }
-            Message::Media(generation, event) => {
-                if let Some(clip) = self.clip.as_mut().filter(|clip| clip.generation == generation)
-                {
-                    match event {
-                        Media::Opened(info) => clip.info = Some(info),
-                        Media::Picture { picture, surface } => {
-                            clip.arrivals += 1;
-                            let order = clip.arrivals;
-                            match surface {
-                                // The shader uploads the planes in the frame that first draws
-                                // them.
-                                Surface::Yuv(planes) => {
-                                    clip.show(order, picture, Displayed::Yuv(planes));
-                                }
-                                // iced uploads images in the background; swapping to a picture
-                                // before its upload finishes would flash the empty viewer.
-                                Surface::Image(handle) => {
-                                    return allocate(handle).map(move |allocation| {
-                                        Message::Uploaded {
-                                            generation,
-                                            order,
-                                            picture,
-                                            allocation: allocation.ok(),
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                        Media::Failed(error) => self.notice = Some(error),
-                    }
-                }
-            }
+            Message::Media(generation, event) => return self.media_event(generation, event),
             Message::Uploaded {
                 generation,
                 order,
                 picture,
                 allocation,
-            } => {
-                if let Some(clip) = self.clip.as_mut().filter(|clip| clip.generation == generation)
-                {
-                    match allocation {
-                        Some(allocation) => {
-                            clip.show(order, picture, Displayed::Image(allocation));
-                        }
-                        None => {
-                            self.notice = Some("could not upload a picture to the GPU".to_string());
+            } => match allocation {
+                Some(allocation) => {
+                    self.show(generation, order, picture, Displayed::Image(allocation));
+                }
+                None => self.notice = Some("could not upload a picture to the GPU".to_string()),
+            },
+            Message::Scrubbed(frame) => return self.move_playhead(frame),
+            Message::Stepped(frames) => {
+                return self.move_playhead(self.playhead.saturating_add(frames));
+            }
+            Message::TimelineViewed(view) => self.timeline_view = view,
+            Message::Key(keyboard::Event::KeyPressed {
+                key: pressed,
+                modifiers,
+                ..
+            }) => {
+                let last_frame = self.last_frame();
+                // With Shift held a letter arrives as its capital.
+                let letter = |letter: &str| {
+                    matches!(pressed.as_ref(), keyboard::Key::Character(character)
+                        if modifiers.command() && character.eq_ignore_ascii_case(letter))
+                };
+                match pressed.as_ref() {
+                    keyboard::Key::Named(key::Named::ArrowLeft) => {
+                        return self.move_playhead(self.playhead - 1);
+                    }
+                    keyboard::Key::Named(key::Named::ArrowRight) => {
+                        return self.move_playhead(self.playhead + 1);
+                    }
+                    keyboard::Key::Named(key::Named::Home) => return self.move_playhead(0),
+                    keyboard::Key::Named(key::Named::End) => {
+                        return self.move_playhead(last_frame);
+                    }
+                    _ if letter("z") && !modifiers.shift() => {
+                        if self.history.undo() {
+                            return self.timeline_changed();
                         }
                     }
+                    _ if letter("z") || letter("y") => {
+                        if self.history.redo() {
+                            return self.timeline_changed();
+                        }
+                    }
+                    _ => {}
                 }
             }
-            Message::Scrubbed(frame) => {
-                if let Some(clip) = &mut self.clip {
-                    clip.move_playhead(u64::from(frame));
-                }
-            }
-            Message::Stepped(frames) => self.step(frames),
-            Message::Key(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Named(named),
-                ..
-            }) => match named {
-                key::Named::ArrowLeft => self.step(-1),
-                key::Named::ArrowRight => self.step(1),
-                _ => {}
-            },
             Message::Key(_) => {}
             Message::MemoryTick => {
                 self.memory_mb =
@@ -381,22 +577,132 @@ impl App {
         Task::none()
     }
 
+    fn media_event(&mut self, generation: u64, event: Media) -> Task<Message> {
+        let Some(source) = self
+            .sources
+            .iter_mut()
+            .find(|source| source.generation == generation)
+        else {
+            // The source was closed since.
+            return Task::none();
+        };
+        match event {
+            Media::Opened(info) => {
+                source.info = Some(info.clone());
+                if self.opening == Some(generation) {
+                    self.opening = None;
+                    if let Some(path) = self.adding.pop_front() {
+                        self.place_at_end(&path, &info);
+                    }
+                    return self.add_next();
+                }
+            }
+            Media::Picture { picture, surface } => {
+                if self.active != Some(generation) {
+                    return Task::none();
+                }
+                self.arrivals += 1;
+                let order = self.arrivals;
+                match surface {
+                    // The shader uploads the planes in the frame that first draws them.
+                    Surface::Yuv(planes) => {
+                        self.show(generation, order, picture, Displayed::Yuv(planes));
+                    }
+                    // iced uploads images in the background; swapping to a picture before its
+                    // upload finishes would flash the empty viewer.
+                    Surface::Image(handle) => {
+                        return allocate(handle).map(move |allocation| Message::Uploaded {
+                            generation,
+                            order,
+                            picture,
+                            allocation: allocation.ok(),
+                        });
+                    }
+                }
+            }
+            Media::Failed(error) => {
+                self.notice = Some(format!("{}: {error}", source.name));
+                // A file that does not open is left off the timeline; the rest still go on.
+                if self.opening == Some(generation) {
+                    self.opening = None;
+                    self.adding.pop_front();
+                    self.sources.retain(|source| source.generation != generation);
+                    return self.add_next();
+                }
+            }
+        }
+        Task::none()
+    }
+
+    fn show(&mut self, generation: u64, order: u64, info: PictureInfo, picture: Displayed) {
+        // The playhead may have left the clip while the picture was on its way, and uploads
+        // finish independently, so an older picture can complete after a newer one.
+        if self.active != Some(generation)
+            || self.shown.as_ref().is_some_and(|shown| shown.order > order)
+        {
+            return;
+        }
+        // Pictures for requests that were since replaced are still the freshest image we have, so
+        // they are shown too; only the newest request is timed.
+        if let Some(pending) = self.pending.as_mut().filter(|pending| {
+            pending.generation == generation && pending.request == info.request
+        }) {
+            let elapsed = pending.at.elapsed();
+            if !pending.seen {
+                pending.seen = true;
+                self.latency.first_picture = Some(elapsed);
+                self.latency.exact = None;
+            }
+            if info.exact {
+                self.latency.exact = Some(elapsed);
+                self.pending = None;
+            }
+        }
+        self.shown = Some(Shown {
+            picture,
+            order,
+            exact: info.exact,
+            hardware: info.hardware,
+            size: info.size,
+        });
+    }
+
+    fn last_frame(&self) -> i64 {
+        (self.history.timeline().duration() - 1).max(0)
+    }
+
+    fn move_playhead(&mut self, frame: i64) -> Task<Message> {
+        let frame = frame.clamp(0, self.last_frame());
+        if frame == self.playhead {
+            return Task::none();
+        }
+        self.playhead = frame;
+        self.show_playhead()
+    }
+
+    /// The timeline was edited: what is under the playhead may be something else now.
+    fn timeline_changed(&mut self) -> Task<Message> {
+        self.playhead = self.playhead.clamp(0, self.last_frame());
+        self.show_playhead()
+    }
+
     /// Something the form of the pictures depends on has changed.
-    fn viewer_changed(&mut self) {
+    fn viewer_changed(&mut self) -> Task<Message> {
         if self.form.is_none() {
             // Nothing is on screen yet, so there is no drag to wait out.
-            self.adopt_form();
+            self.adopt_form()
         } else {
             self.resized_at = Some(Instant::now());
+            Task::none()
         }
     }
 
-    /// Starts asking the decoder for pictures that suit the viewer as it is now.
-    fn adopt_form(&mut self) {
+    /// Starts asking the decoders for pictures that suit the viewer as it is now.
+    fn adopt_form(&mut self) -> Task<Message> {
         let (Some(path), Some(area), Some(scale)) =
             (self.viewer, self.viewer_area, self.scale_factor)
         else {
-            return;
+            return Task::none();
         };
         let form = Form {
             output: path.output(),
@@ -405,16 +711,11 @@ impl App {
                 (area.height * scale).ceil() as u32,
             ),
         };
+        if self.form == Some(form) {
+            return Task::none();
+        }
         self.form = Some(form);
-        if let Some(clip) = &mut self.clip {
-            clip.set_form(form);
-        }
-    }
-
-    fn step(&mut self, frames: i64) {
-        if let Some(clip) = &mut self.clip {
-            clip.move_playhead(clip.playhead.saturating_add_signed(frames));
-        }
+        self.show_playhead()
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -435,42 +736,23 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let clip = self.clip.as_ref();
-        let info = clip.and_then(|clip| clip.info.as_ref());
-
-        let headline = match (&self.notice, clip, info) {
-            (Some(notice), _, _) => notice.clone(),
-            (None, Some(clip), Some(info)) => format!(
-                "{}   {} {}x{} at {} fps, {}",
-                clip.name,
-                info.codec,
-                info.width,
-                info.height,
-                frames_per_second(info.frame_rate),
-                match info.hardware {
-                    Some(name) => format!("{name} decode"),
-                    None => "software decode".to_string(),
-                }
-            ),
-            (None, Some(clip), None) => format!("Opening {}", clip.name),
-            (None, None, _) => String::new(),
-        };
+        let timeline = self.history.timeline();
         let header = row![
-            button("Open clip").on_press(Message::OpenRequested),
-            one_line(headline).width(Fill),
+            button("Add clips").on_press(Message::AddRequested),
+            one_line(self.headline()).width(Fill),
         ]
         .spacing(12)
         .align_y(Center);
 
-        let shown = clip.and_then(|clip| clip.shown.as_ref());
-        let picture: Element<'_, Message> = match shown.map(|shown| &shown.picture) {
+        let picture: Element<'_, Message> = match self.shown.as_ref().map(|shown| &shown.picture) {
             Some(Displayed::Yuv(planes)) => shader(planes).width(Fill).height(Fill).into(),
             Some(Displayed::Image(allocation)) => image(allocation.handle().clone())
                 .content_fit(ContentFit::Contain)
                 .width(Fill)
                 .height(Fill)
                 .into(),
-            None => center(text("Open a clip to start scrubbing")).into(),
+            None if timeline.duration() == 0 => center(text("Add a clip to start")).into(),
+            None => center(text("")).into(),
         };
         let viewer = container(picture)
             .width(Fill)
@@ -482,47 +764,76 @@ impl App {
             viewer = stack![viewer, renderer_probe(Message::RendererProbed)].into();
         }
 
-        let mut layout = column![header, viewer].spacing(10).padding(12);
-        if let (Some(clip), Some(info)) = (clip, info) {
-            let last_frame = info.frame_count.saturating_sub(1);
-            // The slider widget needs a type that converts to f64, hence u32 frame numbers here.
-            layout = layout.push(slider(
-                0..=u32::try_from(last_frame).unwrap_or(u32::MAX),
-                u32::try_from(clip.playhead).unwrap_or(u32::MAX),
-                Message::Scrubbed,
-            ));
-            layout = layout.push(
-                row![
-                    button("Previous frame").on_press(Message::Stepped(-1)),
-                    button("Next frame").on_press(Message::Stepped(1)),
-                    text(format!(
-                        "{}   frame {} of {}",
-                        timecode(clip.playhead, info.frame_rate),
-                        clip.playhead,
-                        last_frame
-                    ))
-                    .wrapping(text::Wrapping::None),
-                    one_line(self.readout(clip)).align_right(Fill),
-                ]
-                .spacing(12)
-                .align_y(Center),
-            );
-        }
-        layout.into()
+        let panel = timeline_panel(
+            timeline,
+            self.playhead,
+            self.timeline_view,
+            Message::Scrubbed,
+            Message::TimelineViewed,
+        );
+        let position = format!(
+            "{}   frame {} of {}",
+            timecode(self.playhead, timeline.rate()),
+            self.playhead,
+            self.last_frame()
+        );
+        let controls = row![
+            button("Previous frame").on_press(Message::Stepped(-1)),
+            button("Next frame").on_press(Message::Stepped(1)),
+            text(position).wrapping(text::Wrapping::None),
+            one_line(self.readout()).align_right(Fill),
+        ]
+        .spacing(12)
+        .align_y(Center);
+
+        column![header, viewer, panel, controls]
+            .spacing(10)
+            .padding(12)
+            .into()
     }
 
-    fn readout(&self, clip: &Clip) -> String {
+    /// The line next to the add button: what went wrong, or what the playhead is on.
+    fn headline(&self) -> String {
+        if let Some(notice) = &self.notice {
+            return notice.clone();
+        }
+        let source = self
+            .sources
+            .iter()
+            .find(|source| Some(source.generation) == self.active.or(self.opening));
+        match source {
+            Some(Source {
+                name,
+                info: Some(info),
+                ..
+            }) => format!(
+                "{name}   {} {}x{} at {} fps, {}",
+                info.codec,
+                info.width,
+                info.height,
+                (f64::from(info.frame_rate.num) / f64::from(info.frame_rate.den.max(1))).round(),
+                match info.hardware {
+                    Some(decoder) => format!("{decoder} decode"),
+                    None => "software decode".to_string(),
+                }
+            ),
+            Some(source) => format!("Opening {}", source.name),
+            None => String::new(),
+        }
+    }
+
+    fn readout(&self) -> String {
         let milliseconds = |latency: Option<Duration>| match latency {
             Some(latency) => format!("{} ms", latency.as_millis()),
             None => "...".to_string(),
         };
         let mut parts = vec![
-            format!("first picture {}", milliseconds(clip.latency.first_picture)),
-            format!("exact frame {}", milliseconds(clip.latency.exact)),
+            format!("first {}", milliseconds(self.latency.first_picture)),
+            format!("exact {}", milliseconds(self.latency.exact)),
         ];
-        if let Some(shown) = &clip.shown {
+        if let Some(shown) = &self.shown {
             if !shown.exact {
-                parts.push("showing keyframe".to_string());
+                parts.push("keyframe".to_string());
             }
             parts.push(if shown.hardware { "GPU decode" } else { "CPU decode" }.to_string());
         }
@@ -531,81 +842,18 @@ impl App {
             Some(ViewerPath::Cpu) => "CPU viewer",
             None => "viewer",
         };
-        match &clip.shown {
+        match &self.shown {
             Some(Shown {
                 size: (width, height),
                 ..
             }) => parts.push(format!("{path} {width}x{height}")),
             None => parts.push(path.to_string()),
         }
+        parts.push(format!("{} open", self.sources.len()));
         if let Some(memory_mb) = self.memory_mb {
-            parts.push(format!("memory {memory_mb} MB"));
+            parts.push(format!("{memory_mb} MB"));
         }
         parts.join("   ")
-    }
-}
-
-impl Clip {
-    fn move_playhead(&mut self, frame: u64) {
-        let last_frame = self
-            .info
-            .as_ref()
-            .map_or(u64::MAX, |info| info.frame_count.saturating_sub(1));
-        let frame = frame.min(last_frame);
-        if frame != self.playhead {
-            self.request(frame);
-        }
-    }
-
-    /// Asks the decoder for pictures in `form` from now on, starting with the current frame.
-    fn set_form(&mut self, form: Form) {
-        if self.form != Some(form) {
-            self.form = Some(form);
-            self.scrubber.set_output(form.output);
-            self.scrubber.set_max_preview(form.max_size);
-            self.request(self.playhead);
-        }
-    }
-
-    fn request(&mut self, frame: u64) {
-        self.playhead = frame;
-        self.pending = Some(Pending {
-            request: self.scrubber.request(frame),
-            at: Instant::now(),
-            seen: false,
-        });
-    }
-
-    fn show(&mut self, order: u64, info: PictureInfo, picture: Displayed) {
-        // Uploads finish independently, so an older picture can complete after a newer one.
-        if self.shown.as_ref().is_some_and(|shown| shown.order > order) {
-            return;
-        }
-        // Pictures for requests that were since replaced are still the freshest image we have, so
-        // they are shown too; only the newest request is timed.
-        if let Some(pending) = self
-            .pending
-            .as_mut()
-            .filter(|pending| pending.request == info.request)
-        {
-            let elapsed = pending.at.elapsed();
-            if !pending.seen {
-                pending.seen = true;
-                self.latency.first_picture = Some(elapsed);
-                self.latency.exact = None;
-            }
-            if info.exact {
-                self.latency.exact = Some(elapsed);
-                self.pending = None;
-            }
-        }
-        self.shown = Some(Shown {
-            picture,
-            order,
-            exact: info.exact,
-            hardware: info.hardware,
-            size: info.size,
-        });
     }
 }
 
@@ -616,30 +864,27 @@ fn one_line<'a>(content: String) -> container::Container<'a, Message> {
     container(text(content).wrapping(text::Wrapping::None)).clip(true)
 }
 
-async fn pick_clip() -> Option<PathBuf> {
+async fn pick_clips() -> Vec<PathBuf> {
     rfd::AsyncFileDialog::new()
-        .set_title("Open a video clip")
+        .set_title("Add video clips")
         .add_filter("Video", VIDEO_EXTENSIONS)
-        .pick_file()
+        .pick_files()
         .await
+        .unwrap_or_default()
+        .iter()
         .map(|file| file.path().to_path_buf())
-}
-
-/// Frame rate rounded to the nearest whole number, as used for timecode.
-fn frames_per_second(rate: Ratio) -> u64 {
-    let (num, den) = (rate.num.max(1) as u64, rate.den.max(1) as u64);
-    ((num + den / 2) / den).max(1)
+        .collect()
 }
 
 /// Non-drop-frame timecode.
-fn timecode(frame: u64, rate: Ratio) -> String {
-    let fps = frames_per_second(rate);
-    let seconds = frame / fps;
+fn timecode(frame: i64, rate: Rate) -> String {
+    let base = timecode_base(rate);
+    let seconds = frame / base;
     format!(
         "{:02}:{:02}:{:02}:{:02}",
         seconds / 3600,
         seconds / 60 % 60,
         seconds % 60,
-        frame % fps
+        frame % base
     )
 }
