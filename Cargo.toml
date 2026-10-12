@@ -9,7 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 cantcut-media = { path = "crates/cantcut-media" }
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-scaling"] }
-iced = { version = "0.14.0", features = ["image-without-codecs", "tokio"] }
+iced = { version = "0.14.0", features = ["advanced", "image-without-codecs", "tokio"] }
 iced_runtime = "0.14.0"
 memory-stats = "1"
 rfd = "0.17"

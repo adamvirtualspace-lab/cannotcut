@@ -1,16 +1,29 @@
 //! cantcut scrubbing spike: one clip, a viewer, a scrub bar, and live latency and memory readouts.
 
+mod viewer;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use cantcut_media::{ClipInfo, Event, Options, Ratio, Scrubber};
+use cantcut_media::{ClipInfo, Event, Options, Output, Pixels, Ratio, Scrubber};
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
-use iced::widget::{button, center, column, container, image, row, slider, space, text};
-use iced::{Center, Color, ContentFit, Element, Fill, Subscription, Task, Theme, time};
+use iced::widget::{
+    button, center, column, container, image, row, sensor, shader, slider, stack, text,
+};
+use iced::{
+    Center, Color, ContentFit, Element, Fill, Size, Subscription, Task, Theme, time, window,
+};
 use iced_runtime::image::{Allocation, allocate};
+use viewer::{YuvPicture, renderer_probe};
 
+/// Keeps the viewer off the shader path, to try the fallback on a machine with a working GPU.
+const CPU_VIEWER_FLAG: &str = "--cpu-viewer";
 const MEMORY_REFRESH: Duration = Duration::from_secs(1);
+/// How long the viewer's size has to hold still before pictures are made for it. While a window
+/// edge is being dragged the picture on screen is stretched instead, which costs nothing.
+const RESIZE_SETTLE: Duration = Duration::from_millis(150);
+const RESIZE_POLL: Duration = Duration::from_millis(50);
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm", "m4v", "avi", "ts"];
 const BYTES_PER_MB: usize = 1024 * 1024;
 
@@ -27,6 +40,13 @@ fn main() -> iced::Result {
 enum Message {
     OpenRequested,
     FileChosen(Option<PathBuf>),
+    /// Whether the window is drawn on the GPU, which decides the viewer's path.
+    RendererProbed(bool),
+    /// The viewer's area was laid out at this size, in logical pixels.
+    ViewerResized(Size),
+    /// Physical pixels per logical pixel in the window.
+    Rescaled(f32),
+    ResizeTick,
     /// An event from the decode thread of the clip with this generation.
     Media(u64, Media),
     /// A picture finished uploading to the GPU (or failed to) and can be shown.
@@ -49,9 +69,44 @@ enum Media {
     Opened(ClipInfo),
     Picture {
         picture: PictureInfo,
-        handle: image::Handle,
+        surface: Surface,
     },
     Failed(String),
+}
+
+/// A picture's pixels, in the form its viewer path draws.
+#[derive(Clone)]
+enum Surface {
+    /// Still has to be uploaded to the GPU before it can be shown.
+    Image(image::Handle),
+    Yuv(YuvPicture),
+}
+
+/// How pictures get from the decoder to the screen.
+#[derive(Clone, Copy)]
+enum ViewerPath {
+    /// The decoder's YUV planes are uploaded as they are and a shader converts them.
+    Shader,
+    /// Pictures are converted to RGB on the decode thread; iced's software renderer can show
+    /// those.
+    Cpu,
+}
+
+impl ViewerPath {
+    fn output(self) -> Output {
+        match self {
+            Self::Shader => Output::Yuv,
+            Self::Cpu => Output::Rgba,
+        }
+    }
+}
+
+/// What the viewer wants pictures to look like.
+#[derive(Clone, Copy, PartialEq)]
+struct Form {
+    output: Output,
+    /// The viewer's area in physical pixels; pictures are scaled down to fit inside.
+    max_size: (u32, u32),
 }
 
 #[derive(Clone, Copy)]
@@ -59,6 +114,7 @@ struct PictureInfo {
     request: u64,
     exact: bool,
     hardware: bool,
+    size: (u32, u32),
 }
 
 impl From<Event> for Media {
@@ -70,8 +126,26 @@ impl From<Event> for Media {
                     request: picture.request,
                     exact: picture.exact,
                     hardware: picture.timing.hardware,
+                    size: (picture.width, picture.height),
                 },
-                handle: image::Handle::from_rgba(picture.width, picture.height, picture.rgba),
+                surface: match picture.pixels {
+                    Pixels::Rgba(rgba) => Surface::Image(image::Handle::from_rgba(
+                        picture.width,
+                        picture.height,
+                        rgba,
+                    )),
+                    Pixels::Nv12 {
+                        luma,
+                        chroma,
+                        colors,
+                    } => Surface::Yuv(YuvPicture::new(
+                        picture.width,
+                        picture.height,
+                        luma,
+                        chroma,
+                        colors,
+                    )),
+                },
             },
             Event::Failed(error) => Self::Failed(error),
         }
@@ -81,6 +155,15 @@ impl From<Event> for Media {
 #[derive(Default)]
 struct App {
     clip: Option<Clip>,
+    /// Unknown until the window's renderer has been probed; chosen once.
+    viewer: Option<ViewerPath>,
+    /// The viewer's area in logical pixels, as last laid out.
+    viewer_area: Option<Size>,
+    scale_factor: Option<f32>,
+    /// When the viewer last changed while the pictures have not followed yet.
+    resized_at: Option<Instant>,
+    /// What the decoder is asked for; unknown until the viewer's path and size both are.
+    form: Option<Form>,
     /// Counts opened clips so events from a clip that was since replaced can be told apart.
     generation: u64,
     notice: Option<String>,
@@ -94,6 +177,8 @@ struct Clip {
     /// Unknown until the decode thread has opened the file.
     info: Option<ClipInfo>,
     playhead: u64,
+    /// The form last asked of the decoder.
+    form: Option<Form>,
     pending: Option<Pending>,
     /// Pictures received from the decoder so far; gives each one its place in line.
     arrivals: u64,
@@ -109,11 +194,17 @@ struct Pending {
 }
 
 struct Shown {
-    /// Holding the allocation keeps the picture on the GPU, so drawing it never shows a gap.
-    allocation: Allocation,
+    picture: Displayed,
     order: u64,
     exact: bool,
     hardware: bool,
+    size: (u32, u32),
+}
+
+enum Displayed {
+    /// Holding the allocation keeps the picture on the GPU, so drawing it never shows a gap.
+    Image(Allocation),
+    Yuv(YuvPicture),
 }
 
 #[derive(Default)]
@@ -125,8 +216,16 @@ struct Latency {
 impl App {
     fn boot() -> (Self, Task<Message>) {
         let mut app = Self::default();
-        let task = match std::env::args_os().nth(1) {
-            Some(path) => app.open(path.into()),
+        let mut path = None;
+        for argument in std::env::args_os().skip(1) {
+            if argument == CPU_VIEWER_FLAG {
+                app.viewer = Some(ViewerPath::Cpu);
+            } else {
+                path = Some(PathBuf::from(argument));
+            }
+        }
+        let task = match path {
+            Some(path) => app.open(path),
             None => Task::none(),
         };
         (app, task)
@@ -150,12 +249,17 @@ impl App {
                     scrubber,
                     info: None,
                     playhead: 0,
+                    form: None,
                     pending: None,
                     arrivals: 0,
                     shown: None,
                     latency: Latency::default(),
                 };
-                clip.request(0);
+                // The file opens meanwhile, but the first picture waits until the viewer knows
+                // what it wants.
+                if let Some(form) = self.form {
+                    clip.set_form(form);
+                }
                 self.clip = Some(clip);
                 self.notice = None;
                 Task::run(events, move |event| Message::Media(generation, event.into()))
@@ -172,22 +276,65 @@ impl App {
             Message::OpenRequested => return Task::perform(pick_clip(), Message::FileChosen),
             Message::FileChosen(Some(path)) => return self.open(path),
             Message::FileChosen(None) => {}
+            Message::RendererProbed(on_gpu) => {
+                if self.viewer.is_none() {
+                    self.viewer = Some(if on_gpu {
+                        ViewerPath::Shader
+                    } else {
+                        ViewerPath::Cpu
+                    });
+                    self.viewer_changed();
+                }
+            }
+            Message::ViewerResized(area) => {
+                self.viewer_area = Some(area);
+                if self.scale_factor.is_none() {
+                    return window::latest()
+                        .and_then(window::scale_factor)
+                        .map(Message::Rescaled);
+                }
+                self.viewer_changed();
+            }
+            Message::Rescaled(scale_factor) => {
+                self.scale_factor = Some(scale_factor);
+                self.viewer_changed();
+            }
+            Message::ResizeTick => {
+                if self
+                    .resized_at
+                    .is_some_and(|at| at.elapsed() >= RESIZE_SETTLE)
+                {
+                    self.resized_at = None;
+                    self.adopt_form();
+                }
+            }
             Message::Media(generation, event) => {
                 if let Some(clip) = self.clip.as_mut().filter(|clip| clip.generation == generation)
                 {
                     match event {
                         Media::Opened(info) => clip.info = Some(info),
-                        Media::Picture { picture, handle } => {
-                            // iced uploads images in the background; swapping to a picture before
-                            // its upload finishes would flash the empty viewer.
+                        Media::Picture { picture, surface } => {
                             clip.arrivals += 1;
                             let order = clip.arrivals;
-                            return allocate(handle).map(move |allocation| Message::Uploaded {
-                                generation,
-                                order,
-                                picture,
-                                allocation: allocation.ok(),
-                            });
+                            match surface {
+                                // The shader uploads the planes in the frame that first draws
+                                // them.
+                                Surface::Yuv(planes) => {
+                                    clip.show(order, picture, Displayed::Yuv(planes));
+                                }
+                                // iced uploads images in the background; swapping to a picture
+                                // before its upload finishes would flash the empty viewer.
+                                Surface::Image(handle) => {
+                                    return allocate(handle).map(move |allocation| {
+                                        Message::Uploaded {
+                                            generation,
+                                            order,
+                                            picture,
+                                            allocation: allocation.ok(),
+                                        }
+                                    });
+                                }
+                            }
                         }
                         Media::Failed(error) => self.notice = Some(error),
                     }
@@ -202,7 +349,9 @@ impl App {
                 if let Some(clip) = self.clip.as_mut().filter(|clip| clip.generation == generation)
                 {
                     match allocation {
-                        Some(allocation) => clip.show(order, picture, allocation),
+                        Some(allocation) => {
+                            clip.show(order, picture, Displayed::Image(allocation));
+                        }
                         None => {
                             self.notice = Some("could not upload a picture to the GPU".to_string());
                         }
@@ -232,6 +381,36 @@ impl App {
         Task::none()
     }
 
+    /// Something the form of the pictures depends on has changed.
+    fn viewer_changed(&mut self) {
+        if self.form.is_none() {
+            // Nothing is on screen yet, so there is no drag to wait out.
+            self.adopt_form();
+        } else {
+            self.resized_at = Some(Instant::now());
+        }
+    }
+
+    /// Starts asking the decoder for pictures that suit the viewer as it is now.
+    fn adopt_form(&mut self) {
+        let (Some(path), Some(area), Some(scale)) =
+            (self.viewer, self.viewer_area, self.scale_factor)
+        else {
+            return;
+        };
+        let form = Form {
+            output: path.output(),
+            max_size: (
+                (area.width * scale).ceil() as u32,
+                (area.height * scale).ceil() as u32,
+            ),
+        };
+        self.form = Some(form);
+        if let Some(clip) = &mut self.clip {
+            clip.set_form(form);
+        }
+    }
+
     fn step(&mut self, frames: i64) {
         if let Some(clip) = &mut self.clip {
             clip.move_playhead(clip.playhead.saturating_add_signed(frames));
@@ -239,10 +418,20 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
+        let mut subscriptions = vec![
             keyboard::listen().map(Message::Key),
             time::every(MEMORY_REFRESH).map(|_| Message::MemoryTick),
-        ])
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
+                    Some(Message::Rescaled(scale_factor))
+                }
+                _ => None,
+            }),
+        ];
+        if self.resized_at.is_some() {
+            subscriptions.push(time::every(RESIZE_POLL).map(|_| Message::ResizeTick));
+        }
+        Subscription::batch(subscriptions)
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -268,13 +457,15 @@ impl App {
         };
         let header = row![
             button("Open clip").on_press(Message::OpenRequested),
-            text(headline)
+            one_line(headline).width(Fill),
         ]
         .spacing(12)
         .align_y(Center);
 
-        let picture: Element<'_, Message> = match clip.and_then(|clip| clip.shown.as_ref()) {
-            Some(shown) => image(shown.allocation.handle().clone())
+        let shown = clip.and_then(|clip| clip.shown.as_ref());
+        let picture: Element<'_, Message> = match shown.map(|shown| &shown.picture) {
+            Some(Displayed::Yuv(planes)) => shader(planes).width(Fill).height(Fill).into(),
+            Some(Displayed::Image(allocation)) => image(allocation.handle().clone())
                 .content_fit(ContentFit::Contain)
                 .width(Fill)
                 .height(Fill)
@@ -285,6 +476,11 @@ impl App {
             .width(Fill)
             .height(Fill)
             .style(|_| container::background(Color::BLACK));
+        let mut viewer: Element<'_, Message> =
+            sensor(viewer).on_resize(Message::ViewerResized).into();
+        if self.viewer.is_none() {
+            viewer = stack![viewer, renderer_probe(Message::RendererProbed)].into();
+        }
 
         let mut layout = column![header, viewer].spacing(10).padding(12);
         if let (Some(clip), Some(info)) = (clip, info) {
@@ -304,9 +500,9 @@ impl App {
                         timecode(clip.playhead, info.frame_rate),
                         clip.playhead,
                         last_frame
-                    )),
-                    space().width(Fill),
-                    text(self.readout(clip)),
+                    ))
+                    .wrapping(text::Wrapping::None),
+                    one_line(self.readout(clip)).align_right(Fill),
                 ]
                 .spacing(12)
                 .align_y(Center),
@@ -328,7 +524,19 @@ impl App {
             if !shown.exact {
                 parts.push("showing keyframe".to_string());
             }
-            parts.push(if shown.hardware { "GPU" } else { "CPU" }.to_string());
+            parts.push(if shown.hardware { "GPU decode" } else { "CPU decode" }.to_string());
+        }
+        let path = match self.viewer {
+            Some(ViewerPath::Shader) => "shader viewer",
+            Some(ViewerPath::Cpu) => "CPU viewer",
+            None => "viewer",
+        };
+        match &clip.shown {
+            Some(Shown {
+                size: (width, height),
+                ..
+            }) => parts.push(format!("{path} {width}x{height}")),
+            None => parts.push(path.to_string()),
         }
         if let Some(memory_mb) = self.memory_mb {
             parts.push(format!("memory {memory_mb} MB"));
@@ -349,6 +557,16 @@ impl Clip {
         }
     }
 
+    /// Asks the decoder for pictures in `form` from now on, starting with the current frame.
+    fn set_form(&mut self, form: Form) {
+        if self.form != Some(form) {
+            self.form = Some(form);
+            self.scrubber.set_output(form.output);
+            self.scrubber.set_max_preview(form.max_size);
+            self.request(self.playhead);
+        }
+    }
+
     fn request(&mut self, frame: u64) {
         self.playhead = frame;
         self.pending = Some(Pending {
@@ -358,7 +576,7 @@ impl Clip {
         });
     }
 
-    fn show(&mut self, order: u64, picture: PictureInfo, allocation: Allocation) {
+    fn show(&mut self, order: u64, info: PictureInfo, picture: Displayed) {
         // Uploads finish independently, so an older picture can complete after a newer one.
         if self.shown.as_ref().is_some_and(|shown| shown.order > order) {
             return;
@@ -368,7 +586,7 @@ impl Clip {
         if let Some(pending) = self
             .pending
             .as_mut()
-            .filter(|pending| pending.request == picture.request)
+            .filter(|pending| pending.request == info.request)
         {
             let elapsed = pending.at.elapsed();
             if !pending.seen {
@@ -376,18 +594,26 @@ impl Clip {
                 self.latency.first_picture = Some(elapsed);
                 self.latency.exact = None;
             }
-            if picture.exact {
+            if info.exact {
                 self.latency.exact = Some(elapsed);
                 self.pending = None;
             }
         }
         self.shown = Some(Shown {
-            allocation,
+            picture,
             order,
-            exact: picture.exact,
-            hardware: picture.hardware,
+            exact: info.exact,
+            hardware: info.hardware,
+            size: info.size,
         });
     }
+}
+
+/// Text that is cut off instead of wrapped when it runs out of room. The rows around the viewer
+/// must keep their height whatever they say: a row that grows squeezes the viewer, and the
+/// picture with it.
+fn one_line<'a>(content: String) -> container::Container<'a, Message> {
+    container(text(content).wrapping(text::Wrapping::None)).clip(true)
 }
 
 async fn pick_clip() -> Option<PathBuf> {

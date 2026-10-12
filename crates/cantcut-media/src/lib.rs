@@ -44,11 +44,52 @@ pub struct Ratio {
     pub den: i32,
 }
 
+/// The form pictures are delivered in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Output {
+    /// Converted to RGB on the decode thread; any viewer can show it.
+    Rgba,
+    /// The planes as they are cached, for a viewer that converts on the GPU. Skips the
+    /// conversion and hands over 1.5 bytes per pixel instead of 4.
+    Yuv,
+}
+
+/// The matrix that turns a clip's YUV samples into RGB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Matrix {
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+/// How a clip's YUV samples map to RGB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Colors {
+    pub matrix: Matrix,
+    /// Samples use the whole 0 to 255 range instead of 16 to 235 (240 for chroma).
+    pub full_range: bool,
+}
+
+/// Rows are packed: no padding between them.
+pub enum Pixels {
+    Rgba(Vec<u8>),
+    /// 4:2:0 YUV: a full-size luma plane, and a plane half as wide and high holding a (Cb, Cr)
+    /// pair per sample.
+    Nv12 {
+        luma: Vec<u8>,
+        chroma: Vec<u8>,
+        colors: Colors,
+    },
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     /// Decode on the GPU when the codec and driver allow it.
     pub hardware: bool,
-    /// Pictures are scaled down to fit inside this size; they are never scaled up.
+    /// What pictures look like until [`Scrubber::set_output`] says otherwise.
+    pub output: Output,
+    /// Pictures are scaled down to fit inside this size; they are never scaled up. A viewer
+    /// that knows its size on screen sets it with [`Scrubber::set_max_preview`].
     pub max_preview: (u32, u32),
     /// Memory for pictures of frames near the playhead, which makes revisiting them instant.
     pub cache_bytes: usize,
@@ -58,6 +99,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             hardware: true,
+            output: Output::Rgba,
             max_preview: (1280, 720),
             cache_bytes: 256 * 1024 * 1024,
         }
@@ -76,8 +118,6 @@ pub struct ClipInfo {
     pub keyframe_count: usize,
     /// Name of the hardware decoder that was set up, if any.
     pub hardware: Option<&'static str>,
-    pub preview_width: u32,
-    pub preview_height: u32,
 }
 
 pub struct Picture {
@@ -90,7 +130,7 @@ pub struct Picture {
     pub exact: bool,
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub pixels: Pixels,
     pub timing: Timing,
 }
 
@@ -115,6 +155,8 @@ pub enum Event {
 struct Request {
     id: u64,
     frame: u64,
+    output: Output,
+    max_preview: (u32, u32),
     at: Instant,
 }
 
@@ -196,6 +238,8 @@ enum Waited {
 pub struct Scrubber {
     mailbox: Arc<Mailbox>,
     next_request: u64,
+    output: Output,
+    max_preview: (u32, u32),
 }
 
 impl Scrubber {
@@ -226,7 +270,20 @@ impl Scrubber {
         Ok(Self {
             mailbox,
             next_request: 0,
+            output: options.output,
+            max_preview: options.max_preview,
         })
+    }
+
+    /// Changes the form of the pictures for requests made from now on.
+    pub fn set_output(&mut self, output: Output) {
+        self.output = output;
+    }
+
+    /// Changes the size pictures are fitted inside, for requests made from now on. Pictures
+    /// cached at another size are dropped, and decoded again when asked for.
+    pub fn set_max_preview(&mut self, max: (u32, u32)) {
+        self.max_preview = max;
     }
 
     /// Asks for `frame`, replacing any request the decoder has not started on yet.
@@ -235,6 +292,8 @@ impl Scrubber {
         self.mailbox.post(Request {
             id: self.next_request,
             frame,
+            output: self.output,
+            max_preview: self.max_preview,
             at: Instant::now(),
         });
         self.next_request
@@ -357,10 +416,11 @@ impl Worker {
         });
         self.previous = Some(request.frame);
         self.rested_at = None;
+        self.session.set_max_preview(request.max_preview);
         self.session.set_focus(target);
 
         let started = Instant::now();
-        if let Some(converted) = self.session.recall(target)? {
+        if let Some(converted) = self.session.recall(target, request.output)? {
             let work = Work {
                 cached: true,
                 ..Work::default()
@@ -434,7 +494,7 @@ impl Worker {
     /// Converts the decoder's current frame and hands it to the sink.
     fn deliver(&mut self, request: &Request, exact: bool, work: Work) -> Result<(), Error> {
         let started = Instant::now();
-        let converted = self.session.picture()?;
+        let converted = self.session.picture(request.output)?;
         self.send(request, converted, exact, started.elapsed(), work);
         Ok(())
     }
@@ -454,7 +514,7 @@ impl Worker {
             exact,
             width: converted.width,
             height: converted.height,
-            rgba: converted.rgba,
+            pixels: converted.pixels,
             timing: Timing {
                 latency: request.at.elapsed(),
                 convert,

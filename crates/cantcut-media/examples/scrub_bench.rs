@@ -1,8 +1,11 @@
 //! Headless scrubbing benchmark: measures how quickly pictures arrive for the playhead moves an
 //! editor makes (random jumps, a fast drag, single-frame steps).
 //!
-//! Usage: `cargo run -p cantcut-media --example scrub_bench -- <clip> [--software] [--verbose]`
+//! Usage: `cargo run -p cantcut-media --example scrub_bench -- <clip> [--software] [--yuv]
+//! [--fit=<width>x<height>] [--verbose]`
 //!
+//! `--yuv` asks for pictures the way the GPU viewer takes them, without the conversion to RGB.
+//! `--fit` sets the viewer size the pictures are scaled down to.
 //! `--sweep` replaces the timing runs with a frame-accuracy check of every frame in the clip.
 
 use std::path::PathBuf;
@@ -10,7 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cantcut_media::{Event, Options, Picture, Scrubber};
+use cantcut_media::{Event, Options, Output, Picture, Scrubber};
 
 const RANDOM_JUMPS: usize = 40;
 const STEPS_FORWARD: u64 = 60;
@@ -29,12 +32,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for argument in std::env::args().skip(1) {
         match argument.as_str() {
             "--software" => options.hardware = false,
+            "--yuv" => options.output = Output::Yuv,
             "--verbose" => verbose = true,
             "--sweep" => sweep = true,
-            _ => path = Some(PathBuf::from(argument)),
+            _ => match argument.strip_prefix("--fit=") {
+                Some(size) => {
+                    let (width, height) = size
+                        .split_once('x')
+                        .ok_or("--fit takes <width>x<height>")?;
+                    options.max_preview = (width.parse()?, height.parse()?);
+                }
+                None => path = Some(PathBuf::from(argument)),
+            },
         }
     }
-    let path = path.ok_or("usage: scrub_bench <clip> [--software] [--verbose]")?;
+    let path = path
+        .ok_or("usage: scrub_bench <clip> [--software] [--yuv] [--fit=WxH] [--verbose] [--sweep]")?;
 
     let (sender, pictures) = mpsc::channel();
     let started = Instant::now();
@@ -58,10 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info.keyframe_count
     );
     println!(
-        "decoder   {}, preview {}x{}, opened in {} ms",
+        "decoder   {}, pictures fit inside {}x{}, opened in {} ms",
         info.hardware.unwrap_or("software"),
-        info.preview_width,
-        info.preview_height,
+        options.max_preview.0,
+        options.max_preview.1,
         started.elapsed().as_millis()
     );
 

@@ -8,7 +8,7 @@ use ffmpeg::software::scaling;
 use ffmpeg::{Packet, codec, decoder, ffi, format, frame, media, threading};
 use ffmpeg_next as ffmpeg;
 
-use crate::{ClipInfo, Error, Options, Ratio};
+use crate::{ClipInfo, Colors, Error, Matrix, Options, Output, Pixels, Ratio};
 
 const FALLBACK_FRAME_RATE: ffi::AVRational = ffi::AVRational { num: 30, den: 1 };
 const MICROSECONDS: ffi::AVRational = ffi::AVRational {
@@ -58,7 +58,7 @@ pub(crate) struct Converted {
     pub frame: u64,
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub pixels: Pixels,
     pub hardware: bool,
 }
 
@@ -85,6 +85,8 @@ pub(crate) struct Session {
     rgba_scaler: Option<scaling::Context>,
     /// Known once the first frame has been decoded.
     colors: Option<Colors>,
+    /// Size of the pictures made from now on.
+    preview_size: (u32, u32),
     cache: PictureCache,
     info: ClipInfo,
 }
@@ -137,7 +139,6 @@ impl Session {
             .map_err(|error| Error::new("open decoder", error))?;
 
         let (width, height) = (decoder.width(), decoder.height());
-        let (preview_width, preview_height) = fit_inside(width, height, options.max_preview);
         let info = ClipInfo {
             path: path.to_path_buf(),
             codec: codec.name().to_string(),
@@ -150,8 +151,6 @@ impl Session {
             frame_count,
             keyframe_count: keyframes.len(),
             hardware,
-            preview_width,
-            preview_height,
         };
         Ok(Self {
             input,
@@ -168,6 +167,7 @@ impl Session {
             preview_scaler: None,
             rgba_scaler: None,
             colors: None,
+            preview_size: fit_inside(width, height, options.max_preview),
             cache: PictureCache::new(options.cache_bytes),
             info,
         })
@@ -338,6 +338,15 @@ impl Session {
         (pts - (self.frame_to_pts(frames) - self.start_pts)).max(self.start_pts)
     }
 
+    /// Makes pictures fit inside `max` from now on. Pictures cached at another size are dropped.
+    pub(crate) fn set_max_preview(&mut self, max: (u32, u32)) {
+        let size = fit_inside(self.info.width, self.info.height, max);
+        if size != self.preview_size {
+            self.preview_size = size;
+            self.cache.clear();
+        }
+    }
+
     /// Cached pictures are dropped farthest from this timestamp first.
     pub(crate) fn set_focus(&mut self, target: i64) {
         self.cache.focus = target;
@@ -359,16 +368,20 @@ impl Session {
     }
 
     /// The picture of the frame shown at `target`, if it is in the cache.
-    pub(crate) fn recall(&mut self, target: i64) -> Result<Option<Converted>, Error> {
+    pub(crate) fn recall(
+        &mut self,
+        target: i64,
+        output: Output,
+    ) -> Result<Option<Converted>, Error> {
         let Some((pts, cached)) = self.cache.find(target) else {
             return Ok(None);
         };
-        let rgba = to_rgba(&mut self.rgba_scaler, self.colors, &cached.picture)?;
+        let pixels = to_pixels(output, &mut self.rgba_scaler, self.colors, &cached.picture)?;
         Ok(Some(Converted {
             frame: self.pts_to_frame(pts),
-            width: self.info.preview_width,
-            height: self.info.preview_height,
-            rgba,
+            width: cached.picture.width(),
+            height: cached.picture.height(),
+            pixels,
             hardware: cached.hardware,
         }))
     }
@@ -385,22 +398,23 @@ impl Session {
         Ok(())
     }
 
-    /// Converts the current frame to a preview-sized RGBA picture, and keeps it in the cache.
-    pub(crate) fn picture(&mut self) -> Result<Converted, Error> {
+    /// Turns the current frame into a preview-sized picture, and keeps it in the cache.
+    pub(crate) fn picture(&mut self, output: Output) -> Result<Converted, Error> {
         let span = self
             .current
             .ok_or_else(|| Error("no decoded frame to show".to_string()))?;
-        if let Some(converted) = self.recall(span.pts)? {
+        if let Some(converted) = self.recall(span.pts, output)? {
             return Ok(converted);
         }
         let (picture, hardware) = self.preview()?;
-        let rgba = to_rgba(&mut self.rgba_scaler, self.colors, &picture)?;
+        let pixels = to_pixels(output, &mut self.rgba_scaler, self.colors, &picture)?;
+        let (width, height) = (picture.width(), picture.height());
         self.cache.insert(span, picture, hardware);
         Ok(Converted {
             frame: self.pts_to_frame(span.pts),
-            width: self.info.preview_width,
-            height: self.info.preview_height,
-            rgba,
+            width,
+            height,
+            pixels,
             hardware,
         })
     }
@@ -429,9 +443,14 @@ impl Session {
         };
 
         let (format, width, height) = (source.format(), source.width(), source.height());
+        let (preview_width, preview_height) = self.preview_size;
         let stale = self.preview_scaler.as_ref().is_none_or(|scaler| {
-            let input = scaler.input();
-            input.format != format || input.width != width || input.height != height
+            let (input, output) = (scaler.input(), scaler.output());
+            input.format != format
+                || input.width != width
+                || input.height != height
+                || output.width != preview_width
+                || output.height != preview_height
         });
         if stale {
             let mut scaler = scaling::Context::get(
@@ -439,8 +458,8 @@ impl Session {
                 width,
                 height,
                 PREVIEW_FORMAT,
-                self.info.preview_width,
-                self.info.preview_height,
+                preview_width,
+                preview_height,
                 scaling::Flags::BILINEAR,
             )
             .map_err(|error| Error::new("set up preview scaler", error))?;
@@ -458,24 +477,16 @@ impl Session {
     }
 }
 
-/// How a clip's YUV samples map to RGB.
-#[derive(Clone, Copy)]
-struct Colors {
-    /// One of swscale's `SWS_CS_*` matrices.
-    matrix: i32,
-    full_range: bool,
-}
-
 impl Colors {
     fn of(frame: &frame::Video) -> Self {
         use ffmpeg::color::{Range, Space};
         let matrix = match frame.color_space() {
-            Space::BT709 => ffi::SWS_CS_ITU709,
-            Space::BT2020NCL | Space::BT2020CL => ffi::SWS_CS_BT2020,
-            Space::BT470BG | Space::SMPTE170M => ffi::SWS_CS_ITU601,
+            Space::BT709 => Matrix::Bt709,
+            Space::BT2020NCL | Space::BT2020CL => Matrix::Bt2020,
+            Space::BT470BG | Space::SMPTE170M => Matrix::Bt601,
             // Untagged video is BT.709 from HD upwards and BT.601 below, by convention.
-            _ if frame.height() >= HD_MIN_HEIGHT => ffi::SWS_CS_ITU709,
-            _ => ffi::SWS_CS_ITU601,
+            _ if frame.height() >= HD_MIN_HEIGHT => Matrix::Bt709,
+            _ => Matrix::Bt601,
         };
         Self {
             matrix,
@@ -485,8 +496,13 @@ impl Colors {
 
     /// Tells `scaler` how its input is encoded and whether its output is full range.
     fn apply(self, scaler: &mut scaling::Context, full_range_output: bool) {
+        let matrix = match self.matrix {
+            Matrix::Bt601 => ffi::SWS_CS_ITU601,
+            Matrix::Bt709 => ffi::SWS_CS_ITU709,
+            Matrix::Bt2020 => ffi::SWS_CS_BT2020,
+        };
         unsafe {
-            let coefficients = ffi::sws_getCoefficients(self.matrix);
+            let coefficients = ffi::sws_getCoefficients(matrix);
             // Neutral brightness, contrast and saturation, in swscale's 16.16 fixed point.
             ffi::sws_setColorspaceDetails(
                 scaler.as_mut_ptr(),
@@ -502,13 +518,52 @@ impl Colors {
     }
 }
 
+/// Puts a cached picture in the form the viewer asked for.
+fn to_pixels(
+    output: Output,
+    rgba_scaler: &mut Option<scaling::Context>,
+    colors: Option<Colors>,
+    picture: &frame::Video,
+) -> Result<Pixels, Error> {
+    match output {
+        Output::Rgba => to_rgba(rgba_scaler, colors, picture).map(Pixels::Rgba),
+        Output::Yuv => {
+            let colors =
+                colors.ok_or_else(|| Error("picture has no colour information".to_string()))?;
+            let (width, height) = (picture.width() as usize, picture.height() as usize);
+            Ok(Pixels::Nv12 {
+                luma: packed_rows(picture, 0, width, height),
+                // Half as many samples per row, two bytes each.
+                chroma: packed_rows(picture, 1, width, height / 2),
+                colors,
+            })
+        }
+    }
+}
+
+/// Copies a plane without the padding FFmpeg leaves at the end of each row.
+fn packed_rows(picture: &frame::Video, plane: usize, row_bytes: usize, rows: usize) -> Vec<u8> {
+    let stride = picture.stride(plane);
+    let data = picture.data(plane);
+    let mut packed = Vec::with_capacity(row_bytes * rows);
+    for row in 0..rows {
+        packed.extend_from_slice(&data[row * stride..row * stride + row_bytes]);
+    }
+    packed
+}
+
 fn to_rgba(
     scaler: &mut Option<scaling::Context>,
     colors: Option<Colors>,
     picture: &frame::Video,
 ) -> Result<Vec<u8>, Error> {
     let (width, height) = (picture.width(), picture.height());
-    if scaler.is_none() {
+    // Pictures change size when the viewer does.
+    let stale = scaler.as_ref().is_none_or(|scaler| {
+        let input = scaler.input();
+        input.width != width || input.height != height
+    });
+    if stale {
         let mut created = scaling::Context::get(
             picture.format(),
             width,
@@ -516,7 +571,10 @@ fn to_rgba(
             Pixel::RGBA,
             width,
             height,
-            scaling::Flags::BILINEAR,
+            // Without accurate rounding swscale's quick tables come out almost two levels dark.
+            scaling::Flags::BILINEAR
+                | scaling::Flags::ACCURATE_RND
+                | scaling::Flags::FULL_CHR_H_INT,
         )
         .map_err(|error| Error::new("set up RGB conversion", error))?;
         if let Some(colors) = colors {
@@ -531,14 +589,7 @@ fn to_rgba(
         .run(picture, &mut converted)
         .map_err(|error| Error::new("convert picture to RGB", error))?;
 
-    let stride = converted.stride(0);
-    let row = width as usize * 4;
-    let data = converted.data(0);
-    let mut rgba = Vec::with_capacity(row * height as usize);
-    for line in 0..height as usize {
-        rgba.extend_from_slice(&data[line * stride..line * stride + row]);
-    }
-    Ok(rgba)
+    Ok(packed_rows(&converted, 0, width as usize * 4, height as usize))
 }
 
 struct Cached {
@@ -572,6 +623,11 @@ impl PictureCache {
             .next_back()
             .filter(|(_, cached)| cached.end > target)
             .map(|(pts, cached)| (*pts, cached))
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
     }
 
     fn insert(&mut self, span: Span, picture: frame::Video, hardware: bool) {
