@@ -479,6 +479,26 @@ impl Timeline {
     }
 }
 
+impl Timeline {
+    /// The first frame after `frame` on which the picture comes from another clip than it does
+    /// on `frame`, or from none: the next cut as the viewer sees it. None when the picture stays
+    /// as it is to the end.
+    pub fn next_picture_change(&self, frame: i64) -> Option<i64> {
+        let shown = |frame: i64| self.picture_at(frame).map(|(clip, _)| clip.id);
+        let now = shown(frame);
+        // The picture can only change where a clip begins or ends.
+        let mut edges: Vec<i64> = self
+            .tracks()
+            .filter(|track| track.kind == TrackKind::Video)
+            .flat_map(|track| track.clips())
+            .flat_map(|(start, clip)| [start, start + clip.duration])
+            .filter(|edge| *edge > frame)
+            .collect();
+        edges.sort_unstable();
+        edges.into_iter().find(|edge| shown(*edge) != now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

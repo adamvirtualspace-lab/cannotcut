@@ -1,5 +1,5 @@
-//! cannotcut: a timeline of clips that can be rearranged, trimmed and cut, a viewer showing the
-//! frame under the playhead, and live latency and memory readouts.
+//! cannotcut: a timeline of clips that can be rearranged, trimmed, cut and played, a viewer
+//! showing the frame under the playhead, and live latency and memory readouts.
 
 mod timeline_panel;
 mod viewer;
@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use cannotcut_media::{ClipInfo, Event, Options, Output, Pixels, Scrubber};
 use cannotcut_timeline::{
-    ClipId, Edge, Edit, History, Media as TimelineMedia, NewClip, Placement, Rate, Timeline,
-    TrackKind,
+    Clip, ClipId, Edge, Edit, History, Media as TimelineMedia, NewClip, Placement, Rate,
+    Timeline, TrackKind,
 };
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
@@ -42,6 +42,18 @@ const BYTES_PER_MB: usize = 1024 * 1024;
 /// and forth across a cut stays quick without every file of the project staying in memory.
 const MAX_OPEN_SOURCES: usize = 3;
 const SOURCE_CACHE_BYTES: usize = 96 * BYTES_PER_MB;
+/// How long before playback reaches a cut the decoder for the clip after it is got ready.
+const WARM_UP_SECONDS: f64 = 2.0;
+/// One decoder carries on across a cut when the frames either side of it are this close in the
+/// same file, as after a clip was split.
+const CARRY_ON_FRAMES: u64 = 2;
+/// While playing, frames are asked for this long before they are due, so that each is on hand
+/// when its moment comes and goes on screen then, neither early nor late.
+const LEAD_SECONDS: f64 = 0.06;
+/// How many requests made while playing are remembered, to tell which frame a picture is of.
+const REMEMBERED_REQUESTS: usize = 16;
+/// Wide enough for either word, so the buttons after it stay put.
+const PLAY_LABEL_WIDTH: f32 = 44.0;
 /// The rate of a project until its first clip sets it.
 const EMPTY_PROJECT_RATE: Rate = Rate::new(30, 1);
 
@@ -90,6 +102,9 @@ enum Message {
     /// Something the user did in the timeline panel.
     Timeline(Action),
     Stepped(i64),
+    PlayToggled,
+    /// A new display frame while playing: the playhead goes where the clock says.
+    PlayTick(Instant),
     Undo,
     Redo,
     /// Cut a clip in two at the playhead.
@@ -198,6 +213,35 @@ struct Preview {
     look_at: Option<i64>,
 }
 
+/// Playback under way: the playhead follows the clock from where it started.
+struct Playback {
+    started: Instant,
+    from: i64,
+    /// The next frame on which the picture comes from another clip, once worked out, and
+    /// whether the decoder for that clip has been got ready.
+    cut: Option<i64>,
+    warmed: bool,
+    /// The timeline frame asked for last; it runs a little ahead of the clock.
+    asked: i64,
+    /// Requests made while playing: source, request and the timeline frame it was for.
+    requests: VecDeque<(u64, u64, i64)>,
+    /// Pictures that have arrived and wait for their frame's turn, earliest first.
+    ready: VecDeque<(i64, Shown)>,
+}
+
+/// How smoothly the last stretch of playback went.
+#[derive(Clone, Copy, Default)]
+struct PlayStats {
+    pictures: u32,
+    /// When the last picture went on screen; None across stretches where nothing plays.
+    last: Option<Instant>,
+    /// How many times one picture followed another, and how long that took in all.
+    steps: u32,
+    stepping: Duration,
+    /// The longest wait between two pictures in a row.
+    longest_gap: Duration,
+}
+
 struct App {
     history: History,
     /// The project's file, once it has been saved or was opened from one.
@@ -218,6 +262,10 @@ struct App {
     opening: Option<u64>,
     /// The source of the clip under the playhead; pictures from any other are out of date.
     active: Option<u64>,
+    /// The source being got ready for the clip after the next cut.
+    warming: Option<u64>,
+    playback: Option<Playback>,
+    play_stats: Option<PlayStats>,
     pending: Option<Pending>,
     /// Pictures accepted from decoders so far; gives each one its place in line.
     arrivals: u64,
@@ -249,6 +297,8 @@ struct Source {
     info: Option<ClipInfo>,
     /// The form last asked of the decoder.
     form: Option<Form>,
+    /// The frame last asked for: where its decoder is, or is heading.
+    last_frame: Option<u64>,
 }
 
 impl Source {
@@ -258,6 +308,7 @@ impl Source {
             self.scrubber.set_output(form.output);
             self.scrubber.set_max_preview(form.max_size);
         }
+        self.last_frame = Some(frame);
         self.scrubber.request(frame)
     }
 }
@@ -304,6 +355,9 @@ impl App {
             adding: VecDeque::new(),
             opening: None,
             active: None,
+            warming: None,
+            playback: None,
+            play_stats: None,
             pending: None,
             arrivals: 0,
             shown: None,
@@ -346,6 +400,8 @@ impl App {
         self.project_path = Some(path);
         self.selected = None;
         self.preview = None;
+        self.playback = None;
+        self.warming = None;
         self.playhead = 0;
         // The old project's files are closed; the new one's open as the playhead reaches them.
         self.sources.clear();
@@ -379,7 +435,7 @@ impl App {
         }
         while let Some(path) = self.adding.front().cloned() {
             let target = TimelineMedia::target_for(&path);
-            let (index, task) = match self.source(&target, &path) {
+            let (index, task) = match self.source(&target, &path, 0, false) {
                 Ok(found) => found,
                 Err(error) => {
                     self.notice = Some(error);
@@ -438,11 +494,28 @@ impl App {
         }
     }
 
-    /// The open source for a media file, opening it if need be. Returns its place in
+    /// An open source for a media file to show `frame` from, opening one if need be. A file can
+    /// be open more than once; the source whose decoder is nearest that frame is taken. With
+    /// `spare` the source showing the picture now is left alone. Returns the source's place in
     /// `sources` and the task that brings in its events.
-    fn source(&mut self, target: &str, path: &Path) -> Result<(usize, Task<Message>), String> {
+    fn source(
+        &mut self,
+        target: &str,
+        path: &Path,
+        frame: u64,
+        spare: bool,
+    ) -> Result<(usize, Task<Message>), String> {
         let mut task = Task::none();
-        match self.sources.iter().position(|source| source.target == target) {
+        let nearest = (0..self.sources.len())
+            .filter(|index| {
+                let source = &self.sources[*index];
+                source.target == target && !(spare && Some(source.generation) == self.active)
+            })
+            .min_by_key(|index| {
+                let last = self.sources[*index].last_frame;
+                last.map_or(u64::MAX, |last| last.abs_diff(frame))
+            });
+        match nearest {
             Some(index) => {
                 let source = self.sources.remove(index);
                 self.sources.push(source);
@@ -469,12 +542,13 @@ impl App {
                     scrubber,
                     info: None,
                     form: None,
+                    last_frame: None,
                 });
                 task = Task::run(events, move |event| Message::Media(generation, event.into()));
                 // Closing a source ends its decode thread and frees its pictures.
                 while self.sources.len() > MAX_OPEN_SOURCES {
                     let idle = self.sources.iter().position(|source| {
-                        ![self.active, self.opening, Some(generation)]
+                        ![self.active, self.opening, self.warming, Some(generation)]
                             .contains(&Some(source.generation))
                     });
                     match idle {
@@ -488,47 +562,61 @@ impl App {
     }
 
     /// Asks for the picture of the frame under the playhead; while an edit is being dragged, of
-    /// the timeline as that edit would leave it.
+    /// the frame that edit wants looked at.
     fn show_playhead(&mut self) -> Task<Message> {
+        let look_at = self.preview.as_ref().and_then(|preview| preview.look_at);
+        self.show_frame(look_at.unwrap_or(self.playhead))
+    }
+
+    /// Asks for the picture of timeline frame `at`; while an edit is being dragged, of the
+    /// timeline as that edit would leave it.
+    fn show_frame(&mut self, at: i64) -> Task<Message> {
         let Some(form) = self.form else {
             // The first picture waits until the viewer knows what it wants.
             return Task::none();
         };
-        let (timeline, at) = match &self.preview {
-            Some(preview) => (
-                &preview.timeline,
-                preview.look_at.unwrap_or(self.playhead),
-            ),
-            None => (self.history.timeline(), self.playhead),
+        let timeline = match &self.preview {
+            Some(preview) => &preview.timeline,
+            None => self.history.timeline(),
         };
         let Some((clip, offset)) = timeline.picture_at(at) else {
-            // Nothing plays here: the viewer goes black.
+            // Nothing plays here: the viewer goes black. While playing that waits for the
+            // clock to get there.
             self.active = None;
             self.pending = None;
-            self.shown = None;
+            if self.playback.is_none() {
+                self.shown = None;
+            }
             return Task::none();
         };
         let frame = clip.media_frame(offset, timeline.rate()).max(0) as u64;
-        let (Some(target), Some(path)) = (clip.media.target.clone(), clip.media.path()) else {
+        let Some((target, path)) = self.location(clip) else {
             self.notice = Some(format!("the media of \"{}\" is missing", clip.name));
             self.active = None;
             self.shown = None;
             return Task::none();
         };
-        let path = match &self.project_folder {
-            Some(folder) if path.is_relative() => folder.join(path),
-            _ => path,
-        };
-        match self.source(&target, &path) {
+        match self.source(&target, &path, frame, false) {
             Ok((index, task)) => {
                 let source = &mut self.sources[index];
                 self.active = Some(source.generation);
-                self.pending = Some(Pending {
+                if self.warming == self.active {
+                    self.warming = None;
+                }
+                let pending = Pending {
                     generation: source.generation,
                     request: source.request(frame, form),
                     at: Instant::now(),
                     seen: false,
-                });
+                };
+                if let Some(playback) = &mut self.playback {
+                    let asked = (pending.generation, pending.request, at);
+                    playback.requests.push_back(asked);
+                    if playback.requests.len() > REMEMBERED_REQUESTS {
+                        playback.requests.pop_front();
+                    }
+                }
+                self.pending = Some(pending);
                 task
             }
             Err(error) => {
@@ -538,6 +626,120 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    /// Where a clip's media file is: its name in the project, and its path on disk.
+    fn location(&self, clip: &Clip) -> Option<(String, PathBuf)> {
+        let path = clip.media.path()?;
+        let path = match &self.project_folder {
+            Some(folder) if path.is_relative() => folder.join(path),
+            _ => path,
+        };
+        Some((clip.media.target.clone()?, path))
+    }
+
+    /// While playing, gets the decoder for the clip after the next cut ready a little ahead of
+    /// time: opened, and on that clip's first frame. Without this the picture would stand still
+    /// at every cut for as long as opening and seeking take.
+    fn warm_up(&mut self) -> Task<Message> {
+        let (Some(form), Some(playback)) = (self.form, &mut self.playback) else {
+            return Task::none();
+        };
+        let timeline = self.history.timeline();
+        let rate = timeline.rate();
+        if playback.cut.is_none_or(|cut| cut <= self.playhead) {
+            playback.cut = timeline.next_picture_change(self.playhead);
+            playback.warmed = false;
+        }
+        let Some(cut) = playback.cut else {
+            return Task::none();
+        };
+        let ahead = (WARM_UP_SECONDS * rate.as_f64()) as i64;
+        if playback.warmed || cut - self.playhead > ahead {
+            return Task::none();
+        }
+        playback.warmed = true;
+        let Some((clip, offset)) = timeline.picture_at(cut) else {
+            // Nothing plays after the cut.
+            return Task::none();
+        };
+        let frame = clip.media_frame(offset, rate).max(0) as u64;
+        // Where the next clip goes on in the file from where this one stops, the decoder at
+        // work simply carries on.
+        let carries_on = timeline.picture_at(cut - 1).is_some_and(|(before, offset)| {
+            let stops_at = before.media_frame(offset, rate).max(0) as u64;
+            before.media.target == clip.media.target
+                && (stops_at..=stops_at + CARRY_ON_FRAMES).contains(&frame)
+        });
+        let Some((target, path)) = self.location(clip).filter(|_| !carries_on) else {
+            return Task::none();
+        };
+        match self.source(&target, &path, frame, true) {
+            Ok((index, task)) => {
+                let source = &mut self.sources[index];
+                self.warming = Some(source.generation);
+                // Its picture is not shown; asking for it is what puts the decoder in place.
+                source.request(frame, form);
+                task
+            }
+            Err(_) => Task::none(),
+        }
+    }
+
+    /// A display frame while playing: the clock says which timeline frame is due, the picture
+    /// for it goes on screen if it has arrived, and the frame a little further on is asked for.
+    /// A decoder that cannot keep up leaves frames out; it does not slow the film down.
+    fn play_tick(&mut self, now: Instant) -> Task<Message> {
+        let rate = self.history.timeline().rate().as_f64();
+        let last_frame = self.last_frame();
+        let Some(playback) = &mut self.playback else {
+            return Task::none();
+        };
+        let elapsed = now.saturating_duration_since(playback.started).as_secs_f64();
+        let frame = (playback.from + (elapsed * rate) as i64).min(last_frame);
+        self.playhead = frame;
+
+        // The newest picture that is due; older ones it overtook are dropped.
+        let mut due = None;
+        while playback.ready.front().is_some_and(|(at, _)| *at <= frame) {
+            due = playback.ready.pop_front();
+        }
+        let ahead = (frame + (LEAD_SECONDS * rate).ceil() as i64).min(last_frame);
+        let ask = (ahead > playback.asked).then(|| playback.asked = ahead);
+        if let Some((_, shown)) = due {
+            self.shown = Some(shown);
+            if let Some(stats) = &mut self.play_stats {
+                if let Some(last) = stats.last {
+                    let gap = now.saturating_duration_since(last);
+                    stats.steps += 1;
+                    stats.stepping += gap;
+                    // The picture on screen when play was pressed does not count: what follows
+                    // it is the start-up, not a stutter.
+                    if stats.pictures > 1 {
+                        stats.longest_gap = stats.longest_gap.max(gap);
+                    }
+                }
+                stats.pictures += 1;
+                stats.last = Some(now);
+            }
+        }
+        if self.history.timeline().picture_at(frame).is_none() {
+            // Nothing plays here. The wait for the next picture is no stutter.
+            self.shown = None;
+            if let Some(stats) = &mut self.play_stats {
+                stats.last = None;
+            }
+        }
+        if frame >= last_frame {
+            self.playback = None;
+            return self.show_playhead();
+        }
+        let asked = if ask.is_some() {
+            self.show_frame(ahead)
+        } else {
+            Task::none()
+        };
+        Task::batch([asked, self.warm_up()])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -650,6 +852,29 @@ impl App {
             Message::Stepped(frames) => {
                 return self.move_playhead(self.playhead.saturating_add(frames));
             }
+            Message::PlayToggled => {
+                if self.playback.take().is_none() && self.history.timeline().duration() > 0 {
+                    // From the end, playing starts over.
+                    if self.playhead >= self.last_frame() {
+                        self.playhead = 0;
+                    }
+                    self.preview = None;
+                    self.playback = Some(Playback {
+                        started: Instant::now(),
+                        from: self.playhead,
+                        cut: None,
+                        warmed: false,
+                        asked: self.playhead,
+                        requests: VecDeque::new(),
+                        ready: VecDeque::new(),
+                    });
+                    self.play_stats = Some(PlayStats::default());
+                    return self.warm_up();
+                }
+                // Paused: the frame the playhead stopped on, exactly.
+                return self.show_playhead();
+            }
+            Message::PlayTick(now) => return self.play_tick(now),
             Message::Undo => {
                 if self.history.undo() {
                     return self.timeline_changed();
@@ -700,6 +925,7 @@ impl App {
                         Some(Message::Timeline(Action::Scrub(self.last_frame())))
                     }
                     Some(key::Named::Delete | key::Named::Backspace) => Some(Message::Delete),
+                    Some(key::Named::Space) => Some(Message::PlayToggled),
                     _ if letter("z") && !modifiers.shift() => Some(Message::Undo),
                     _ if letter("z") || letter("y") => Some(Message::Redo),
                     _ if letter("b") => Some(Message::Split),
@@ -741,7 +967,9 @@ impl App {
                 }
             }
             Media::Picture { picture, surface } => {
-                if self.active != Some(generation) {
+                // While playing, pictures are told apart by the request they answer, as the
+                // clip before a cut and the one after it are both at work around it.
+                if self.active != Some(generation) && self.playback.is_none() {
                     return Task::none();
                 }
                 self.arrivals += 1;
@@ -778,6 +1006,32 @@ impl App {
     }
 
     fn show(&mut self, generation: u64, order: u64, info: PictureInfo, picture: Displayed) {
+        if let Some(playback) = &mut self.playback {
+            // While playing, a picture waits for the clock to reach its frame. Keyframes on
+            // the way to a frame, and pictures nobody asked for while playing, are left out.
+            let asked = playback
+                .requests
+                .iter()
+                .find(|(source, request, _)| (*source, *request) == (generation, info.request));
+            if let Some((_, _, frame)) = asked.filter(|_| info.exact) {
+                let shown = Shown {
+                    picture,
+                    order,
+                    exact: true,
+                    hardware: info.hardware,
+                    size: info.size,
+                };
+                let place = playback.ready.partition_point(|(at, _)| at <= frame);
+                playback.ready.insert(place, (*frame, shown));
+                if let Some(pending) = self.pending.take_if(|pending| {
+                    pending.generation == generation && pending.request == info.request
+                }) {
+                    self.latency.first_picture = Some(pending.at.elapsed());
+                    self.latency.exact = self.latency.first_picture;
+                }
+            }
+            return;
+        }
         // The playhead may have left the clip while the picture was on its way, and uploads
         // finish independently, so an older picture can complete after a newer one.
         if self.active != Some(generation)
@@ -852,7 +1106,9 @@ impl App {
         })
     }
 
+    /// Puts the playhead where the user wants it, which ends playback.
     fn move_playhead(&mut self, frame: i64) -> Task<Message> {
+        self.playback = None;
         let frame = frame.clamp(0, self.last_frame());
         if frame == self.playhead {
             return Task::none();
@@ -864,6 +1120,7 @@ impl App {
     /// The timeline was edited: what is under the playhead may be something else now.
     fn timeline_changed(&mut self) -> Task<Message> {
         let timeline = self.history.timeline();
+        self.playback = None;
         self.preview = None;
         self.selected = self.selected.filter(|id| timeline.clip(*id).is_some());
         self.playhead = self.playhead.clamp(0, self.last_frame());
@@ -916,6 +1173,10 @@ impl App {
         if self.resized_at.is_some() {
             subscriptions.push(time::every(RESIZE_POLL).map(|_| Message::ResizeTick));
         }
+        if self.playback.is_some() {
+            // One tick for every frame the display shows.
+            subscriptions.push(window::frames().map(Message::PlayTick));
+        }
         Subscription::batch(subscriptions)
     }
 
@@ -964,6 +1225,12 @@ impl App {
             button("Delete").on_press_maybe(self.delete_edit().map(|_| Message::Delete)),
             button("Add track").on_press(Message::AddTrack),
             one_line(position).center_x(Fill),
+            button(
+                text(if self.playback.is_some() { "Pause" } else { "Play" })
+                    .width(PLAY_LABEL_WIDTH)
+                    .align_x(Center)
+            )
+            .on_press_maybe((timeline.duration() > 0).then_some(Message::PlayToggled)),
             button("Previous frame").on_press(Message::Stepped(-1)),
             button("Next frame").on_press(Message::Stepped(1)),
         ]
@@ -1052,6 +1319,13 @@ impl App {
                 ..
             }) => parts.push(format!("{path} {width}x{height}")),
             None => parts.push(path.to_string()),
+        }
+        if let Some(stats) = self.play_stats.filter(|stats| !stats.stepping.is_zero()) {
+            parts.push(format!(
+                "played {:.0} fps, longest gap {} ms",
+                f64::from(stats.steps) / stats.stepping.as_secs_f64(),
+                stats.longest_gap.as_millis()
+            ));
         }
         parts.push(format!("{} open", self.sources.len()));
         if let Some(memory_mb) = self.memory_mb {

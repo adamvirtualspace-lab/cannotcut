@@ -700,6 +700,40 @@ mod tests {
     }
 
     #[test]
+    fn the_next_cut_is_where_the_picture_changes_clips() {
+        // Main track: clips at 0..100 and 100..300, then nothing until one at 400..450. Above it
+        // a clip covers 150..200.
+        let mut timeline = Timeline::new("test", RATE);
+        place(&mut timeline, 0, clip(0, 100), Placement::Insert);
+        place(&mut timeline, 100, clip(0, 200), Placement::Insert);
+        place(&mut timeline, 400, clip(0, 50), Placement::Overwrite);
+        let add_track = Edit::AddTrack {
+            index: 1,
+            kind: TrackKind::Video,
+            name: "Overlay".to_string(),
+        };
+        timeline.apply(&add_track).unwrap();
+        let above = Edit::Place {
+            track: 1,
+            at: 150,
+            clip: clip(0, 50),
+            mode: Placement::Overwrite,
+        };
+        timeline.apply(&above).unwrap();
+
+        let cuts: Vec<i64> = std::iter::successors(Some(0), |frame| {
+            timeline.next_picture_change(*frame)
+        })
+        .collect();
+        // To the second clip, up to the overlay, back down, into the gap, out of it, the end.
+        assert_eq!(cuts, [0, 100, 150, 200, 300, 400, 450]);
+        // From inside a clip, and from inside the gap.
+        assert_eq!(timeline.next_picture_change(120), Some(150));
+        assert_eq!(timeline.next_picture_change(350), Some(400));
+        assert_eq!(timeline.next_picture_change(450), None);
+    }
+
+    #[test]
     fn free_space_is_found_next_to_the_clips_in_the_way() {
         let mut timeline = Timeline::new("test", RATE);
         place(&mut timeline, 100, clip(0, 50), Placement::Overwrite);
