@@ -62,9 +62,78 @@ pub(crate) struct Converted {
     pub hardware: bool,
 }
 
+/// A GPU decode device. The decoders a session goes through share one.
+struct Device(*mut ffi::AVBufferRef);
+
+impl Device {
+    /// The platform's decode device, when there is one and `codec` can use it.
+    fn create(codec: &ffmpeg::Codec) -> Option<Self> {
+        let hardware = HARDWARE?;
+        unsafe {
+            let supported = (0..)
+                .map(|index| ffi::avcodec_get_hw_config(codec.as_ptr(), index))
+                .take_while(|config| !config.is_null())
+                .any(|config| {
+                    (*config).device_type == hardware.device
+                        && (*config).pix_fmt == hardware.pixel
+                        && (*config).methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32
+                            != 0
+                });
+            if !supported {
+                return None;
+            }
+            let mut device = ptr::null_mut();
+            let created = ffi::av_hwdevice_ctx_create(
+                &mut device,
+                hardware.device,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            );
+            (created >= 0).then_some(Self(device))
+        }
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        unsafe { ffi::av_buffer_unref(&mut self.0) };
+    }
+}
+
+/// What it takes to open a decoder for the clip, which happens more than once: see
+/// [`Session::seek_demuxer`].
+struct DecoderSource {
+    parameters: codec::Parameters,
+    codec: ffmpeg::Codec,
+    /// None when decoding in software.
+    device: Option<Device>,
+}
+
+impl DecoderSource {
+    fn open(&self) -> Result<decoder::Video, Error> {
+        let mut context = codec::Context::from_parameters(self.parameters.clone())
+            .map_err(|error| Error::new("read codec parameters", error))?;
+        match &self.device {
+            Some(device) => unsafe {
+                // The codec context takes ownership of the reference made here.
+                (*context.as_mut_ptr()).hw_device_ctx = ffi::av_buffer_ref(device.0);
+                (*context.as_mut_ptr()).get_format = Some(pick_hardware_format);
+            },
+            None => context.set_threading(threading::Config::kind(threading::Type::Frame)),
+        }
+        context
+            .decoder()
+            .open_as(self.codec)
+            .and_then(|opened| opened.video())
+            .map_err(|error| Error::new("open decoder", error))
+    }
+}
+
 pub(crate) struct Session {
     input: format::context::Input,
     decoder: decoder::Video,
+    source: DecoderSource,
     stream: usize,
     time_base: ffi::AVRational,
     /// Duration of one frame at the nominal frame rate.
@@ -121,22 +190,19 @@ impl Session {
         };
         let keyframes = keyframe_times(&stream);
 
-        let mut context = codec::Context::from_parameters(stream.parameters())
-            .map_err(|error| Error::new("read codec parameters", error))?;
-        let codec = decoder::find(context.id())
-            .ok_or_else(|| Error(format!("no decoder for {:?}", context.id())))?;
-        let hardware = options
-            .hardware
-            .then(|| enable_hardware(&mut context, &codec))
-            .flatten();
-        if hardware.is_none() {
-            context.set_threading(threading::Config::kind(threading::Type::Frame));
-        }
-        let decoder = context
-            .decoder()
-            .open_as(codec)
-            .and_then(|opened| opened.video())
-            .map_err(|error| Error::new("open decoder", error))?;
+        // A copy of its own, so the decoder can be opened again without the stream at hand.
+        let parameters = stream.parameters().clone();
+        let codec = decoder::find(parameters.id())
+            .ok_or_else(|| Error(format!("no decoder for {:?}", parameters.id())))?;
+        let source = DecoderSource {
+            parameters,
+            codec,
+            device: options.hardware.then(|| Device::create(&codec)).flatten(),
+        };
+        let decoder = source.open()?;
+        let hardware = HARDWARE
+            .filter(|_| source.device.is_some())
+            .map(|hardware| hardware.name);
 
         let (width, height) = (decoder.width(), decoder.height());
         let info = ClipInfo {
@@ -155,6 +221,7 @@ impl Session {
         Ok(Self {
             input,
             decoder,
+            source,
             stream: stream_index,
             time_base,
             frame_time,
@@ -271,7 +338,16 @@ impl Session {
         if result < 0 {
             return Err(Error::new("seek", ffmpeg::Error::from(result)));
         }
-        self.decoder.flush();
+        if self.source.device.is_some() {
+            // On the GPU a flush is not enough. A decoder that was flushed and then started in
+            // the middle of an open GOP kept numbering its frames correctly while their pictures
+            // stopped changing some hundred frames on, without an error (seen with D3D11VA on a
+            // Radeon 760M). A decoder that has seen nothing else of the file does not do that.
+            self.decoded = frame::Video::empty();
+            self.decoder = self.source.open()?;
+        } else {
+            self.decoder.flush();
+        }
         self.current = None;
         self.drained = false;
         Ok(())
@@ -697,34 +773,6 @@ fn keyframe_times(stream: &ffmpeg::Stream) -> Vec<i64> {
     }
     keyframes.sort_unstable();
     keyframes
-}
-
-/// Attaches a GPU decode device to `context` when this platform has one and `codec` supports it.
-fn enable_hardware(context: &mut codec::Context, codec: &ffmpeg::Codec) -> Option<&'static str> {
-    let hardware = HARDWARE?;
-    unsafe {
-        let supported = (0..)
-            .map(|index| ffi::avcodec_get_hw_config(codec.as_ptr(), index))
-            .take_while(|config| !config.is_null())
-            .any(|config| {
-                (*config).device_type == hardware.device
-                    && (*config).pix_fmt == hardware.pixel
-                    && (*config).methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0
-            });
-        if !supported {
-            return None;
-        }
-        let mut device = ptr::null_mut();
-        if ffi::av_hwdevice_ctx_create(&mut device, hardware.device, ptr::null(), ptr::null_mut(), 0)
-            < 0
-        {
-            return None;
-        }
-        // The codec context takes ownership of the device reference.
-        (*context.as_mut_ptr()).hw_device_ctx = device;
-        (*context.as_mut_ptr()).get_format = Some(pick_hardware_format);
-    }
-    Some(hardware.name)
 }
 
 /// FFmpeg offers the formats it can output; taking the GPU one keeps frames on the GPU. If the

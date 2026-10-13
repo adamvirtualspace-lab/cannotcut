@@ -326,6 +326,33 @@ impl Track {
         self.items.iter().map(Item::duration).sum()
     }
 
+    /// The frames where one item ends and the next begins, and both ends of the track.
+    pub fn borders(&self) -> impl Iterator<Item = i64> {
+        self.placed()
+            .map(|(start, _)| start)
+            .chain(std::iter::once(self.duration()))
+    }
+
+    /// The start nearest to `wanted` at which something `duration` frames long covers no clip:
+    /// `wanted` itself when that is free, otherwise right before or right after a clip.
+    pub fn free_start(&self, wanted: i64, duration: i64) -> i64 {
+        let wanted = wanted.max(0);
+        let fits = |start: i64| {
+            start >= 0
+                && self
+                    .clips()
+                    .all(|(at, clip)| start + duration <= at || start >= at + clip.duration)
+        };
+        if fits(wanted) {
+            return wanted;
+        }
+        self.clips()
+            .flat_map(|(at, clip)| [at - duration, at + clip.duration])
+            .filter(|start| fits(*start))
+            .min_by_key(|start| (start - wanted).abs())
+            .unwrap_or_else(|| self.duration())
+    }
+
     /// The clip playing at `frame`, with how far into it that is.
     pub fn clip_at(&self, frame: i64) -> Option<(&Clip, i64)> {
         self.clips()

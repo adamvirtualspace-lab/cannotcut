@@ -700,6 +700,27 @@ mod tests {
     }
 
     #[test]
+    fn free_space_is_found_next_to_the_clips_in_the_way() {
+        let mut timeline = Timeline::new("test", RATE);
+        place(&mut timeline, 100, clip(0, 50), Placement::Overwrite);
+        place(&mut timeline, 170, clip(0, 30), Placement::Overwrite);
+        let track = timeline.track(0).unwrap();
+        assert_eq!(layout(&timeline, 0), "g100 c0+50 g20 c0+30");
+        assert_eq!(track.borders().collect::<Vec<_>>(), [0, 100, 150, 170, 200]);
+
+        // Free as asked, before the start, and far beyond the end.
+        assert_eq!(track.free_start(40, 60), 40);
+        assert_eq!(track.free_start(-5, 10), 0);
+        assert_eq!(track.free_start(900, 10), 900);
+        // Overlapping the first clip from the left: right before it is nearest.
+        assert_eq!(track.free_start(60, 60), 40);
+        // Twenty frames fit exactly between the two clips, thirty do not.
+        assert_eq!(track.free_start(145, 20), 150);
+        assert_eq!(track.free_start(145, 30), 200);
+        assert_eq!(track.free_start(120, 200), 200);
+    }
+
+    #[test]
     fn clips_follow_the_medias_own_frame_rate() {
         let sixty = Arc::new(Media::from_path(
             Path::new("/clips/b.mp4"),

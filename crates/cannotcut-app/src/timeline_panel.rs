@@ -1,15 +1,20 @@
-//! The timeline as the user sees it: a ruler, a lane per track with its clips, and the playhead.
-//! Clicking or dragging anywhere moves the playhead; the wheel scrolls, and zooms with Ctrl.
+//! The timeline as the user sees and edits it: a ruler, a lane per track with its clips, and the
+//! playhead. Dragging in the ruler or on empty space moves the playhead; clips are picked up and
+//! moved by their body and trimmed by their edges; the wheel scrolls, and zooms with Ctrl.
 
-use cannotcut_timeline::{Item, Rate, Timeline, TrackKind};
+use cannotcut_timeline::{ClipId, Edge, Edit, Item, Placement, Rate, Timeline, TrackKind};
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer, text};
 use iced::advanced::{Renderer as _, text::Renderer as _};
+use iced::keyboard::{self, key};
 use iced::{
-    Color, Element, Event, Length, Pixels, Point, Rectangle, Size, Theme, alignment, border,
-    keyboard, mouse, touch, window,
+    Border, Color, Element, Event, Length, Pixels, Point, Rectangle, Size, Theme, alignment,
+    border, mouse, touch, window,
 };
 
+/// The track whose clips always sit back to back: taking one out closes the hole, and clips
+/// dropped on it go in between the others.
+pub const MAIN_TRACK: usize = 0;
 /// The panel never changes height: the viewer above it must not be squeezed by what it shows.
 const PANEL_HEIGHT: f32 = 176.0;
 const RULER_HEIGHT: f32 = 24.0;
@@ -32,6 +37,12 @@ const MIN_LABELLED_WIDTH: f32 = 28.0;
 const LABEL_SIZE: f32 = 12.0;
 const PLAYHEAD_WIDTH: f32 = 2.0;
 const PLAYHEAD_HANDLE: f32 = 10.0;
+/// The strip at each end of a clip that trims it instead of moving it.
+const EDGE_GRIP: f32 = 7.0;
+/// A press on a clip becomes a drag once the pointer has moved this far.
+const DRAG_THRESHOLD: f32 = 4.0;
+/// An edge being dragged jumps to a nearby edge or the playhead within this distance.
+const SNAP_DISTANCE: f32 = 8.0;
 
 /// Which part of the timeline the panel shows.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -83,39 +94,93 @@ impl View {
     }
 }
 
-pub struct TimelinePanel<'a, Message> {
-    timeline: &'a Timeline,
-    playhead: i64,
-    view: Option<View>,
-    on_scrub: Box<dyn Fn(i64) -> Message + 'a>,
-    on_view: Box<dyn Fn(Option<View>) -> Message + 'a>,
+/// What the user did in the panel.
+#[derive(Clone, Debug)]
+pub enum Action {
+    /// Moved the playhead to this frame.
+    Scrub(i64),
+    /// Zoomed or scrolled; None shows everything.
+    View(Option<View>),
+    Select(Option<ClipId>),
+    /// Is dragging towards this edit: show it without making it.
+    Preview(Edit),
+    /// Let go: make the edit.
+    Commit(Edit),
+    /// The drag came back to where nothing changes, or was given up.
+    Cancel,
 }
 
-/// A panel showing `timeline` with the playhead on frame `playhead`. With `view` None the whole
-/// timeline is shown. `on_scrub` gets the frame the user moves the playhead to, `on_view` the
-/// view they zoom or scroll to.
-pub fn timeline_panel<'a, Message>(
+pub struct TimelinePanel<'a, Message> {
+    /// The timeline as it is. Drags are worked out against it.
     timeline: &'a Timeline,
+    /// What is drawn: the timeline with the edit being dragged already made.
+    shown: &'a Timeline,
     playhead: i64,
     view: Option<View>,
-    on_scrub: impl Fn(i64) -> Message + 'a,
-    on_view: impl Fn(Option<View>) -> Message + 'a,
+    selected: Option<ClipId>,
+    on_action: Box<dyn Fn(Action) -> Message + 'a>,
+}
+
+/// A panel for `timeline`, drawn as `shown` (the same, or with a previewed edit made), with the
+/// playhead on frame `playhead`. With `view` None the whole timeline is in sight.
+pub fn timeline_panel<'a, Message>(
+    timeline: &'a Timeline,
+    shown: &'a Timeline,
+    playhead: i64,
+    view: Option<View>,
+    selected: Option<ClipId>,
+    on_action: impl Fn(Action) -> Message + 'a,
 ) -> TimelinePanel<'a, Message> {
     TimelinePanel {
         timeline,
+        shown,
         playhead,
         view,
-        on_scrub: Box::new(on_scrub),
-        on_view: Box::new(on_view),
+        selected,
+        on_action: Box::new(on_action),
     }
 }
 
 #[derive(Default)]
 struct State {
-    scrubbing: bool,
+    gesture: Gesture,
+    /// The edit the drag stands at; made when the pointer lets go.
+    pending: Option<Edit>,
+    /// The frame the dragged edge has jumped to, shown as a line.
+    snapped: Option<i64>,
     modifiers: keyboard::Modifiers,
     /// Where the playhead was when the panel last made sure it is in sight.
     followed: Option<i64>,
+}
+
+/// What a press that is still held down is doing.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Gesture {
+    #[default]
+    None,
+    Scrub,
+    /// On a clip's body. It is a click until the pointer has moved far enough, then a move.
+    Clip {
+        id: ClipId,
+        press: Point,
+        /// Frames from the clip's start to where it was grabbed.
+        grab: f32,
+        moving: bool,
+    },
+    Trim {
+        id: ClipId,
+        edge: Edge,
+        press_x: f32,
+    },
+}
+
+/// What is under a point of the panel.
+#[derive(Clone, Copy, PartialEq)]
+enum Hit {
+    /// The ruler, or a lane where no clip is.
+    Empty { lane: bool },
+    Body { id: ClipId, start: i64 },
+    Grip { id: ClipId, edge: Edge },
 }
 
 impl<Message> TimelinePanel<'_, Message> {
@@ -131,13 +196,258 @@ impl<Message> TimelinePanel<'_, Message> {
         (self.timeline.duration() - 1).max(0)
     }
 
+    fn publish(&self, action: Action, shell: &mut Shell<'_, Message>) {
+        shell.publish((self.on_action)(action));
+    }
+
+    /// The track drawn in the lane at height `y`; the top of the stack is the top lane.
+    fn track_at(&self, y: f32) -> Option<usize> {
+        let lane = ((y - RULER_HEIGHT - LANE_GAP / 2.0) / (LANE_HEIGHT + LANE_GAP)).floor();
+        let tracks = self.timeline.tracks().len();
+        (y >= RULER_HEIGHT && lane >= 0.0 && (lane as usize) < tracks)
+            .then(|| tracks - 1 - lane as usize)
+    }
+
+    fn hit(&self, view: View, point: Point) -> Hit {
+        let Some(track) = self.track_at(point.y) else {
+            return Hit::Empty { lane: false };
+        };
+        let clips = self.timeline.track(track).into_iter().flat_map(|track| track.clips());
+        for (start, clip) in clips {
+            let (left, right) = (view.x(start as f32), view.x((start + clip.duration) as f32));
+            if (left..right).contains(&point.x) {
+                // Short clips keep a body to move them by.
+                let grip = EDGE_GRIP.min((right - left) / 3.0);
+                return if point.x < left + grip {
+                    Hit::Grip {
+                        id: clip.id,
+                        edge: Edge::Start,
+                    }
+                } else if point.x >= right - grip {
+                    Hit::Grip {
+                        id: clip.id,
+                        edge: Edge::End,
+                    }
+                } else {
+                    Hit::Body { id: clip.id, start }
+                };
+            }
+        }
+        Hit::Empty { lane: true }
+    }
+
     /// Moves the playhead to the frame `x` pixels from the panel's left edge.
     fn scrub(&self, x: f32, width: f32, shell: &mut Shell<'_, Message>) {
         let frame = self.view(width).frame(x).floor() as i64;
         let frame = frame.clamp(0, self.last_frame());
         if frame != self.playhead {
-            shell.publish((self.on_scrub)(frame));
+            self.publish(Action::Scrub(frame), shell);
         }
+    }
+
+    /// The clip edge of `timeline`, or the playhead, near `frame`: what a dragged edge jumps to.
+    /// Clips for which `skip` holds (given their track and id) offer no edges.
+    fn snap(
+        &self,
+        view: View,
+        timeline: &Timeline,
+        frame: i64,
+        skip: impl Fn(usize, ClipId) -> bool,
+    ) -> Option<i64> {
+        let skip = &skip;
+        let edges = timeline.tracks().enumerate().flat_map(move |(index, track)| {
+            track
+                .clips()
+                .filter(move |(_, clip)| !skip(index, clip.id))
+                .flat_map(|(start, clip)| [start, start + clip.duration])
+        });
+        edges
+            .chain([0, self.playhead])
+            .min_by_key(|edge| (edge - frame).abs())
+            .filter(|edge| (edge - frame).abs() as f32 * view.scale <= SNAP_DISTANCE)
+    }
+
+    /// The trim a drag of `distance` pixels on a clip's edge stands for, and the frame the edge
+    /// snapped to. On the main track the clips after it move along.
+    fn trim(
+        &self,
+        view: View,
+        id: ClipId,
+        edge: Edge,
+        distance: f32,
+    ) -> (Option<Edit>, Option<i64>) {
+        let Some((track, clip, start)) = self.timeline.clip(id) else {
+            return (None, None);
+        };
+        let ripple = track == MAIN_TRACK;
+        let Some(range) = self.timeline.trim_range(id, edge, ripple) else {
+            return (None, None);
+        };
+        let mut frames = (distance / view.scale).round() as i64;
+        // Where the dragged edge ends up on the timeline. A rippling start stays where it is.
+        let edge_at = match edge {
+            Edge::Start if ripple => None,
+            Edge::Start => Some(start + frames),
+            Edge::End => Some(start + clip.duration + frames),
+        };
+        // With ripple the rest of the track moves too, so its edges are nothing to line up with.
+        let skip = |other, clip| clip == id || (ripple && other == track);
+        let snapped = edge_at.and_then(|at| {
+            let to = self.snap(view, self.timeline, at, skip)?;
+            range.contains(&(frames + to - at)).then(|| {
+                frames += to - at;
+                to
+            })
+        });
+        let frames = frames.clamp(*range.start(), *range.end());
+        if frames == 0 {
+            return (None, None);
+        }
+        let edit = Edit::Trim {
+            clip: id,
+            edge,
+            frames,
+            ripple,
+        };
+        (Some(edit), snapped)
+    }
+
+    /// The move a clip dragged to `point` stands for, and the frame it snapped to. `grab` is how
+    /// far into the clip it is held, in frames.
+    fn relocate(
+        &self,
+        view: View,
+        id: ClipId,
+        grab: f32,
+        point: Point,
+    ) -> (Option<Edit>, Option<i64>) {
+        let Some((from, clip, _)) = self.timeline.clip(id) else {
+            return (None, None);
+        };
+        let tracks = self.timeline.tracks().len();
+        let lane = ((point.y - RULER_HEIGHT - LANE_GAP / 2.0) / (LANE_HEIGHT + LANE_GAP)).floor();
+        let to = tracks - 1 - (lane.max(0.0) as usize).min(tracks - 1);
+        let mut wanted = (view.frame(point.x) - grab).round() as i64;
+        let ripple = from == MAIN_TRACK;
+
+        // Where it can go is judged without it: on the main track the others have closed up.
+        let mut rest = self.timeline.clone();
+        if rest.apply(&Edit::Remove { clip: id, ripple }).is_err() {
+            return (None, None);
+        }
+        let Some(target) = rest.track(to) else {
+            return (None, None);
+        };
+        let (at, mode, snapped) = if to == MAIN_TRACK {
+            // In between the clips, wherever that is nearest.
+            let at = target
+                .borders()
+                .min_by_key(|border| (border - wanted).abs())
+                .unwrap_or(0);
+            (at, Placement::Insert, None)
+        } else {
+            // Either end may line up with something.
+            let snap = |frame| self.snap(view, &rest, frame, |_, clip| clip == id);
+            let mut snapped = snap(wanted);
+            match snapped {
+                Some(to) => wanted = to,
+                None => {
+                    snapped = snap(wanted + clip.duration);
+                    wanted = snapped.map_or(wanted, |to| to - clip.duration);
+                }
+            }
+            // Clips do not cover each other: one in the way pushes it to the nearest free spot.
+            let at = target.free_start(wanted, clip.duration);
+            (at, Placement::Overwrite, snapped.filter(|_| at == wanted))
+        };
+        let edit = Edit::Move {
+            clip: id,
+            track: to,
+            at,
+            mode,
+            ripple,
+        };
+        // Dropping it where it came from is no edit.
+        let mut moved = self.timeline.clone();
+        let changes = moved.apply(&edit).is_ok() && moved != *self.timeline;
+        (changes.then_some(edit), snapped.filter(|_| changes))
+    }
+
+    /// Takes the drag to `point`: works out the edit it stands for and has it shown.
+    fn drag(&self, state: &mut State, point: Point, width: f32, shell: &mut Shell<'_, Message>) {
+        let view = self.view(width);
+        let (edit, snapped) = match &mut state.gesture {
+            Gesture::None => return,
+            Gesture::Scrub => return self.scrub(point.x, width, shell),
+            Gesture::Clip {
+                id,
+                press,
+                grab,
+                moving,
+            } => {
+                *moving |= press.distance(point) >= DRAG_THRESHOLD;
+                if !*moving {
+                    return;
+                }
+                self.relocate(view, *id, *grab, point)
+            }
+            Gesture::Trim { id, edge, press_x } => self.trim(view, *id, *edge, point.x - *press_x),
+        };
+        state.snapped = snapped;
+        if edit != state.pending {
+            state.pending = edit.clone();
+            self.publish(edit.map_or(Action::Cancel, Action::Preview), shell);
+        }
+        shell.request_redraw();
+    }
+
+    fn press(&self, state: &mut State, point: Point, width: f32, shell: &mut Shell<'_, Message>) {
+        let view = self.view(width);
+        let hit = self.hit(view, point);
+        let picked = match hit {
+            Hit::Body { id, .. } | Hit::Grip { id, .. } => Some(id),
+            // A press on the ruler leaves the selection alone; one on empty track clears it.
+            Hit::Empty { lane: false } => self.selected,
+            Hit::Empty { lane: true } => None,
+        };
+        if picked != self.selected {
+            self.publish(Action::Select(picked), shell);
+        }
+        state.gesture = match hit {
+            Hit::Empty { .. } => {
+                self.scrub(point.x, width, shell);
+                Gesture::Scrub
+            }
+            Hit::Body { id, start } => Gesture::Clip {
+                id,
+                press: point,
+                grab: view.frame(point.x) - start as f32,
+                moving: false,
+            },
+            Hit::Grip { id, edge } => Gesture::Trim {
+                id,
+                edge,
+                press_x: point.x,
+            },
+        };
+        shell.capture_event();
+    }
+
+    fn release(&self, state: &mut State, width: f32, shell: &mut Shell<'_, Message>) {
+        match std::mem::take(&mut state.gesture) {
+            Gesture::None | Gesture::Scrub => {}
+            // A click on a clip also puts the playhead there.
+            Gesture::Clip {
+                press,
+                moving: false,
+                ..
+            } => self.scrub(press.x, width, shell),
+            Gesture::Clip { .. } | Gesture::Trim { .. } => {
+                let ended = state.pending.take().map_or(Action::Cancel, Action::Commit);
+                self.publish(ended, shell);
+            }
+        }
+        state.snapped = None;
     }
 
     fn scroll_or_zoom(
@@ -171,7 +481,7 @@ impl<Message> TimelinePanel<'_, Message> {
             None
         };
         if changed != self.view {
-            shell.publish((self.on_view)(changed));
+            self.publish(Action::View(changed), shell);
         }
     }
 }
@@ -211,36 +521,46 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
     ) {
         let bounds = layout.bounds();
         let state = tree.state.downcast_mut::<State>();
+        // Positions inside the panel count from its corner.
+        let inside = |position: Point| Point::new(position.x - bounds.x, position.y - bounds.y);
         match event {
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
             }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key::Named::Escape),
+                ..
+            }) if !matches!(state.gesture, Gesture::None | Gesture::Scrub) => {
+                // Gives the drag up: everything goes back to where it was.
+                *state = State {
+                    modifiers: state.modifiers,
+                    followed: state.followed,
+                    ..State::default()
+                };
+                self.publish(Action::Cancel, shell);
+            }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(position) = cursor.position_over(bounds) {
-                    state.scrubbing = true;
-                    self.scrub(position.x - bounds.x, bounds.width, shell);
-                    shell.capture_event();
+                    self.press(state, inside(position), bounds.width, shell);
                 }
             }
             Event::Touch(touch::Event::FingerPressed { position, .. })
                 if bounds.contains(*position) =>
             {
-                state.scrubbing = true;
-                self.scrub(position.x - bounds.x, bounds.width, shell);
-                shell.capture_event();
+                self.press(state, inside(*position), bounds.width, shell);
             }
             // A drag that started in the panel goes on outside it.
             Event::Mouse(mouse::Event::CursorMoved { position })
             | Event::Touch(touch::Event::FingerMoved { position, .. })
-                if state.scrubbing =>
+                if state.gesture != Gesture::None =>
             {
-                self.scrub(position.x - bounds.x, bounds.width, shell);
+                self.drag(state, inside(*position), bounds.width, shell);
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(
                 touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. },
-            ) => state.scrubbing = false,
+            ) => self.release(state, bounds.width, shell),
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 if let Some(position) = cursor.position_over(bounds) {
                     let zoom = state.modifiers.command();
@@ -252,7 +572,8 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                 // When the playhead moved out of a zoomed-in view, by a key say, the view goes
                 // after it. A view the user scrolled away from the playhead is left alone.
                 let moved = state.followed.replace(self.playhead) != Some(self.playhead);
-                if let Some(view) = self.view.filter(|_| moved && !state.scrubbing) {
+                let idle = state.gesture == Gesture::None;
+                if let Some(view) = self.view.filter(|_| moved && idle) {
                     let x = view.x(self.playhead as f32);
                     if !(0.0..=bounds.width - PLAYHEAD_WIDTH).contains(&x) {
                         let centred = View {
@@ -260,7 +581,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                             ..view
                         };
                         let centred = centred.clamped(self.timeline.duration(), bounds.width);
-                        shell.publish((self.on_view)(Some(centred)));
+                        self.publish(Action::View(Some(centred)), shell);
                     }
                 }
             }
@@ -270,7 +591,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
 
     fn draw(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         renderer: &mut iced::Renderer,
         theme: &Theme,
         _style: &renderer::Style,
@@ -279,6 +600,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
         _viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
+        let state = tree.state.downcast_ref::<State>();
         let palette = theme.extended_palette();
         let view = self.view(bounds.width);
         let rate = self.timeline.rate();
@@ -323,7 +645,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
             }
 
             // The top of the stack is the top lane, as it covers the ones below it.
-            for (lane, track) in self.timeline.tracks().rev().enumerate() {
+            for (lane, track) in self.shown.tracks().rev().enumerate() {
                 let y = bounds.y + RULER_HEIGHT + LANE_GAP + lane as f32 * (LANE_HEIGHT + LANE_GAP);
                 if y >= bounds.y + bounds.height {
                     break;
@@ -358,10 +680,15 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                         Size::new(width, LANE_HEIGHT),
                     );
                     let dimmed = if track.enabled && clip.enabled { 1.0 } else { 0.4 };
+                    let selected = self.selected == Some(clip.id);
                     renderer.fill_quad(
                         renderer::Quad {
                             bounds: area,
-                            border: border::rounded(4),
+                            border: Border {
+                                color: if selected { ink } else { Color::TRANSPARENT },
+                                width: if selected { 2.0 } else { 0.0 },
+                                radius: 4.0.into(),
+                            },
                             ..renderer::Quad::default()
                         },
                         Color {
@@ -375,7 +702,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                     {
                         // The name stays in sight while any of the clip is.
                         let position =
-                            Point::new(visible.x + 6.0, y + LANE_HEIGHT / 2.0);
+                            Point::new(visible.x + 8.0, y + LANE_HEIGHT / 2.0);
                         let color = Color {
                             a: dimmed,
                             ..pair.text
@@ -386,7 +713,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                 }
             }
 
-            if self.timeline.duration() == 0 {
+            if self.shown.duration() == 0 {
                 let position = Point::new(
                     bounds.x + MARGIN,
                     bounds.y + RULER_HEIGHT + LANE_GAP + LANE_HEIGHT / 2.0,
@@ -398,23 +725,23 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
 
         // In a layer of its own, or the clips' names would be drawn over it.
         renderer.with_layer(bounds, |renderer| {
-            let x = (bounds.x + view.x(self.playhead as f32)).round();
-            let mut bar = |left: f32, width: f32, height: f32| {
+            let mut bar = |frame: i64, width: f32, height: f32, color: Color| {
+                let x = (bounds.x + view.x(frame as f32)).round() - (width - PLAYHEAD_WIDTH) / 2.0;
                 renderer.fill_quad(
                     renderer::Quad {
-                        bounds: Rectangle::new(
-                            Point::new(left, bounds.y),
-                            Size::new(width, height),
-                        ),
+                        bounds: Rectangle::new(Point::new(x, bounds.y), Size::new(width, height)),
                         border: border::rounded(2),
                         ..renderer::Quad::default()
                     },
-                    ink,
+                    color,
                 );
             };
-            bar(x, PLAYHEAD_WIDTH, bounds.height);
-            let handle = x - (PLAYHEAD_HANDLE - PLAYHEAD_WIDTH) / 2.0;
-            bar(handle, PLAYHEAD_HANDLE, RULER_HEIGHT * 0.5);
+            // Where a dragged edge has lined up with something.
+            if let Some(frame) = state.snapped {
+                bar(frame, PLAYHEAD_WIDTH, bounds.height, palette.warning.base.color);
+            }
+            bar(self.playhead, PLAYHEAD_WIDTH, bounds.height, ink);
+            bar(self.playhead, PLAYHEAD_HANDLE, RULER_HEIGHT * 0.5, ink);
         });
     }
 
@@ -426,13 +753,21 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
         _viewport: &Rectangle,
         _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
-        let state = tree.state.downcast_ref::<State>();
-        if state.scrubbing {
-            mouse::Interaction::Grabbing
-        } else if cursor.is_over(layout.bounds()) {
-            mouse::Interaction::Pointer
-        } else {
-            mouse::Interaction::None
+        let bounds = layout.bounds();
+        match tree.state.downcast_ref::<State>().gesture {
+            Gesture::Trim { .. } => return mouse::Interaction::ResizingHorizontally,
+            Gesture::Clip { moving: true, .. } => return mouse::Interaction::Grabbing,
+            Gesture::Scrub | Gesture::Clip { .. } => return mouse::Interaction::Pointer,
+            Gesture::None => {}
+        }
+        let Some(position) = cursor.position_over(bounds) else {
+            return mouse::Interaction::None;
+        };
+        let point = Point::new(position.x - bounds.x, position.y - bounds.y);
+        match self.hit(self.view(bounds.width), point) {
+            Hit::Grip { .. } => mouse::Interaction::ResizingHorizontally,
+            Hit::Body { .. } => mouse::Interaction::Grab,
+            Hit::Empty { .. } => mouse::Interaction::Pointer,
         }
     }
 }
@@ -502,9 +837,64 @@ fn tick_label(frame: i64, step: i64, rate: Rate) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use cannotcut_timeline::{Media, NewClip};
+
     use super::*;
 
     const RATE: Rate = Rate::new(30, 1);
+    /// One pixel per frame, frame zero at the left edge: pixels and frames read the same.
+    const PLAIN: View = View {
+        scale: 1.0,
+        start: 0.0,
+    };
+
+    /// A main track with clips of 100, 200 and 300 frames, and above it a track with a clip of
+    /// 50 frames starting at frame 400. The ids are returned in that order.
+    fn project() -> (Timeline, [ClipId; 4]) {
+        let media = Arc::new(Media::from_path(Path::new("/clips/a.mp4"), RATE, 1000));
+        let clip = |source_start, duration| NewClip {
+            name: "a".to_string(),
+            media: media.clone(),
+            source_start,
+            duration,
+        };
+        let mut timeline = Timeline::new("test", RATE);
+        let add_track = Edit::AddTrack {
+            index: 1,
+            kind: TrackKind::Video,
+            name: "Overlay".to_string(),
+        };
+        timeline.apply(&add_track).unwrap();
+        let mut place = |track, at, clip, mode| {
+            let edit = Edit::Place {
+                track,
+                at,
+                clip,
+                mode,
+            };
+            timeline.apply(&edit).unwrap().unwrap()
+        };
+        let ids = [
+            place(MAIN_TRACK, 0, clip(100, 100), Placement::Insert),
+            place(MAIN_TRACK, 100, clip(0, 200), Placement::Insert),
+            place(MAIN_TRACK, 300, clip(0, 300), Placement::Insert),
+            place(1, 400, clip(0, 50), Placement::Overwrite),
+        ];
+        (timeline, ids)
+    }
+
+    fn panel(timeline: &Timeline, playhead: i64) -> TimelinePanel<'_, ()> {
+        timeline_panel(timeline, timeline, playhead, Some(PLAIN), None, |_| ())
+    }
+
+    /// The height of the middle of a track's lane.
+    fn lane_y(timeline: &Timeline, track: usize) -> f32 {
+        let lane = (timeline.tracks().len() - 1 - track) as f32;
+        RULER_HEIGHT + LANE_GAP + lane * (LANE_HEIGHT + LANE_GAP) + LANE_HEIGHT / 2.0
+    }
 
     #[test]
     fn fitting_shows_the_whole_timeline_between_the_margins() {
@@ -550,5 +940,112 @@ mod tests {
         assert_eq!(tick_label(30 * 3725, 1800, RATE), "1:02:05");
         // 29.97 counts thirty frames to the second, as timecode does.
         assert_eq!(timecode_base(Rate::new(30000, 1001)), 30);
+    }
+
+    #[test]
+    fn a_point_is_on_a_clips_body_its_edges_or_nothing() {
+        let (timeline, [first, second, _, overlay]) = project();
+        let panel = panel(&timeline, 0);
+        let (main, upper) = (lane_y(&timeline, MAIN_TRACK), lane_y(&timeline, 1));
+        let at = |x, y| panel.hit(PLAIN, Point::new(x, y));
+        assert!(at(50.0, main) == Hit::Body { id: first, start: 0 });
+        assert!(at(2.0, main) == Hit::Grip { id: first, edge: Edge::Start });
+        assert!(at(98.0, main) == Hit::Grip { id: first, edge: Edge::End });
+        assert!(at(101.0, main) == Hit::Grip { id: second, edge: Edge::Start });
+        assert!(at(420.0, upper) == Hit::Body { id: overlay, start: 400 });
+        assert!(at(200.0, upper) == Hit::Empty { lane: true });
+        assert!(at(200.0, RULER_HEIGHT / 2.0) == Hit::Empty { lane: false });
+        assert!(at(200.0, PANEL_HEIGHT - 2.0) == Hit::Empty { lane: false });
+    }
+
+    #[test]
+    fn trimming_on_the_main_track_ripples_and_stops_at_the_medias_ends() {
+        let (timeline, [first, second, ..]) = project();
+        let panel = panel(&timeline, 0);
+        let trim = |clip, edge, distance| panel.trim(PLAIN, clip, edge, distance).0;
+        assert_eq!(
+            trim(second, Edge::End, -40.0),
+            Some(Edit::Trim {
+                clip: second,
+                edge: Edge::End,
+                frames: -40,
+                ripple: true
+            })
+        );
+        // The first clip starts a hundred frames into its media: its start can go back that far
+        // and no further, and forward until one frame is left.
+        let frames = |edit| match edit {
+            Some(Edit::Trim { frames, .. }) => frames,
+            _ => 0,
+        };
+        assert_eq!(frames(trim(first, Edge::Start, -500.0)), -100);
+        assert_eq!(frames(trim(first, Edge::Start, 500.0)), 99);
+        // Back where it started is no edit.
+        assert_eq!(trim(first, Edge::End, 0.3), None);
+    }
+
+    #[test]
+    fn a_trimmed_edge_jumps_to_the_playhead_and_to_other_tracks_edges() {
+        let (timeline, [.., third, overlay]) = project();
+        // The third clip ends at 600; the overlay runs from 400 to 450 and the playhead is at
+        // 520.
+        let panel = panel(&timeline, 520);
+        let (edit, snapped) = panel.trim(PLAIN, third, Edge::End, -75.0);
+        assert_eq!(snapped, Some(520));
+        assert!(matches!(edit, Some(Edit::Trim { frames: -80, .. })));
+        let (edit, snapped) = panel.trim(PLAIN, third, Edge::End, -155.0);
+        assert_eq!(snapped, Some(450));
+        assert!(matches!(edit, Some(Edit::Trim { frames: -150, .. })));
+        // Too far from anything: it goes where it is dragged.
+        let (edit, snapped) = panel.trim(PLAIN, third, Edge::End, -30.0);
+        assert_eq!(snapped, None);
+        assert!(matches!(edit, Some(Edit::Trim { frames: -30, .. })));
+        // On a free track the neighbours stay put, and the start snaps too.
+        let (edit, snapped) = panel.trim(PLAIN, overlay, Edge::End, 73.0);
+        assert_eq!(snapped, Some(520));
+        assert!(matches!(edit, Some(Edit::Trim { frames: 70, ripple: false, .. })));
+    }
+
+    #[test]
+    fn clips_dragged_along_the_main_track_change_places() {
+        let (timeline, [first, second, third, _]) = project();
+        let panel = panel(&timeline, 0);
+        let main = lane_y(&timeline, MAIN_TRACK);
+        // Held 10 frames in and dragged so that it would start at 290: with the first clip
+        // gone the others close up to 0..200 and 200..500, and 200 is the nearest border.
+        let (edit, _) = panel.relocate(PLAIN, first, 10.0, Point::new(300.0, main));
+        let Some(edit) = edit else {
+            panic!("the drag should move the clip");
+        };
+        let mut moved = timeline.clone();
+        moved.apply(&edit).unwrap();
+        let main_track = moved.track(MAIN_TRACK).unwrap();
+        let order: Vec<ClipId> = main_track.clips().map(|(_, clip)| clip.id).collect();
+        assert_eq!(order, [second, first, third]);
+        assert_eq!(moved.duration(), timeline.duration());
+
+        // A small drag leaves it where it is: no edit.
+        assert_eq!(panel.relocate(PLAIN, first, 10.0, Point::new(40.0, main)).0, None);
+    }
+
+    #[test]
+    fn clips_dragged_to_a_free_track_keep_clear_of_the_clips_there() {
+        let (timeline, [first, _, _, overlay]) = project();
+        let panel = panel(&timeline, 0);
+        let upper = lane_y(&timeline, 1);
+        // The first clip, 100 frames, dropped so that it would cover the overlay at 400..450:
+        // it lands right before it instead, and the main track closes up.
+        let (edit, _) = panel.relocate(PLAIN, first, 0.0, Point::new(360.0, upper));
+        let mut moved = timeline.clone();
+        moved.apply(&edit.unwrap()).unwrap();
+        let (track, _, start) = moved.clip(first).unwrap();
+        assert_eq!((track, start), (1, 300));
+        assert_eq!(moved.clip(overlay).unwrap().2, 400);
+        assert_eq!(moved.track(MAIN_TRACK).unwrap().duration(), 500);
+
+        // Dragged along its own free track, the overlay snaps to the cut at 300 below it.
+        let (edit, snapped) = panel.relocate(PLAIN, overlay, 0.0, Point::new(304.0, upper));
+        assert_eq!(snapped, Some(300));
+        assert!(matches!(edit, Some(Edit::Move { at: 300, ripple: false, .. })));
     }
 }

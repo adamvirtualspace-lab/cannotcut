@@ -1,5 +1,5 @@
-//! cannotcut: a timeline of clips, a viewer showing the frame under the playhead, and live latency
-//! and memory readouts.
+//! cannotcut: a timeline of clips that can be rearranged, trimmed and cut, a viewer showing the
+//! frame under the playhead, and live latency and memory readouts.
 
 mod timeline_panel;
 mod viewer;
@@ -10,7 +10,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cannotcut_media::{ClipInfo, Event, Options, Output, Pixels, Scrubber};
-use cannotcut_timeline::{Edit, History, Media as TimelineMedia, NewClip, Placement, Rate, Timeline};
+use cannotcut_timeline::{
+    ClipId, Edge, Edit, History, Media as TimelineMedia, NewClip, Placement, Rate, Timeline,
+    TrackKind,
+};
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
 use iced::widget::{button, center, column, container, image, row, sensor, shader, stack, text};
@@ -18,7 +21,7 @@ use iced::{
     Center, Color, ContentFit, Element, Fill, Size, Subscription, Task, Theme, time, window,
 };
 use iced_runtime::image::{Allocation, allocate};
-use timeline_panel::{View, timecode_base, timeline_panel};
+use timeline_panel::{Action, MAIN_TRACK, View, timecode_base, timeline_panel};
 use viewer::{YuvPicture, renderer_probe};
 
 /// Keeps the viewer off the shader path, to try the fallback on a machine with a working GPU.
@@ -26,6 +29,8 @@ const CPU_VIEWER_FLAG: &str = "--cpu-viewer";
 /// Starts with the playhead on a frame, to look at a spot without touching the mouse.
 const PLAYHEAD_FLAG: &str = "--at=";
 const PROJECT_EXTENSION: &str = "otio";
+/// The small print of the status row.
+const STATUS_TEXT_SIZE: f32 = 13.0;
 const MEMORY_REFRESH: Duration = Duration::from_secs(1);
 /// How long the viewer's size has to hold still before pictures are made for it. While a window
 /// edge is being dragged the picture on screen is stretched instead, which costs nothing.
@@ -60,6 +65,12 @@ fn main() -> iced::Result {
 enum Message {
     AddRequested,
     FilesChosen(Vec<PathBuf>),
+    OpenRequested,
+    ProjectChosen(Option<PathBuf>),
+    ProjectLoaded(Result<(PathBuf, Timeline), String>),
+    SaveRequested,
+    SaveChosen(Option<PathBuf>),
+    Saved(Result<PathBuf, String>),
     /// Whether the window is drawn on the GPU, which decides the viewer's path.
     RendererProbed(bool),
     /// The viewer's area was laid out at this size, in logical pixels.
@@ -76,11 +87,16 @@ enum Message {
         picture: PictureInfo,
         allocation: Option<Allocation>,
     },
-    /// The playhead was put on this timeline frame.
-    Scrubbed(i64),
+    /// Something the user did in the timeline panel.
+    Timeline(Action),
     Stepped(i64),
-    /// The timeline panel was zoomed or scrolled; None shows everything.
-    TimelineViewed(Option<View>),
+    Undo,
+    Redo,
+    /// Cut a clip in two at the playhead.
+    Split,
+    /// Take the selected clip off the timeline.
+    Delete,
+    AddTrack,
     Key(keyboard::Event),
     MemoryTick,
 }
@@ -175,10 +191,21 @@ impl From<Event> for Media {
     }
 }
 
+/// An edit being dragged in the timeline, shown before it is made.
+struct Preview {
+    timeline: Timeline,
+    /// The frame the viewer shows in place of the playhead's: the edge being trimmed.
+    look_at: Option<i64>,
+}
+
 struct App {
     history: History,
+    /// The project's file, once it has been saved or was opened from one.
+    project_path: Option<PathBuf>,
     /// Where the project file is; relative media paths start from here.
     project_folder: Option<PathBuf>,
+    selected: Option<ClipId>,
+    preview: Option<Preview>,
     /// The timeline frame the viewer shows.
     playhead: i64,
     /// The media files that are open, the one used longest ago first.
@@ -267,7 +294,10 @@ impl App {
     fn boot() -> (Self, Task<Message>) {
         let mut app = Self {
             history: History::new(Timeline::new("Untitled", EMPTY_PROJECT_RATE)),
+            project_path: None,
             project_folder: None,
+            selected: None,
+            preview: None,
             playhead: 0,
             sources: Vec::new(),
             generation: 0,
@@ -287,31 +317,57 @@ impl App {
             notice: None,
             memory_mb: None,
         };
+        let mut playhead = 0;
         for argument in std::env::args_os().skip(1) {
             let path = PathBuf::from(&argument);
             let text = argument.to_string_lossy();
             if text == CPU_VIEWER_FLAG {
                 app.viewer = Some(ViewerPath::Cpu);
             } else if let Some(frame) = text.strip_prefix(PLAYHEAD_FLAG) {
-                app.playhead = frame.parse().unwrap_or(0);
+                playhead = frame.parse().unwrap_or(0);
             } else if path.extension().is_some_and(|extension| extension == PROJECT_EXTENSION) {
-                app.open_project(&path);
+                match Timeline::load(&path) {
+                    Ok(timeline) => drop(app.adopt_project(path, timeline)),
+                    Err(error) => app.notice = Some(error.to_string()),
+                }
             } else {
                 app.adding.push_back(path);
             }
         }
+        app.playhead = playhead;
         let task = app.add_next();
         (app, task)
     }
 
-    fn open_project(&mut self, path: &Path) {
-        match Timeline::load(path) {
-            Ok(timeline) => {
-                self.history = History::new(timeline);
-                self.project_folder = path.parent().map(Path::to_path_buf);
+    /// Replaces what is being edited with a project read from `path`.
+    fn adopt_project(&mut self, path: PathBuf, timeline: Timeline) -> Task<Message> {
+        self.history = History::new(timeline);
+        self.project_folder = path.parent().map(Path::to_path_buf);
+        self.project_path = Some(path);
+        self.selected = None;
+        self.preview = None;
+        self.playhead = 0;
+        // The old project's files are closed; the new one's open as the playhead reaches them.
+        self.sources.clear();
+        self.adding.clear();
+        self.opening = None;
+        self.active = None;
+        self.pending = None;
+        self.shown = None;
+        self.notice = None;
+        self.show_playhead()
+    }
+
+    fn save(&self, path: PathBuf) -> Task<Message> {
+        // Tracks are shared, so the copy handed to the background is cheap.
+        let timeline = self.history.timeline().clone();
+        let saving = async move {
+            match timeline.save(&path) {
+                Ok(()) => Ok(path),
+                Err(error) => Err(error.to_string()),
             }
-            Err(error) => self.notice = Some(error.to_string()),
-        }
+        };
+        Task::perform(saving, Message::Saved)
     }
 
     /// Starts on the next file waiting to go on the timeline. Its length has to be known first,
@@ -431,14 +487,21 @@ impl App {
         Ok((self.sources.len() - 1, task))
     }
 
-    /// Asks for the picture of the frame under the playhead.
+    /// Asks for the picture of the frame under the playhead; while an edit is being dragged, of
+    /// the timeline as that edit would leave it.
     fn show_playhead(&mut self) -> Task<Message> {
         let Some(form) = self.form else {
             // The first picture waits until the viewer knows what it wants.
             return Task::none();
         };
-        let timeline = self.history.timeline();
-        let Some((clip, offset)) = timeline.picture_at(self.playhead) else {
+        let (timeline, at) = match &self.preview {
+            Some(preview) => (
+                &preview.timeline,
+                preview.look_at.unwrap_or(self.playhead),
+            ),
+            None => (self.history.timeline(), self.playhead),
+        };
+        let Some((clip, offset)) = timeline.picture_at(at) else {
             // Nothing plays here: the viewer goes black.
             self.active = None;
             self.pending = None;
@@ -528,44 +591,124 @@ impl App {
                 }
                 None => self.notice = Some("could not upload a picture to the GPU".to_string()),
             },
-            Message::Scrubbed(frame) => return self.move_playhead(frame),
+            Message::OpenRequested => {
+                return Task::perform(pick_project(), Message::ProjectChosen);
+            }
+            Message::ProjectChosen(Some(path)) => {
+                return Task::perform(load_project(path), Message::ProjectLoaded);
+            }
+            Message::ProjectLoaded(Ok((path, timeline))) => {
+                return self.adopt_project(path, timeline);
+            }
+            Message::SaveRequested => {
+                return match self.project_path.clone() {
+                    Some(path) => self.save(path),
+                    None => {
+                        let name = self.history.timeline().name.clone();
+                        Task::perform(pick_save_path(name), Message::SaveChosen)
+                    }
+                };
+            }
+            Message::SaveChosen(Some(path)) => return self.save(path),
+            Message::Saved(Ok(path)) => {
+                self.notice = Some(format!("Saved {}", path.display()));
+                self.project_folder = path.parent().map(Path::to_path_buf);
+                self.project_path = Some(path);
+            }
+            Message::ProjectLoaded(Err(error)) | Message::Saved(Err(error)) => {
+                self.notice = Some(error);
+            }
+            Message::ProjectChosen(None) | Message::SaveChosen(None) => {}
+            Message::Timeline(action) => match action {
+                Action::Scrub(frame) => return self.move_playhead(frame),
+                Action::View(view) => self.timeline_view = view,
+                Action::Select(clip) => self.selected = clip,
+                Action::Preview(edit) => {
+                    let mut timeline = self.history.timeline().clone();
+                    if timeline.apply(&edit).is_ok() {
+                        // While an edge is trimmed the viewer shows the frame it now stands on.
+                        let look_at = match edit {
+                            Edit::Trim { clip, edge, .. } => {
+                                timeline.clip(clip).map(|(_, clip, start)| match edge {
+                                    Edge::Start => start,
+                                    Edge::End => start + clip.duration - 1,
+                                })
+                            }
+                            _ => None,
+                        };
+                        self.preview = Some(Preview { timeline, look_at });
+                        return self.show_playhead();
+                    }
+                }
+                Action::Commit(edit) => return self.edit(&edit),
+                Action::Cancel => {
+                    if self.preview.take().is_some() {
+                        return self.show_playhead();
+                    }
+                }
+            },
             Message::Stepped(frames) => {
                 return self.move_playhead(self.playhead.saturating_add(frames));
             }
-            Message::TimelineViewed(view) => self.timeline_view = view,
+            Message::Undo => {
+                if self.history.undo() {
+                    return self.timeline_changed();
+                }
+            }
+            Message::Redo => {
+                if self.history.redo() {
+                    return self.timeline_changed();
+                }
+            }
+            Message::Split => {
+                if let Some(edit) = self.split_edit() {
+                    return self.edit(&edit);
+                }
+            }
+            Message::Delete => {
+                if let Some(edit) = self.delete_edit() {
+                    return self.edit(&edit);
+                }
+            }
+            Message::AddTrack => {
+                let tracks = self.history.timeline().tracks().len();
+                return self.edit(&Edit::AddTrack {
+                    index: tracks,
+                    kind: TrackKind::Video,
+                    name: format!("Video {}", tracks + 1),
+                });
+            }
             Message::Key(keyboard::Event::KeyPressed {
                 key: pressed,
                 modifiers,
                 ..
             }) => {
-                let last_frame = self.last_frame();
                 // With Shift held a letter arrives as its capital.
                 let letter = |letter: &str| {
                     matches!(pressed.as_ref(), keyboard::Key::Character(character)
                         if modifiers.command() && character.eq_ignore_ascii_case(letter))
                 };
-                match pressed.as_ref() {
-                    keyboard::Key::Named(key::Named::ArrowLeft) => {
-                        return self.move_playhead(self.playhead - 1);
+                let named = match pressed.as_ref() {
+                    keyboard::Key::Named(named) => Some(named),
+                    _ => None,
+                };
+                let meant = match named {
+                    Some(key::Named::ArrowLeft) => Some(Message::Stepped(-1)),
+                    Some(key::Named::ArrowRight) => Some(Message::Stepped(1)),
+                    Some(key::Named::Home) => Some(Message::Timeline(Action::Scrub(0))),
+                    Some(key::Named::End) => {
+                        Some(Message::Timeline(Action::Scrub(self.last_frame())))
                     }
-                    keyboard::Key::Named(key::Named::ArrowRight) => {
-                        return self.move_playhead(self.playhead + 1);
-                    }
-                    keyboard::Key::Named(key::Named::Home) => return self.move_playhead(0),
-                    keyboard::Key::Named(key::Named::End) => {
-                        return self.move_playhead(last_frame);
-                    }
-                    _ if letter("z") && !modifiers.shift() => {
-                        if self.history.undo() {
-                            return self.timeline_changed();
-                        }
-                    }
-                    _ if letter("z") || letter("y") => {
-                        if self.history.redo() {
-                            return self.timeline_changed();
-                        }
-                    }
-                    _ => {}
+                    Some(key::Named::Delete | key::Named::Backspace) => Some(Message::Delete),
+                    _ if letter("z") && !modifiers.shift() => Some(Message::Undo),
+                    _ if letter("z") || letter("y") => Some(Message::Redo),
+                    _ if letter("b") => Some(Message::Split),
+                    _ if letter("s") => Some(Message::SaveRequested),
+                    _ if letter("o") => Some(Message::OpenRequested),
+                    _ => None,
+                };
+                if let Some(message) = meant {
+                    return self.update(message);
                 }
             }
             Message::Key(_) => {}
@@ -671,6 +814,44 @@ impl App {
         (self.history.timeline().duration() - 1).max(0)
     }
 
+    /// Makes an edit the user asked for; it can be undone.
+    fn edit(&mut self, edit: &Edit) -> Task<Message> {
+        match self.history.apply(edit) {
+            Ok(_) => self.notice = None,
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+        self.timeline_changed()
+    }
+
+    /// The cut at the playhead: through the selected clip when the playhead is on it, otherwise
+    /// through the topmost clip there. None when the playhead is on no clip, or on a cut.
+    fn split_edit(&self) -> Option<Edit> {
+        let timeline = self.history.timeline();
+        let cuts = |track: usize| {
+            let (_, offset) = timeline.track(track)?.clip_at(self.playhead)?;
+            (offset > 0).then_some(track)
+        };
+        let selected = self
+            .selected
+            .and_then(|id| timeline.clip(id))
+            .filter(|(_, clip, start)| (start + 1..start + clip.duration).contains(&self.playhead))
+            .map(|(track, ..)| track);
+        let track = selected.or_else(|| (0..timeline.tracks().len()).rev().find_map(cuts))?;
+        Some(Edit::Split {
+            track,
+            at: self.playhead,
+        })
+    }
+
+    /// Taking the selected clip away. On the main track the clips after it close up.
+    fn delete_edit(&self) -> Option<Edit> {
+        let (track, clip, _) = self.history.timeline().clip(self.selected?)?;
+        Some(Edit::Remove {
+            clip: clip.id,
+            ripple: track == MAIN_TRACK,
+        })
+    }
+
     fn move_playhead(&mut self, frame: i64) -> Task<Message> {
         let frame = frame.clamp(0, self.last_frame());
         if frame == self.playhead {
@@ -682,6 +863,9 @@ impl App {
 
     /// The timeline was edited: what is under the playhead may be something else now.
     fn timeline_changed(&mut self) -> Task<Message> {
+        let timeline = self.history.timeline();
+        self.preview = None;
+        self.selected = self.selected.filter(|id| timeline.clip(*id).is_some());
         self.playhead = self.playhead.clamp(0, self.last_frame());
         self.show_playhead()
     }
@@ -739,6 +923,8 @@ impl App {
         let timeline = self.history.timeline();
         let header = row![
             button("Add clips").on_press(Message::AddRequested),
+            button("Open").on_press(Message::OpenRequested),
+            button("Save").on_press(Message::SaveRequested),
             one_line(self.headline()).width(Fill),
         ]
         .spacing(12)
@@ -764,29 +950,47 @@ impl App {
             viewer = stack![viewer, renderer_probe(Message::RendererProbed)].into();
         }
 
-        let panel = timeline_panel(
-            timeline,
-            self.playhead,
-            self.timeline_view,
-            Message::Scrubbed,
-            Message::TimelineViewed,
-        );
+        // A button that cannot do anything right now shows it by being greyed out.
         let position = format!(
             "{}   frame {} of {}",
             timecode(self.playhead, timeline.rate()),
             self.playhead,
             self.last_frame()
         );
-        let controls = row![
+        let toolbar = row![
+            button("Undo").on_press_maybe(self.history.undo_label().map(|_| Message::Undo)),
+            button("Redo").on_press_maybe(self.history.redo_label().map(|_| Message::Redo)),
+            button("Split").on_press_maybe(self.split_edit().map(|_| Message::Split)),
+            button("Delete").on_press_maybe(self.delete_edit().map(|_| Message::Delete)),
+            button("Add track").on_press(Message::AddTrack),
+            one_line(position).center_x(Fill),
             button("Previous frame").on_press(Message::Stepped(-1)),
             button("Next frame").on_press(Message::Stepped(1)),
-            text(position).wrapping(text::Wrapping::None),
-            one_line(self.readout()).align_right(Fill),
         ]
         .spacing(12)
         .align_y(Center);
 
-        column![header, viewer, panel, controls]
+        let shown = self
+            .preview
+            .as_ref()
+            .map_or(timeline, |preview| &preview.timeline);
+        let panel = timeline_panel(
+            timeline,
+            shown,
+            self.playhead,
+            self.timeline_view,
+            self.selected,
+            Message::Timeline,
+        );
+        let status = container(
+            text(self.readout())
+                .size(STATUS_TEXT_SIZE)
+                .wrapping(text::Wrapping::None),
+        )
+        .clip(true)
+        .align_right(Fill);
+
+        column![header, viewer, toolbar, panel, status]
             .spacing(10)
             .padding(12)
             .into()
@@ -862,6 +1066,32 @@ impl App {
 /// picture with it.
 fn one_line<'a>(content: String) -> container::Container<'a, Message> {
     container(text(content).wrapping(text::Wrapping::None)).clip(true)
+}
+
+async fn pick_project() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_title("Open a project")
+        .add_filter("Project", &[PROJECT_EXTENSION])
+        .pick_file()
+        .await
+        .map(|file| file.path().to_path_buf())
+}
+
+async fn pick_save_path(name: String) -> Option<PathBuf> {
+    let chosen = rfd::AsyncFileDialog::new()
+        .set_title("Save the project")
+        .add_filter("Project", &[PROJECT_EXTENSION])
+        .set_file_name(format!("{name}.{PROJECT_EXTENSION}"))
+        .save_file()
+        .await?;
+    Some(chosen.path().with_extension(PROJECT_EXTENSION))
+}
+
+async fn load_project(path: PathBuf) -> Result<(PathBuf, Timeline), String> {
+    match Timeline::load(&path) {
+        Ok(timeline) => Ok((path, timeline)),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 async fn pick_clips() -> Vec<PathBuf> {
