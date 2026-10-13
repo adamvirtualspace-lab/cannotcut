@@ -2,7 +2,9 @@
 //! playhead. Dragging in the ruler or on empty space moves the playhead; clips are picked up and
 //! moved by their body and trimmed by their edges; the wheel scrolls, and zooms with Ctrl.
 
-use cannotcut_timeline::{ClipId, Edge, Edit, Item, Placement, Rate, Timeline, TrackKind};
+use cannotcut_timeline::{
+    ClipId, Edge, Edit, Item, Placement, Rate, Timeline, Track, TrackKind,
+};
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer, text};
 use iced::advanced::{Renderer as _, text::Renderer as _};
@@ -321,7 +323,7 @@ impl<Message> TimelinePanel<'_, Message> {
         grab: f32,
         point: Point,
     ) -> (Option<Edit>, Option<i64>) {
-        let Some((from, clip, _)) = self.timeline.clip(id) else {
+        let Some((from, clip, start)) = self.timeline.clip(id) else {
             return (None, None);
         };
         let tracks = self.timeline.tracks().len();
@@ -344,6 +346,16 @@ impl<Message> TimelinePanel<'_, Message> {
                 .borders()
                 .min_by_key(|border| (border - wanted).abs())
                 .unwrap_or(0);
+            // Going back in between the same two clips is no move, even where a project from
+            // elsewhere has a gap that putting the clip in again would close.
+            let clips_before = |track: Option<&Track>, frame: i64| {
+                let clips = track.into_iter().flat_map(Track::clips);
+                clips.filter(|(start, _)| *start < frame).count()
+            };
+            let before = clips_before(self.timeline.track(MAIN_TRACK), start);
+            if from == MAIN_TRACK && clips_before(Some(target), at) == before {
+                return (None, None);
+            }
             (at, Placement::Insert, None)
         } else {
             // Either end may line up with something.
@@ -1026,6 +1038,47 @@ mod tests {
 
         // A small drag leaves it where it is: no edit.
         assert_eq!(panel.relocate(PLAIN, first, 10.0, Point::new(40.0, main)).0, None);
+    }
+
+    #[test]
+    fn nudging_a_clip_on_the_main_track_leaves_a_gap_before_it_alone() {
+        // A project from elsewhere: 100 frames, a gap of 50, then another 100.
+        let media = Arc::new(Media::from_path(Path::new("/clips/a.mp4"), RATE, 1000));
+        let mut timeline = Timeline::new("test", RATE);
+        let mut place = |at| {
+            let edit = Edit::Place {
+                track: MAIN_TRACK,
+                at,
+                clip: NewClip {
+                    name: "a".to_string(),
+                    media: media.clone(),
+                    source_start: 0,
+                    duration: 100,
+                },
+                mode: Placement::Overwrite,
+            };
+            timeline.apply(&edit).unwrap().unwrap()
+        };
+        let (first, second) = (place(0), place(150));
+        let panel = panel(&timeline, 0);
+        let main = lane_y(&timeline, MAIN_TRACK);
+
+        // A click that slips a few pixels, or a short drag either way: nothing changes.
+        for x in [195.0, 200.0, 207.0, 140.0, 400.0] {
+            let (edit, _) = panel.relocate(PLAIN, second, 50.0, Point::new(x, main));
+            assert_eq!(edit, None, "dragged to {x}");
+        }
+        // Dragged in front of the other clip, they change places.
+        let (edit, _) = panel.relocate(PLAIN, second, 50.0, Point::new(60.0, main));
+        let mut moved = timeline.clone();
+        moved.apply(&edit.unwrap()).unwrap();
+        let order: Vec<ClipId> = moved
+            .track(MAIN_TRACK)
+            .unwrap()
+            .clips()
+            .map(|(_, clip)| clip.id)
+            .collect();
+        assert_eq!(order, [second, first]);
     }
 
     #[test]
