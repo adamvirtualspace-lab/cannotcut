@@ -3,7 +3,10 @@
 //! Scrubbing works straight from the source file, without proxies. A [`Scrubber`] owns a decode
 //! thread that always chases the most recent request: after a seek it first shows the keyframe it
 //! landed on, then keeps decoding towards the requested frame unless a newer request arrives.
+//!
+//! An [`AudioReader`] gives the sound of a file, resampled for playback.
 
+mod audio;
 mod session;
 
 use std::fmt;
@@ -12,6 +15,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub use audio::{AudioReader, CHANNELS};
 use session::{Converted, Session};
 
 /// How many frames behind the playhead are decoded ahead of need, for stepping backwards.

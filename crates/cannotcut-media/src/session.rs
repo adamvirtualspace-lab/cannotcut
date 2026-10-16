@@ -743,7 +743,7 @@ fn picture_bytes(picture: &frame::Video) -> usize {
         .sum()
 }
 
-fn init() {
+pub(crate) fn init() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         ffmpeg::init().expect("FFmpeg failed to initialise");
@@ -753,7 +753,7 @@ fn init() {
     });
 }
 
-fn raw_rational(value: ffmpeg::Rational) -> ffi::AVRational {
+pub(crate) fn raw_rational(value: ffmpeg::Rational) -> ffi::AVRational {
     ffi::AVRational {
         num: value.numerator(),
         den: value.denominator(),

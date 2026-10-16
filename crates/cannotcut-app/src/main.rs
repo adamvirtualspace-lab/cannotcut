@@ -1,6 +1,7 @@
-//! cannotcut: a timeline of clips that can be rearranged, trimmed, cut and played, a viewer
-//! showing the frame under the playhead, and live latency and memory readouts.
+//! cannotcut: a timeline of clips that can be rearranged, trimmed, cut and played with their
+//! sound, a viewer showing the frame under the playhead, and live latency and memory readouts.
 
+mod settings;
 mod timeline_panel;
 mod viewer;
 
@@ -9,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cannotcut_audio::{Player, Status as SoundStatus};
 use cannotcut_media::{ClipInfo, Event, Options, Output, Pixels, Scrubber};
 use cannotcut_timeline::{
     Clip, ClipId, Edge, Edit, History, Media as TimelineMedia, NewClip, Placement, Rate,
@@ -21,11 +23,17 @@ use iced::{
     Center, Color, ContentFit, Element, Fill, Size, Subscription, Task, Theme, time, window,
 };
 use iced_runtime::image::{Allocation, allocate};
+use settings::Settings;
 use timeline_panel::{Action, MAIN_TRACK, View, timecode_base, timeline_panel};
 use viewer::{YuvPicture, renderer_probe};
 
 /// Keeps the viewer off the shader path, to try the fallback on a machine with a working GPU.
 const CPU_VIEWER_FLAG: &str = "--cpu-viewer";
+/// Plays without the sound card, following the system clock.
+const NO_SOUND_FLAG: &str = "--no-sound";
+/// Milliseconds the sound is heard later than the sound card reports; pictures wait as long.
+/// Overrides the delay kept in the settings for the sound output.
+const SOUND_DELAY_FLAG: &str = "--sound-delay=";
 /// Starts with the playhead on a frame, to look at a spot without touching the mouse.
 const PLAYHEAD_FLAG: &str = "--at=";
 const PROJECT_EXTENSION: &str = "otio";
@@ -52,6 +60,8 @@ const CARRY_ON_FRAMES: u64 = 2;
 const LEAD_SECONDS: f64 = 0.06;
 /// How many requests made while playing are remembered, to tell which frame a picture is of.
 const REMEMBERED_REQUESTS: usize = 16;
+/// How long playing waits for the sound card to start before following the system clock.
+const SOUND_START_LIMIT: Duration = Duration::from_secs(1);
 /// Wide enough for either word, so the buttons after it stay put.
 const PLAY_LABEL_WIDTH: f32 = 44.0;
 /// The rate of a project until its first clip sets it.
@@ -213,10 +223,19 @@ struct Preview {
     look_at: Option<i64>,
 }
 
-/// Playback under way: the playhead follows the clock from where it started.
+/// What the playhead follows while playing.
+#[derive(Clone, Copy)]
+enum Clock {
+    /// The sound card: the playhead is wherever the sound being heard is, so pictures keep
+    /// pace with the sound.
+    Sound { asked_at: Instant },
+    /// The system clock, from where playing started; when there is no sound card to follow.
+    Wall { started: Instant, from: i64 },
+}
+
+/// Playback under way: the playhead follows the clock.
 struct Playback {
-    started: Instant,
-    from: i64,
+    clock: Clock,
     /// The next frame on which the picture comes from another clip, once worked out, and
     /// whether the decoder for that clip has been got ready.
     cut: Option<i64>,
@@ -264,6 +283,14 @@ struct App {
     active: Option<u64>,
     /// The source being got ready for the clip after the next cut.
     warming: Option<u64>,
+    /// Plays the timeline's sound, and keeps time while playing.
+    sound: Player,
+    /// Plays without sound, as asked on the command line.
+    silent: bool,
+    /// The sound delay asked for on the command line, in milliseconds, instead of the one in
+    /// the settings.
+    sound_delay: Option<u64>,
+    settings: Settings,
     playback: Option<Playback>,
     play_stats: Option<PlayStats>,
     pending: Option<Pending>,
@@ -356,6 +383,10 @@ impl App {
             opening: None,
             active: None,
             warming: None,
+            sound: Player::start(),
+            silent: false,
+            sound_delay: None,
+            settings: Settings::load(),
             playback: None,
             play_stats: None,
             pending: None,
@@ -377,6 +408,10 @@ impl App {
             let text = argument.to_string_lossy();
             if text == CPU_VIEWER_FLAG {
                 app.viewer = Some(ViewerPath::Cpu);
+            } else if text == NO_SOUND_FLAG {
+                app.silent = true;
+            } else if let Some(milliseconds) = text.strip_prefix(SOUND_DELAY_FLAG) {
+                app.sound_delay = milliseconds.parse().ok();
             } else if let Some(frame) = text.strip_prefix(PLAYHEAD_FLAG) {
                 playhead = frame.parse().unwrap_or(0);
             } else if path.extension().is_some_and(|extension| extension == PROJECT_EXTENSION) {
@@ -400,7 +435,7 @@ impl App {
         self.project_path = Some(path);
         self.selected = None;
         self.preview = None;
-        self.playback = None;
+        self.stop_playing();
         self.warming = None;
         self.playhead = 0;
         // The old project's files are closed; the new one's open as the playhead reaches them.
@@ -695,8 +730,28 @@ impl App {
         let Some(playback) = &mut self.playback else {
             return Task::none();
         };
-        let elapsed = now.saturating_duration_since(playback.started).as_secs_f64();
-        let frame = (playback.from + (elapsed * rate) as i64).min(last_frame);
+        let frame = match playback.clock {
+            Clock::Sound { asked_at } => match self.sound.position(now) {
+                Some(seconds) => (seconds * rate) as i64,
+                // The sound card does not answer: the system clock takes over from here.
+                None if now.saturating_duration_since(asked_at) > SOUND_START_LIMIT => {
+                    self.sound.stop();
+                    playback.clock = Clock::Wall {
+                        started: now,
+                        from: self.playhead,
+                    };
+                    self.playhead
+                }
+                // The pictures wait for the sound to start.
+                None => self.playhead,
+            },
+            Clock::Wall { started, from } => {
+                from + (now.saturating_duration_since(started).as_secs_f64() * rate) as i64
+            }
+        };
+        // The sound card's first guesses at its delay can be a few milliseconds out; the
+        // playhead never steps back for that.
+        let frame = frame.clamp(self.playhead, last_frame);
         self.playhead = frame;
 
         // The newest picture that is due; older ones it overtook are dropped.
@@ -731,7 +786,7 @@ impl App {
             }
         }
         if frame >= last_frame {
-            self.playback = None;
+            self.stop_playing();
             return self.show_playhead();
         }
         let asked = if ask.is_some() {
@@ -853,15 +908,33 @@ impl App {
                 return self.move_playhead(self.playhead.saturating_add(frames));
             }
             Message::PlayToggled => {
-                if self.playback.take().is_none() && self.history.timeline().duration() > 0 {
+                let was_playing = self.playback.is_some();
+                self.stop_playing();
+                if !was_playing && self.history.timeline().duration() > 0 {
                     // From the end, playing starts over.
                     if self.playhead >= self.last_frame() {
                         self.playhead = 0;
                     }
                     self.preview = None;
+                    let clock = match self.sound.status() {
+                        SoundStatus::Ready { .. } if !self.silent => {
+                            let delay = self.output_delay().unwrap_or(0);
+                            self.sound.set_delay(Duration::from_millis(delay));
+                            // Tracks are shared, so the copy for the sound thread is cheap.
+                            let timeline = self.history.timeline().clone();
+                            let folder = self.project_folder.clone();
+                            self.sound.play(timeline, self.playhead, folder);
+                            Clock::Sound {
+                                asked_at: Instant::now(),
+                            }
+                        }
+                        _ => Clock::Wall {
+                            started: Instant::now(),
+                            from: self.playhead,
+                        },
+                    };
                     self.playback = Some(Playback {
-                        started: Instant::now(),
-                        from: self.playhead,
+                        clock,
                         cut: None,
                         warmed: false,
                         asked: self.playhead,
@@ -1106,9 +1179,26 @@ impl App {
         })
     }
 
+    /// How much later than the sound card reports the sound is heard, in milliseconds, when
+    /// that is known for the output in use.
+    fn output_delay(&self) -> Option<u64> {
+        match self.sound.status() {
+            SoundStatus::Ready { device, .. } => self
+                .sound_delay
+                .or_else(|| self.settings.sound_delays.get(&device).copied()),
+            _ => None,
+        }
+    }
+
+    /// Ends playback, sound and all.
+    fn stop_playing(&mut self) {
+        self.playback = None;
+        self.sound.stop();
+    }
+
     /// Puts the playhead where the user wants it, which ends playback.
     fn move_playhead(&mut self, frame: i64) -> Task<Message> {
-        self.playback = None;
+        self.stop_playing();
         let frame = frame.clamp(0, self.last_frame());
         if frame == self.playhead {
             return Task::none();
@@ -1119,8 +1209,8 @@ impl App {
 
     /// The timeline was edited: what is under the playhead may be something else now.
     fn timeline_changed(&mut self) -> Task<Message> {
+        self.stop_playing();
         let timeline = self.history.timeline();
-        self.playback = None;
         self.preview = None;
         self.selected = self.selected.filter(|id| timeline.clip(*id).is_some());
         self.playhead = self.playhead.clamp(0, self.last_frame());
@@ -1327,6 +1417,20 @@ impl App {
                 stats.longest_gap.as_millis()
             ));
         }
+        parts.push(match self.sound.status() {
+            SoundStatus::Ready { rate, .. } => {
+                let delay = match self.output_delay() {
+                    Some(delay) => format!(", {delay} ms late"),
+                    None => String::new(),
+                };
+                match self.sound.problem() {
+                    Some(problem) => format!("sound {} kHz{delay}: {problem}", rate / 1000),
+                    None => format!("sound {} kHz{delay}", rate / 1000),
+                }
+            }
+            SoundStatus::Starting => "sound starting".to_string(),
+            SoundStatus::Unavailable(why) => format!("no sound: {why}"),
+        });
         parts.push(format!("{} open", self.sources.len()));
         if let Some(memory_mb) = self.memory_mb {
             parts.push(format!("{memory_mb} MB"));

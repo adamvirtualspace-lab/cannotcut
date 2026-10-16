@@ -8,6 +8,7 @@ name = "cannotcut"
 path = "src/main.rs"
 
 [dependencies]
+cannotcut-audio.workspace = true
 cannotcut-media.workspace = true
 cannotcut-timeline.workspace = true
 iced.workspace = true
@@ -15,3 +16,4 @@ iced.workspace = true
 iced_runtime.workspace = true
 memory-stats.workspace = true
 rfd.workspace = true
+serde_json.workspace = true
