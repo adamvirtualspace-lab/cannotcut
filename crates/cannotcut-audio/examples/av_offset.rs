@@ -2,7 +2,11 @@
 //! to measure how far pictures and sound are apart (Windows only). Run it while cannotcut plays
 //! a clip that flashes white on every click, such as `C:\dev\clips\sound_cuts.otio`.
 //!
-//! Usage: `cargo run -p cannotcut-audio --example av_offset -- <out prefix> <seconds> [x y]`
+//! Usage: `cargo run -p cannotcut-audio --example av_offset -- <out prefix> <seconds> [x y]
+//! [--mic]`
+//!
+//! With `--mic` the sound is heard through the default microphone instead, pointed at the
+//! speakers: what the ear gets, delays of the speakers' own processing included.
 //!
 //! `x` and `y` place the patch of screen that is watched, as fractions of the screen (default
 //! 0.35 0.2, inside the viewer of a maximized window). Writes `<prefix>-screen.csv` (when each new
@@ -50,8 +54,9 @@ mod windows_only {
     type Blocks = Arc<Mutex<Vec<(f64, Vec<f32>)>>>;
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-        let mut arguments = std::env::args().skip(1);
-        let usage = "usage: av_offset <out prefix> <seconds> [x y]";
+        let mic = std::env::args().any(|argument| argument == "--mic");
+        let mut arguments = std::env::args().skip(1).filter(|argument| argument != "--mic");
+        let usage = "usage: av_offset <out prefix> <seconds> [x y] [--mic]";
         let prefix = arguments.next().ok_or(usage)?;
         let seconds: f64 = arguments.next().ok_or(usage)?.parse()?;
         let x: f64 = arguments.next().map_or(Ok(0.35), |x| x.parse())?;
@@ -59,10 +64,19 @@ mod windows_only {
 
         // The sound: recording an output device records what it plays. Its timestamps are the
         // performance counter in 100 ns steps.
-        let device = cpal::default_host()
-            .default_output_device()
-            .ok_or("no sound output")?;
-        let config: cpal::StreamConfig = device.default_output_config()?.into();
+        let host = cpal::default_host();
+        let (device, config) = if mic {
+            let device = host.default_input_device().ok_or("no microphone")?;
+            let config = device.default_input_config()?;
+            (device, config)
+        } else {
+            let device = host.default_output_device().ok_or("no sound output")?;
+            let config = device.default_output_config()?;
+            (device, config)
+        };
+        let name = device.description().map(|description| description.name().to_string());
+        println!("listening with {} ({config:?})", name.unwrap_or_default());
+        let config: cpal::StreamConfig = config.into();
         let channels = usize::from(config.channels);
         let rate = config.sample_rate;
         let blocks: Blocks = Arc::default();

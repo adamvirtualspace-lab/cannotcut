@@ -24,28 +24,28 @@ const MAX_SEEK_ATTEMPTS: usize = 4;
 const PREVIEW_FORMAT: Pixel = Pixel::NV12;
 const HD_MIN_HEIGHT: u32 = 720;
 
-struct Hardware {
+pub(crate) struct Hardware {
     device: ffi::AVHWDeviceType,
-    pixel: ffi::AVPixelFormat,
-    name: &'static str,
+    pub(crate) pixel: ffi::AVPixelFormat,
+    pub(crate) name: &'static str,
 }
 
 #[cfg(windows)]
-const HARDWARE: Option<Hardware> = Some(Hardware {
+pub(crate) const HARDWARE: Option<Hardware> = Some(Hardware {
     device: ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
     pixel: ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
     name: "D3D11VA",
 });
 
 #[cfg(target_os = "linux")]
-const HARDWARE: Option<Hardware> = Some(Hardware {
+pub(crate) const HARDWARE: Option<Hardware> = Some(Hardware {
     device: ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
     pixel: ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
     name: "VAAPI",
 });
 
 #[cfg(not(any(windows, target_os = "linux")))]
-const HARDWARE: Option<Hardware> = None;
+pub(crate) const HARDWARE: Option<Hardware> = None;
 
 /// Presentation span of a decoded frame, in stream time base units.
 #[derive(Clone, Copy)]
@@ -63,11 +63,11 @@ pub(crate) struct Converted {
 }
 
 /// A GPU decode device. The decoders a session goes through share one.
-struct Device(*mut ffi::AVBufferRef);
+pub(crate) struct Device(*mut ffi::AVBufferRef);
 
 impl Device {
     /// The platform's decode device, when there is one and `codec` can use it.
-    fn create(codec: &ffmpeg::Codec) -> Option<Self> {
+    pub(crate) fn create(codec: &ffmpeg::Codec) -> Option<Self> {
         let hardware = HARDWARE?;
         unsafe {
             let supported = (0..)
@@ -103,15 +103,15 @@ impl Drop for Device {
 
 /// What it takes to open a decoder for the clip, which happens more than once: see
 /// [`Session::seek_demuxer`].
-struct DecoderSource {
-    parameters: codec::Parameters,
-    codec: ffmpeg::Codec,
+pub(crate) struct DecoderSource {
+    pub(crate) parameters: codec::Parameters,
+    pub(crate) codec: ffmpeg::Codec,
     /// None when decoding in software.
-    device: Option<Device>,
+    pub(crate) device: Option<Device>,
 }
 
 impl DecoderSource {
-    fn open(&self) -> Result<decoder::Video, Error> {
+    pub(crate) fn open(&self) -> Result<decoder::Video, Error> {
         let mut context = codec::Context::from_parameters(self.parameters.clone())
             .map_err(|error| Error::new("read codec parameters", error))?;
         match &self.device {
@@ -554,7 +554,7 @@ impl Session {
 }
 
 impl Colors {
-    fn of(frame: &frame::Video) -> Self {
+    pub(crate) fn of(frame: &frame::Video) -> Self {
         use ffmpeg::color::{Range, Space};
         let matrix = match frame.color_space() {
             Space::BT709 => Matrix::Bt709,

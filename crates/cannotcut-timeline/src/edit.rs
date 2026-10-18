@@ -58,6 +58,16 @@ pub enum Edit {
         mode: Placement,
         ripple: bool,
     },
+    /// Sets how loud a clip's sound plays: 1 as recorded, 0 silent.
+    SetVolume {
+        clip: ClipId,
+        volume: f32,
+    },
+    /// Silences a track's sound, or lets it be heard again. Its pictures are not affected.
+    SetMuted {
+        track: usize,
+        muted: bool,
+    },
 }
 
 impl Edit {
@@ -71,6 +81,9 @@ impl Edit {
             Self::Trim { .. } => "Trim",
             Self::Remove { .. } => "Delete",
             Self::Move { .. } => "Move",
+            Self::SetVolume { .. } => "Volume",
+            Self::SetMuted { muted: true, .. } => "Mute",
+            Self::SetMuted { muted: false, .. } => "Unmute",
         }
     }
 }
@@ -189,6 +202,7 @@ impl Timeline {
                     source_start: clip.source_start,
                     duration: clip.duration,
                     enabled: true,
+                    volume: 1.0,
                     extras: Extras::default(),
                 };
                 let id = clip.id;
@@ -252,6 +266,24 @@ impl Timeline {
                 let moved = self.take(*clip, *ripple)?;
                 check_span(*at, moved.duration)?;
                 self.place(*track, *at, moved, *mode)?;
+                Ok(None)
+            }
+            Edit::SetVolume { clip, volume } => {
+                if !volume.is_finite() || *volume < 0.0 {
+                    return Err(EditError::OutOfBounds);
+                }
+                let (track, index) = self.locate(*clip)?;
+                if let Item::Clip(clip) = &mut Arc::make_mut(&mut self.tracks[track]).items[index] {
+                    clip.volume = *volume;
+                }
+                Ok(None)
+            }
+            Edit::SetMuted { track, muted } => {
+                let track = self
+                    .tracks
+                    .get_mut(*track)
+                    .ok_or(EditError::NoSuchTrack(*track))?;
+                Arc::make_mut(track).muted = *muted;
                 Ok(None)
             }
         }
@@ -902,5 +934,45 @@ mod tests {
             .tracks()
             .flat_map(|track| track.clips().map(|(_, clip)| clip.duration))
             .sum()
+    }
+
+    #[test]
+    fn volume_and_mute_change_the_sound_and_nothing_else() {
+        let mut history = History::new(Timeline::new("t", RATE));
+        let mut placed = history.timeline().clone();
+        let id = place(&mut placed, 0, clip(0, 30), Placement::Insert);
+        history = History::new(placed);
+        let before = layout(history.timeline(), 0);
+
+        let louder = Edit::SetVolume {
+            clip: id,
+            volume: 1.5,
+        };
+        history.apply(&louder).unwrap();
+        let mute = Edit::SetMuted {
+            track: 0,
+            muted: true,
+        };
+        history.apply(&mute).unwrap();
+        let timeline = history.timeline();
+        assert_eq!(timeline.clip(id).unwrap().1.volume, 1.5);
+        assert!(timeline.track(0).unwrap().muted);
+        assert_eq!(layout(timeline, 0), before);
+        assert_eq!(history.undo_label(), Some("Mute"));
+
+        history.undo();
+        assert!(!history.timeline().track(0).unwrap().muted);
+        history.undo();
+        assert_eq!(history.timeline().clip(id).unwrap().1.volume, 1.0);
+
+        for volume in [-0.5, f32::NAN, f32::INFINITY] {
+            let refused = history.apply(&Edit::SetVolume { clip: id, volume });
+            assert_eq!(refused, Err(EditError::OutOfBounds));
+        }
+        let missing = history.apply(&Edit::SetMuted {
+            track: 3,
+            muted: true,
+        });
+        assert_eq!(missing, Err(EditError::NoSuchTrack(3)));
     }
 }

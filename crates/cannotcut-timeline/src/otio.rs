@@ -134,6 +134,10 @@ fn write_track(track: &Track, rate: Rate) -> Value {
             }),
         })
         .collect();
+    let mut metadata = track.extras.metadata.clone();
+    if track.muted {
+        metadata.insert(OWN_METADATA.to_string(), json!({ "muted": true }));
+    }
     json!({
         "OTIO_SCHEMA": "Track.1",
         "children": children,
@@ -144,7 +148,7 @@ fn write_track(track: &Track, rate: Rate) -> Value {
             TrackKind::Audio => "Audio",
         },
         "markers": track.extras.markers,
-        "metadata": track.extras.metadata,
+        "metadata": metadata,
         "name": track.name,
         "source_range": null,
     })
@@ -172,6 +176,10 @@ fn write_clip(clip: &Clip, rate: Rate) -> Value {
     }
     // The range is written at the timeline's rate, where its numbers are whole.
     let source_start = media_start(media, rate) + clip.source_start;
+    let mut clip_metadata = clip.extras.metadata.clone();
+    if clip.volume != 1.0 {
+        clip_metadata.insert(OWN_METADATA.to_string(), json!({ "volume": clip.volume }));
+    }
     json!({
         "OTIO_SCHEMA": "Clip.2",
         "active_media_reference_key": DEFAULT_MEDIA,
@@ -179,7 +187,7 @@ fn write_clip(clip: &Clip, rate: Rate) -> Value {
         "enabled": clip.enabled,
         "markers": clip.extras.markers,
         "media_references": { DEFAULT_MEDIA: reference },
-        "metadata": clip.extras.metadata,
+        "metadata": clip_metadata,
         "name": clip.name,
         "source_range": range(source_start, clip.duration, rate),
     })
@@ -213,11 +221,16 @@ fn read_track(track: &Object, rate: Rate, next_id: &mut u64) -> Result<Track, Er
             _ => return Err(unsupported(schema(child), "on a track")),
         }
     }
+    let mut extras = extras(track);
+    let own = extras.metadata.remove(OWN_METADATA);
     let mut track = Track {
         name: text_of(track, "name"),
         kind,
         enabled: flag(track, "enabled"),
-        extras: extras(track),
+        muted: own
+            .and_then(|own| own.get("muted")?.as_bool())
+            .unwrap_or(false),
+        extras,
         items,
     };
     track.tidy();
@@ -264,6 +277,12 @@ fn read_clip(clip: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error
         name: text_of(reference, "name"),
         metadata: media_metadata,
     };
+    let mut extras = extras(clip);
+    let own = extras.metadata.remove(OWN_METADATA);
+    let volume = own
+        .and_then(|own| own.get("volume")?.as_f64())
+        .filter(|volume| volume.is_finite() && *volume >= 0.0)
+        .map_or(1.0, |volume| volume as f32);
     Ok(Clip {
         id: new_id(next_id),
         name,
@@ -271,7 +290,8 @@ fn read_clip(clip: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error
         duration: frames(source_duration.0, source_duration.1, rate),
         media: Arc::new(media),
         enabled: flag(clip, "enabled"),
-        extras: extras(clip),
+        volume,
+        extras,
     })
 }
 
@@ -580,6 +600,20 @@ mod tests {
         for edit in &edits {
             timeline.apply(edit).unwrap();
         }
+        let (_, late) = timeline.track(1).unwrap().clips().next().unwrap();
+        let late = late.id;
+        timeline
+            .apply(&Edit::SetVolume {
+                clip: late,
+                volume: 0.35,
+            })
+            .unwrap();
+        timeline
+            .apply(&Edit::SetMuted {
+                track: 1,
+                muted: true,
+            })
+            .unwrap();
         let text = timeline.to_otio();
         assert_eq!(Timeline::from_otio(&text).unwrap(), timeline);
         // Other tools read whole numbers at the timeline's rate.

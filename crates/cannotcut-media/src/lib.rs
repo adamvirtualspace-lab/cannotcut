@@ -4,9 +4,11 @@
 //! thread that always chases the most recent request: after a seek it first shows the keyframe it
 //! landed on, then keeps decoding towards the requested frame unless a newer request arrives.
 //!
-//! An [`AudioReader`] gives the sound of a file, resampled for playback.
+//! An [`AudioReader`] gives the sound of a file, resampled for playback, and a [`FilmWriter`]
+//! encodes a finished film, its pictures drawn by [`ClipReader`]s.
 
 mod audio;
+mod export;
 mod session;
 
 use std::fmt;
@@ -15,7 +17,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub use audio::{AudioReader, CHANNELS};
+pub use audio::{AudioReader, CHANNELS, Waveform};
+pub use export::{
+    AUDIO_BIT_RATE, ClipReader, FilmFormat, FilmPicture, FilmWriter, picture_size,
+};
 use session::{Converted, Session};
 
 /// How many frames behind the playhead are decoded ahead of need, for stepping backwards.

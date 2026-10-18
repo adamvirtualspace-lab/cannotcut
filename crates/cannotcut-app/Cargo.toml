@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 cannotcut-audio.workspace = true
+cannotcut-export.workspace = true
 cannotcut-media.workspace = true
 cannotcut-timeline.workspace = true
 iced.workspace = true

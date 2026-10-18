@@ -210,6 +210,8 @@ pub struct Clip {
     /// Length on the timeline, in timeline frames.
     pub duration: i64,
     pub enabled: bool,
+    /// How loud its sound plays: 1 as recorded, 0 silent, 2 twice as strong.
+    pub volume: f32,
     pub extras: Extras,
 }
 
@@ -286,6 +288,8 @@ pub struct Track {
     pub name: String,
     pub kind: TrackKind,
     pub enabled: bool,
+    /// Its sound is not heard; its pictures still are.
+    pub muted: bool,
     pub extras: Extras,
     pub(crate) items: Vec<Item>,
 }
@@ -296,6 +300,7 @@ impl Track {
             name: name.into(),
             kind,
             enabled: true,
+            muted: false,
             extras: Extras::default(),
             items: Vec::new(),
         }

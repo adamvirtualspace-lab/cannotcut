@@ -4,6 +4,7 @@ members = [
     "crates/cannotcut-media",
     "crates/cannotcut-timeline",
     "crates/cannotcut-audio",
+    "crates/cannotcut-export",
     "crates/cannotcut-app",
 ]
 
@@ -13,6 +14,7 @@ edition = "2024"
 
 [workspace.dependencies]
 cannotcut-audio = { path = "crates/cannotcut-audio" }
+cannotcut-export = { path = "crates/cannotcut-export" }
 cannotcut-media = { path = "crates/cannotcut-media" }
 cannotcut-timeline = { path = "crates/cannotcut-timeline" }
 cpal = "0.18.2"

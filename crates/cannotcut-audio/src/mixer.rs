@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use cannotcut_media::{AudioReader, CHANNELS};
-use cannotcut_timeline::{Clip, ClipId, Rate, Timeline};
+use cannotcut_timeline::{Clip, ClipId, Rate, Timeline, Track};
 
 /// Mixes the sound of every clip on a timeline, from a starting frame onwards, in order.
 pub struct Mixer {
@@ -31,10 +31,15 @@ struct Voice {
 impl Mixer {
     /// A mix of `timeline` from frame `from`, at `rate` samples a second.
     pub fn new(timeline: Timeline, from: i64, rate: u32, folder: Option<PathBuf>) -> Self {
-        let to_sample = |frame| frame_to_sample(frame, timeline.rate(), rate);
+        let from = frame_to_sample(from, timeline.rate(), rate);
+        Self::from_sample(timeline, from, rate, folder)
+    }
+
+    /// A mix of `timeline` from sample `from`, at `rate` samples a second.
+    pub fn from_sample(timeline: Timeline, from: i64, rate: u32, folder: Option<PathBuf>) -> Self {
         Self {
-            position: to_sample(from),
-            end: to_sample(timeline.duration()),
+            position: from.max(0),
+            end: frame_to_sample(timeline.duration(), timeline.rate(), rate),
             timeline,
             folder,
             rate,
@@ -70,15 +75,16 @@ impl Mixer {
         let to_sample = |frame| frame_to_sample(frame, timeline_rate, rate);
 
         let mut heard = Vec::new();
-        for track in self.timeline.tracks().filter(|track| track.enabled) {
+        let sounding = |track: &&Track| track.enabled && !track.muted;
+        for track in self.timeline.tracks().filter(sounding) {
             for (start, clip) in track.clips().filter(|(_, clip)| clip.enabled) {
                 let (begins, ends) = (to_sample(start), to_sample(start + clip.duration));
                 if begins < to && ends > from && !self.silent.contains(&clip.id) {
-                    heard.push((begins, ends, clip.id));
+                    heard.push((begins, ends, clip.id, clip.volume));
                 }
             }
         }
-        for (begins, ends, id) in heard {
+        for (begins, ends, id, volume) in heard {
             let (first, last) = (begins.max(from), ends.min(to));
             let voice = match self.voices.iter().position(|voice| voice.clip == id) {
                 Some(index) => index,
@@ -121,7 +127,7 @@ impl Mixer {
             }
             let offset = (first - from) as usize * CHANNELS;
             for (mixed, sample) in out[offset..offset + samples].iter_mut().zip(&self.scratch) {
-                *mixed += sample;
+                *mixed += sample * volume;
             }
         }
         self.voices.retain(|voice| voice.end > to);

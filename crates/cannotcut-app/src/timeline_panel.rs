@@ -1,7 +1,12 @@
 //! The timeline as the user sees and edits it: a ruler, a lane per track with its clips, and the
 //! playhead. Dragging in the ruler or on empty space moves the playhead; clips are picked up and
-//! moved by their body and trimmed by their edges; the wheel scrolls, and zooms with Ctrl.
+//! moved by their body and trimmed by their edges; the wheel scrolls, and zooms with Ctrl. A
+//! clip's sound is drawn along its bottom, as loud as it will play.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use cannotcut_media::Waveform;
 use cannotcut_timeline::{
     ClipId, Edge, Edit, Item, Placement, Rate, Timeline, Track, TrackKind,
 };
@@ -18,10 +23,16 @@ use iced::{
 /// dropped on it go in between the others.
 pub const MAIN_TRACK: usize = 0;
 /// The panel never changes height: the viewer above it must not be squeezed by what it shows.
-const PANEL_HEIGHT: f32 = 176.0;
-const RULER_HEIGHT: f32 = 24.0;
-const LANE_HEIGHT: f32 = 40.0;
-const LANE_GAP: f32 = 4.0;
+pub const PANEL_HEIGHT: f32 = 176.0;
+pub const RULER_HEIGHT: f32 = 24.0;
+pub const LANE_HEIGHT: f32 = 40.0;
+pub const LANE_GAP: f32 = 4.0;
+/// The part of a lane, from its bottom, that a clip's waveform takes up.
+const WAVEFORM_HEIGHT: f32 = 16.0;
+/// How far below full scale, in decibels, the quietest sound drawn is.
+const WAVEFORM_RANGE_DB: f32 = 48.0;
+/// Pixels from one bar of a waveform to the next.
+const WAVEFORM_STEP: f32 = 2.0;
 /// Room left of frame zero and right of the last frame when everything is shown.
 const MARGIN: f32 = 12.0;
 /// How much of an empty timeline is shown.
@@ -112,6 +123,9 @@ pub enum Action {
     Cancel,
 }
 
+/// The waveforms of the media files that have been read, by the files' names in the project.
+pub type Waveforms = HashMap<String, Arc<Waveform>>;
+
 pub struct TimelinePanel<'a, Message> {
     /// The timeline as it is. Drags are worked out against it.
     timeline: &'a Timeline,
@@ -120,6 +134,7 @@ pub struct TimelinePanel<'a, Message> {
     playhead: i64,
     view: Option<View>,
     selected: Option<ClipId>,
+    waveforms: &'a Waveforms,
     on_action: Box<dyn Fn(Action) -> Message + 'a>,
 }
 
@@ -131,6 +146,7 @@ pub fn timeline_panel<'a, Message>(
     playhead: i64,
     view: Option<View>,
     selected: Option<ClipId>,
+    waveforms: &'a Waveforms,
     on_action: impl Fn(Action) -> Message + 'a,
 ) -> TimelinePanel<'a, Message> {
     TimelinePanel {
@@ -139,6 +155,7 @@ pub fn timeline_panel<'a, Message>(
         playhead,
         view,
         selected,
+        waveforms,
         on_action: Box::new(on_action),
     }
 }
@@ -708,18 +725,57 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                             ..pair.color
                         },
                     );
+                    let waveform = clip.media.target.as_ref().and_then(|target| {
+                        self.waveforms.get(target)
+                    });
+                    if let (Some(waveform), Some(visible)) = (waveform, area.intersection(&bounds))
+                    {
+                        // Each bar is the loudest the clip gets over its stretch, at the
+                        // clip's volume. A muted track's sound is drawn faint.
+                        let faintness = if track.muted { 0.2 } else { 0.55 };
+                        let color = Color {
+                            a: dimmed * faintness,
+                            ..pair.text
+                        };
+                        let base = y + LANE_HEIGHT - 2.0;
+                        let seconds = |x: f32| {
+                            let frame = view.frame(x - bounds.x) - start as f32;
+                            (clip.source_start as f64 + f64::from(frame)) / rate.as_f64()
+                        };
+                        let mut x = visible.x;
+                        while x < visible.x + visible.width - 1.0 {
+                            let peak = waveform.peak(seconds(x), seconds(x + WAVEFORM_STEP));
+                            let height = loudness(peak * clip.volume) * WAVEFORM_HEIGHT;
+                            if height >= 0.5 {
+                                renderer.fill_quad(
+                                    renderer::Quad {
+                                        bounds: Rectangle::new(
+                                            Point::new(x, base - height),
+                                            Size::new(WAVEFORM_STEP / 2.0, height),
+                                        ),
+                                        ..renderer::Quad::default()
+                                    },
+                                    color,
+                                );
+                            }
+                            x += WAVEFORM_STEP;
+                        }
+                    }
                     if let Some(visible) = area
                         .intersection(&bounds)
                         .filter(|_| width >= MIN_LABELLED_WIDTH)
                     {
-                        // The name stays in sight while any of the clip is.
-                        let position =
-                            Point::new(visible.x + 8.0, y + LANE_HEIGHT / 2.0);
+                        // The name stays in sight while any of the clip is, above the sound.
+                        let position = Point::new(visible.x + 8.0, y + LANE_HEIGHT * 0.3);
                         let color = Color {
                             a: dimmed,
                             ..pair.text
                         };
-                        let (name, shaping) = (clip.name.clone(), text::Shaping::Advanced);
+                        let mut name = clip.name.clone();
+                        if clip.volume != 1.0 {
+                            name.push_str(&format!("  {:.0}%", clip.volume * 100.0));
+                        }
+                        let shaping = text::Shaping::Advanced;
                         fill_label(renderer, name, position, color, visible, shaping);
                     }
                 }
@@ -788,6 +844,16 @@ impl<'a, Message: 'a> From<TimelinePanel<'a, Message>> for Element<'a, Message> 
     fn from(panel: TimelinePanel<'a, Message>) -> Self {
         Element::new(panel)
     }
+}
+
+/// How tall a peak is drawn, from 0 to 1. Ears hear loudness in steps of ratio, so the bars do
+/// too: every halving of the sound takes the same height off, and sound more than
+/// [`WAVEFORM_RANGE_DB`] below full scale is not drawn.
+fn loudness(peak: f32) -> f32 {
+    if peak <= 0.0 {
+        return 0.0;
+    }
+    ((20.0 * peak.log10() + WAVEFORM_RANGE_DB) / WAVEFORM_RANGE_DB).clamp(0.0, 1.0)
 }
 
 /// One line of small text, vertically centred on `position` and cut off at `clip`.
@@ -898,8 +964,10 @@ mod tests {
         (timeline, ids)
     }
 
+    static NO_WAVEFORMS: std::sync::LazyLock<Waveforms> = std::sync::LazyLock::new(HashMap::new);
+
     fn panel(timeline: &Timeline, playhead: i64) -> TimelinePanel<'_, ()> {
-        timeline_panel(timeline, timeline, playhead, Some(PLAIN), None, |_| ())
+        timeline_panel(timeline, timeline, playhead, Some(PLAIN), None, &NO_WAVEFORMS, |_| ())
     }
 
     /// The height of the middle of a track's lane.

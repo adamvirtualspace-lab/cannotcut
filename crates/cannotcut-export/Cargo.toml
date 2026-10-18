@@ -1,0 +1,9 @@
+[package]
+name = "cannotcut-export"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cannotcut-audio.workspace = true
+cannotcut-media.workspace = true
+cannotcut-timeline.workspace = true

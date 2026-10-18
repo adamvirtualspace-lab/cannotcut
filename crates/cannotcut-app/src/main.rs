@@ -5,26 +5,36 @@ mod settings;
 mod timeline_panel;
 mod viewer;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cannotcut_audio::{Player, Status as SoundStatus};
-use cannotcut_media::{ClipInfo, Event, Options, Output, Pixels, Scrubber};
+use cannotcut_export::{Event as ExportEvent, Export, Quality, Resolution};
+use cannotcut_media::{
+    ClipInfo, Event, Options, Output, Pixels, Scrubber, Waveform, picture_size,
+};
 use cannotcut_timeline::{
     Clip, ClipId, Edge, Edit, History, Media as TimelineMedia, NewClip, Placement, Rate,
     Timeline, TrackKind,
 };
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
-use iced::widget::{button, center, column, container, image, row, sensor, shader, stack, text};
+use iced::futures::channel::oneshot;
+use iced::widget::{
+    Column, button, center, column, container, image, pick_list, progress_bar, row, sensor,
+    shader, slider, stack, text,
+};
 use iced::{
     Center, Color, ContentFit, Element, Fill, Size, Subscription, Task, Theme, time, window,
 };
 use iced_runtime::image::{Allocation, allocate};
 use settings::Settings;
-use timeline_panel::{Action, MAIN_TRACK, View, timecode_base, timeline_panel};
+use timeline_panel::{
+    Action, LANE_GAP, LANE_HEIGHT, MAIN_TRACK, PANEL_HEIGHT, RULER_HEIGHT, View, Waveforms,
+    timecode_base, timeline_panel,
+};
 use viewer::{YuvPicture, renderer_probe};
 
 /// Keeps the viewer off the shader path, to try the fallback on a machine with a working GPU.
@@ -34,9 +44,18 @@ const NO_SOUND_FLAG: &str = "--no-sound";
 /// Milliseconds the sound is heard later than the sound card reports; pictures wait as long.
 /// Overrides the delay kept in the settings for the sound output.
 const SOUND_DELAY_FLAG: &str = "--sound-delay=";
+/// Exports the project to this film as soon as it is open, without asking where.
+const EXPORT_FLAG: &str = "--export=";
 /// Starts with the playhead on a frame, to look at a spot without touching the mouse.
 const PLAYHEAD_FLAG: &str = "--at=";
 const PROJECT_EXTENSION: &str = "otio";
+const FILM_EXTENSION: &str = "mp4";
+const EXPORT_BAR_WIDTH: f32 = 160.0;
+const DIALOG_WIDTH: f32 = 380.0;
+const DIALOG_LABEL_WIDTH: f32 = 90.0;
+const DIALOG_TITLE_SIZE: f32 = 20.0;
+const BYTES_PER_MEGABYTE: f64 = 1_000_000.0;
+const EXPORT_BAR_HEIGHT: f32 = 8.0;
 /// The small print of the status row.
 const STATUS_TEXT_SIZE: f32 = 13.0;
 const MEMORY_REFRESH: Duration = Duration::from_secs(1);
@@ -60,10 +79,30 @@ const CARRY_ON_FRAMES: u64 = 2;
 const LEAD_SECONDS: f64 = 0.06;
 /// How many requests made while playing are remembered, to tell which frame a picture is of.
 const REMEMBERED_REQUESTS: usize = 16;
+/// How strongly each display tick's time pulls the steady tick times towards it.
+const TICK_PULL: f64 = 0.05;
+/// Tick intervals the display's pace is first worked out from. A single one can be far out: a
+/// tick can come early, or the app can miss one.
+const PACE_SAMPLES: usize = 8;
+/// A frame start this close to a display tick, as a share of a frame (about a millisecond at
+/// 30 fps), could fall either side of it from one tick to the next.
+const NEAR_TICK: f64 = 0.03;
+/// How far such a frame start is moved away from the tick, as a share of a frame.
+const TICK_NUDGE: f64 = 0.1;
 /// How long playing waits for the sound card to start before following the system clock.
 const SOUND_START_LIMIT: Duration = Duration::from_secs(1);
 /// Wide enough for either word, so the buttons after it stay put.
 const PLAY_LABEL_WIDTH: f32 = 44.0;
+/// Peaks a second in a waveform: enough to see words and beats.
+const WAVEFORM_RATE: u32 = 100;
+/// The loudest a clip can be turned up to: twice as strong as recorded.
+const MAX_VOLUME: f32 = 2.0;
+const VOLUME_SLIDER_WIDTH: f32 = 140.0;
+/// Wide enough for "200%", so the slider beside it stays put.
+const VOLUME_LABEL_WIDTH: f32 = 44.0;
+/// The column of track buttons left of the timeline panel.
+const HEADER_WIDTH: f32 = 72.0;
+const HEADER_TEXT_SIZE: f32 = 12.0;
 /// The rate of a project until its first clip sets it.
 const EMPTY_PROJECT_RATE: Rate = Rate::new(30, 1);
 
@@ -92,6 +131,19 @@ enum Message {
     ProjectLoaded(Result<(PathBuf, Timeline), String>),
     SaveRequested,
     SaveChosen(Option<PathBuf>),
+    /// Show the export choices.
+    ExportOpened,
+    ExportClosed,
+    ExportResolution(Resolution),
+    ExportQuality(Quality),
+    /// The choices are made: ask where the film goes.
+    ExportRequested,
+    ExportChosen(Option<PathBuf>),
+    /// A media file's picture size has been read, or could not be.
+    PictureSized(String, Option<(u32, u32)>),
+    /// News from the export under way.
+    Exported(ExportEvent),
+    ExportCancelled,
     Saved(Result<PathBuf, String>),
     /// Whether the window is drawn on the GPU, which decides the viewer's path.
     RendererProbed(bool),
@@ -114,7 +166,7 @@ enum Message {
     Stepped(i64),
     PlayToggled,
     /// A new display frame while playing: the playhead goes where the clock says.
-    PlayTick(Instant),
+    PlayTick,
     Undo,
     Redo,
     /// Cut a clip in two at the playhead.
@@ -122,6 +174,14 @@ enum Message {
     /// Take the selected clip off the timeline.
     Delete,
     AddTrack,
+    /// Silence a track, or let it be heard again.
+    ToggleMute(usize),
+    /// The volume slider of the selected clip is being dragged.
+    VolumeChanged(f32),
+    /// The volume slider was let go: the volume it shows is set.
+    VolumeReleased,
+    /// A media file's waveform has been read, or could not be.
+    WaveformRead(String, Option<Arc<Waveform>>),
     Key(keyboard::Event),
     MemoryTick,
 }
@@ -246,6 +306,87 @@ struct Playback {
     requests: VecDeque<(u64, u64, i64)>,
     /// Pictures that have arrived and wait for their frame's turn, earliest first.
     ready: VecDeque<(i64, Shown)>,
+    /// When the display shows its frames, at a steady pace.
+    ticks: Ticks,
+    /// How far, in frames, the frame shown runs ahead of the clock: nudges that keep frame
+    /// starts off the display's ticks.
+    shift: f64,
+}
+
+impl Playback {
+    /// The frame to show when the clock stands at `exact` frames. The sound card and the
+    /// display keep slightly different time, so now and then a frame start drifts onto a
+    /// display tick, where it would fall either side of it by turns. It is nudged off the tick
+    /// instead, the way it already fell, so the frame shown does not change for it.
+    fn frame_at(&mut self, exact: f64) -> i64 {
+        let shifted = exact + self.shift;
+        let near = shifted - shifted.round();
+        if near.abs() < NEAR_TICK {
+            self.shift += TICK_NUDGE.copysign(near);
+            // Half a frame of nudges, which takes minutes: one frame shows twice or not at
+            // all, and the nudging starts over.
+            if self.shift.abs() > 0.5 {
+                self.shift -= self.shift.signum();
+            }
+        }
+        (exact + self.shift).floor() as i64
+    }
+}
+
+/// The times of the display's frames, one refresh apart. Ticks reach the app a little early or
+/// late, by a millisecond or two; a frame that starts close to a tick would then show a tick
+/// early or late by turns. Which frame to show is decided at these steady times instead.
+#[derive(Default)]
+struct Ticks {
+    last: Option<Instant>,
+    /// Seconds from one display frame to the next.
+    period: Option<f64>,
+    /// The first intervals between ticks, until the pace is known.
+    intervals: Vec<f64>,
+}
+
+impl Ticks {
+    /// The steady time of the display frame a tick arriving `now` stands for.
+    fn steady(&mut self, now: Instant) -> Instant {
+        let since = |earlier: Instant| match now.checked_duration_since(earlier) {
+            Some(after) => after.as_secs_f64(),
+            None => -earlier.duration_since(now).as_secs_f64(),
+        };
+        let (Some(last), Some(period)) = (self.last, self.period) else {
+            // The first ticks: the pace is not known yet.
+            if let Some(last) = self.last {
+                self.intervals.push(since(last));
+                if self.intervals.len() == PACE_SAMPLES {
+                    self.intervals.sort_by(f64::total_cmp);
+                    let median = self.intervals[PACE_SAMPLES / 2];
+                    self.period = Some(median).filter(|period| *period > 0.0);
+                    self.intervals.clear();
+                }
+            }
+            self.last = Some(now);
+            return now;
+        };
+        // Display frames the app missed are counted in.
+        let frames = (since(last) / period).round().max(1.0);
+        let expected = last + Duration::from_secs_f64(frames * period);
+        let error = since(expected);
+        if error.abs() > period / 2.0 {
+            // Out of step: the display changed, or the app stalled. Start over from here.
+            *self = Self {
+                last: Some(now),
+                ..Self::default()
+            };
+            return now;
+        }
+        let steady = if error >= 0.0 {
+            expected + Duration::from_secs_f64(error * TICK_PULL)
+        } else {
+            expected - Duration::from_secs_f64(-error * TICK_PULL)
+        };
+        self.period = Some(period + error * TICK_PULL / frames);
+        self.last = Some(steady);
+        steady
+    }
 }
 
 /// How smoothly the last stretch of playback went.
@@ -311,6 +452,32 @@ struct App {
     timeline_view: Option<View>,
     notice: Option<String>,
     memory_mb: Option<usize>,
+    /// The waveforms read so far, by the media files' names in the project.
+    waveforms: Waveforms,
+    /// Files whose waveform has been asked for, whether it has come yet or not.
+    waveforms_asked: HashSet<String>,
+    /// Files waiting for their waveform to be read, one at a time.
+    waveform_queue: VecDeque<(String, PathBuf)>,
+    reading_waveform: bool,
+    /// The volume the slider stands at while it is dragged.
+    volume_drag: Option<f32>,
+    exporting: Option<Exporting>,
+    /// The export choices are on show.
+    export_dialog: bool,
+    /// The picture sizes of media files, by their names in the project, as far as known.
+    picture_sizes: HashMap<String, (u32, u32)>,
+    /// Files whose picture size is being read.
+    sizing: HashSet<String>,
+}
+
+/// An export under way.
+struct Exporting {
+    export: Export,
+    started: Instant,
+    /// Frames made so far, of how many.
+    done: i64,
+    total: i64,
+    encoder: Option<&'static str>,
 }
 
 /// An open media file: a decode thread that makes pictures of its frames.
@@ -401,8 +568,18 @@ impl App {
             timeline_view: None,
             notice: None,
             memory_mb: None,
+            waveforms: Waveforms::new(),
+            waveforms_asked: HashSet::new(),
+            waveform_queue: VecDeque::new(),
+            reading_waveform: false,
+            volume_drag: None,
+            exporting: None,
+            export_dialog: false,
+            picture_sizes: HashMap::new(),
+            sizing: HashSet::new(),
         };
         let mut playhead = 0;
+        let mut export = None;
         for argument in std::env::args_os().skip(1) {
             let path = PathBuf::from(&argument);
             let text = argument.to_string_lossy();
@@ -412,6 +589,8 @@ impl App {
                 app.silent = true;
             } else if let Some(milliseconds) = text.strip_prefix(SOUND_DELAY_FLAG) {
                 app.sound_delay = milliseconds.parse().ok();
+            } else if let Some(film) = text.strip_prefix(EXPORT_FLAG) {
+                export = Some(PathBuf::from(film));
             } else if let Some(frame) = text.strip_prefix(PLAYHEAD_FLAG) {
                 playhead = frame.parse().unwrap_or(0);
             } else if path.extension().is_some_and(|extension| extension == PROJECT_EXTENSION) {
@@ -424,7 +603,10 @@ impl App {
             }
         }
         app.playhead = playhead;
-        let task = app.add_next();
+        let mut task = app.add_next();
+        if let Some(film) = export {
+            task = Task::batch([task, app.export(film)]);
+        }
         (app, task)
     }
 
@@ -724,15 +906,19 @@ impl App {
     /// A display frame while playing: the clock says which timeline frame is due, the picture
     /// for it goes on screen if it has arrived, and the frame a little further on is asked for.
     /// A decoder that cannot keep up leaves frames out; it does not slow the film down.
-    fn play_tick(&mut self, now: Instant) -> Task<Message> {
+    fn play_tick(&mut self) -> Task<Message> {
         let rate = self.history.timeline().rate().as_f64();
         let last_frame = self.last_frame();
         let Some(playback) = &mut self.playback else {
             return Task::none();
         };
+        // Not the time the display frame was stamped with: the tick arrives one or two display
+        // frames after that, and which of the two changes from run to run, which would move
+        // the pictures against the sound by as much. What is drawn now goes up next.
+        let now = playback.ticks.steady(Instant::now());
         let frame = match playback.clock {
             Clock::Sound { asked_at } => match self.sound.position(now) {
-                Some(seconds) => (seconds * rate) as i64,
+                Some(seconds) => playback.frame_at(seconds * rate),
                 // The sound card does not answer: the system clock takes over from here.
                 None if now.saturating_duration_since(asked_at) > SOUND_START_LIMIT => {
                     self.sound.stop();
@@ -746,7 +932,8 @@ impl App {
                 None => self.playhead,
             },
             Clock::Wall { started, from } => {
-                from + (now.saturating_duration_since(started).as_secs_f64() * rate) as i64
+                let elapsed = now.saturating_duration_since(started).as_secs_f64();
+                playback.frame_at(from as f64 + elapsed * rate)
             }
         };
         // The sound card's first guesses at its delay can be a few milliseconds out; the
@@ -798,6 +985,57 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        // Whatever happened may have put a new file on the timeline.
+        Task::batch([task, self.read_waveforms()])
+    }
+
+    /// Asks for the waveform of every media file on the timeline that has none yet.
+    fn read_waveforms(&mut self) -> Task<Message> {
+        let mut wanted = Vec::new();
+        for track in self.history.timeline().tracks() {
+            for (_, clip) in track.clips() {
+                if let Some((target, path)) = self.location(clip)
+                    && !self.waveforms_asked.contains(&target)
+                {
+                    wanted.push((target, path));
+                }
+            }
+        }
+        for (target, path) in wanted {
+            if self.waveforms_asked.insert(target.clone()) {
+                self.waveform_queue.push_back((target, path));
+            }
+        }
+        self.next_waveform()
+    }
+
+    /// Reads the next waveform waiting, on a thread of its own: it takes reading the file's
+    /// whole sound. One at a time, so the files being played from keep the disk to themselves.
+    fn next_waveform(&mut self) -> Task<Message> {
+        if self.reading_waveform {
+            return Task::none();
+        }
+        let Some((target, path)) = self.waveform_queue.pop_front() else {
+            return Task::none();
+        };
+        let (sender, read) = oneshot::channel();
+        let started = std::thread::Builder::new()
+            .name("cannotcut-waveform".to_string())
+            .spawn(move || {
+                let _ = sender.send(Waveform::read(&path, WAVEFORM_RATE));
+            });
+        if started.is_err() {
+            return Task::none();
+        }
+        self.reading_waveform = true;
+        Task::perform(
+            async move { read.await.ok().and_then(Result::ok).flatten().map(Arc::new) },
+            move |waveform| Message::WaveformRead(target.clone(), waveform),
+        )
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AddRequested => return Task::perform(pick_clips(), Message::FilesChosen),
             Message::FilesChosen(paths) => {
@@ -867,6 +1105,36 @@ impl App {
                 };
             }
             Message::SaveChosen(Some(path)) => return self.save(path),
+            Message::ExportOpened => {
+                if self.exporting.is_none() {
+                    self.export_dialog = true;
+                    return self.read_film_size();
+                }
+            }
+            Message::ExportClosed => self.export_dialog = false,
+            Message::ExportResolution(resolution) => self.settings.export.resolution = resolution,
+            Message::ExportQuality(quality) => self.settings.export.quality = quality,
+            Message::PictureSized(target, size) => {
+                self.sizing.remove(&target);
+                if let Some(size) = size {
+                    self.picture_sizes.insert(target, size);
+                }
+            }
+            Message::ExportRequested => {
+                let name = self.history.timeline().name.clone();
+                return Task::perform(pick_film_path(name), Message::ExportChosen);
+            }
+            Message::ExportChosen(Some(path)) => {
+                self.export_dialog = false;
+                self.settings.save_export();
+                return self.export(path);
+            }
+            Message::Exported(event) => self.export_event(event),
+            Message::ExportCancelled => {
+                if let Some(exporting) = &self.exporting {
+                    exporting.export.cancel();
+                }
+            }
             Message::Saved(Ok(path)) => {
                 self.notice = Some(format!("Saved {}", path.display()));
                 self.project_folder = path.parent().map(Path::to_path_buf);
@@ -875,7 +1143,9 @@ impl App {
             Message::ProjectLoaded(Err(error)) | Message::Saved(Err(error)) => {
                 self.notice = Some(error);
             }
-            Message::ProjectChosen(None) | Message::SaveChosen(None) => {}
+            Message::ProjectChosen(None)
+            | Message::SaveChosen(None)
+            | Message::ExportChosen(None) => {}
             Message::Timeline(action) => match action {
                 Action::Scrub(frame) => return self.move_playhead(frame),
                 Action::View(view) => self.timeline_view = view,
@@ -940,6 +1210,8 @@ impl App {
                         asked: self.playhead,
                         requests: VecDeque::new(),
                         ready: VecDeque::new(),
+                        ticks: Ticks::default(),
+                        shift: 0.0,
                     });
                     self.play_stats = Some(PlayStats::default());
                     return self.warm_up();
@@ -947,7 +1219,7 @@ impl App {
                 // Paused: the frame the playhead stopped on, exactly.
                 return self.show_playhead();
             }
-            Message::PlayTick(now) => return self.play_tick(now),
+            Message::PlayTick => return self.play_tick(),
             Message::Undo => {
                 if self.history.undo() {
                     return self.timeline_changed();
@@ -976,6 +1248,38 @@ impl App {
                     name: format!("Video {}", tracks + 1),
                 });
             }
+            Message::ToggleMute(track) => {
+                let muted = self.history.timeline().track(track).map(|track| !track.muted);
+                if let Some(muted) = muted {
+                    return self.sound_edit(&Edit::SetMuted { track, muted });
+                }
+            }
+            Message::VolumeChanged(volume) => {
+                // Shown on the clip while dragging; heard once let go.
+                if let Some(clip) = self.selected {
+                    let mut timeline = self.history.timeline().clone();
+                    if timeline.apply(&Edit::SetVolume { clip, volume }).is_ok() {
+                        self.volume_drag = Some(volume);
+                        self.preview = Some(Preview {
+                            timeline,
+                            look_at: None,
+                        });
+                    }
+                }
+            }
+            Message::VolumeReleased => {
+                self.preview = None;
+                if let (Some(clip), Some(volume)) = (self.selected, self.volume_drag.take()) {
+                    return self.sound_edit(&Edit::SetVolume { clip, volume });
+                }
+            }
+            Message::WaveformRead(target, waveform) => {
+                self.reading_waveform = false;
+                if let Some(waveform) = waveform {
+                    self.waveforms.insert(target, waveform);
+                }
+                return self.next_waveform();
+            }
             Message::Key(keyboard::Event::KeyPressed {
                 key: pressed,
                 modifiers,
@@ -999,6 +1303,7 @@ impl App {
                     }
                     Some(key::Named::Delete | key::Named::Backspace) => Some(Message::Delete),
                     Some(key::Named::Space) => Some(Message::PlayToggled),
+                    Some(key::Named::Escape) if self.export_dialog => Some(Message::ExportClosed),
                     _ if letter("z") && !modifiers.shift() => Some(Message::Undo),
                     _ if letter("z") || letter("y") => Some(Message::Redo),
                     _ if letter("b") => Some(Message::Split),
@@ -1031,6 +1336,8 @@ impl App {
         match event {
             Media::Opened(info) => {
                 source.info = Some(info.clone());
+                let target = source.target.clone();
+                self.picture_sizes.insert(target, (info.width, info.height));
                 if self.opening == Some(generation) {
                     self.opening = None;
                     if let Some(path) = self.adding.pop_front() {
@@ -1207,6 +1514,122 @@ impl App {
         self.show_playhead()
     }
 
+    /// Starts making the timeline into a film at `path`, in the background.
+    fn export(&mut self, path: PathBuf) -> Task<Message> {
+        if self.exporting.is_some() {
+            return Task::none();
+        }
+        let (sender, events) = mpsc::unbounded();
+        // Tracks are shared, so the copy the export works from is cheap; editing goes on
+        // without changing the film being made.
+        let export = Export::start(
+            self.history.timeline().clone(),
+            self.project_folder.clone(),
+            path,
+            self.settings.export,
+            move |event| {
+                let _ = sender.unbounded_send(event);
+            },
+        );
+        self.exporting = Some(Exporting {
+            export,
+            started: Instant::now(),
+            done: 0,
+            total: self.history.timeline().duration(),
+            encoder: None,
+        });
+        Task::run(events, Message::Exported)
+    }
+
+    /// The clip a film takes its shape from: the first on the main track, or else the first
+    /// anywhere. The export works it out the same way.
+    fn film_clip(&self) -> Option<&Clip> {
+        let timeline = self.history.timeline();
+        timeline
+            .tracks()
+            .flat_map(|track| track.clips().map(|(_, clip)| clip))
+            .next()
+    }
+
+    /// Reads the picture size of the clip a film takes its shape from, in the background,
+    /// unless it is known already.
+    fn read_film_size(&mut self) -> Task<Message> {
+        let Some((target, path)) = self.film_clip().and_then(|clip| self.location(clip)) else {
+            return Task::none();
+        };
+        if self.picture_sizes.contains_key(&target) || !self.sizing.insert(target.clone()) {
+            return Task::none();
+        }
+        let (sender, read) = oneshot::channel();
+        let started = std::thread::Builder::new()
+            .name("cannotcut-probe".to_string())
+            .spawn(move || {
+                let _ = sender.send(picture_size(&path).ok());
+            });
+        if started.is_err() {
+            return Task::none();
+        }
+        Task::perform(async move { read.await.ok().flatten() }, move |size| {
+            Message::PictureSized(target.clone(), size)
+        })
+    }
+
+    fn export_event(&mut self, event: ExportEvent) {
+        let Some(exporting) = &mut self.exporting else {
+            return;
+        };
+        match event {
+            ExportEvent::Started { encoder, .. } => exporting.encoder = Some(encoder),
+            ExportEvent::Progress { done, total } => {
+                exporting.done = done;
+                exporting.total = total;
+            }
+            ExportEvent::Finished(result) => {
+                self.notice = Some(match result {
+                    Ok(summary) => format!(
+                        "Exported {} in {:.0} s",
+                        summary
+                            .path
+                            .file_name()
+                            .map_or(summary.path.display().to_string(), |name| name
+                                .to_string_lossy()
+                                .into_owned()),
+                        summary.took.as_secs_f64()
+                    ),
+                    Err(error) if error == "cancelled" => "Export cancelled".to_string(),
+                    Err(error) => format!("Export failed: {error}"),
+                });
+                self.exporting = None;
+            }
+        }
+    }
+
+    /// Makes an edit that changes only what is heard. Playback carries on: the sound is
+    /// picked up again from the playhead, as the edit leaves it.
+    fn sound_edit(&mut self, edit: &Edit) -> Task<Message> {
+        match self.history.apply(edit) {
+            Ok(_) => self.notice = None,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return Task::none();
+            }
+        }
+        if let Some(playback) = &mut self.playback
+            && let Clock::Sound { .. } = playback.clock
+        {
+            let timeline = self.history.timeline().clone();
+            let folder = self.project_folder.clone();
+            if !self.sound.replace(timeline.clone(), folder.clone()) {
+                // No sound heard yet to carry on from.
+                self.sound.play(timeline, self.playhead, folder);
+                playback.clock = Clock::Sound {
+                    asked_at: Instant::now(),
+                };
+            }
+        }
+        Task::none()
+    }
+
     /// The timeline was edited: what is under the playhead may be something else now.
     fn timeline_changed(&mut self) -> Task<Message> {
         self.stop_playing();
@@ -1265,7 +1688,7 @@ impl App {
         }
         if self.playback.is_some() {
             // One tick for every frame the display shows.
-            subscriptions.push(window::frames().map(Message::PlayTick));
+            subscriptions.push(window::frames().map(|_| Message::PlayTick));
         }
         Subscription::batch(subscriptions)
     }
@@ -1276,6 +1699,7 @@ impl App {
             button("Add clips").on_press(Message::AddRequested),
             button("Open").on_press(Message::OpenRequested),
             button("Save").on_press(Message::SaveRequested),
+            self.export_control(),
             one_line(self.headline()).width(Fill),
         ]
         .spacing(12)
@@ -1300,6 +1724,10 @@ impl App {
         if self.viewer.is_none() {
             viewer = stack![viewer, renderer_probe(Message::RendererProbed)].into();
         }
+        if self.export_dialog {
+            // Over the viewer, so that nothing around it moves.
+            viewer = stack![viewer, center(self.export_dialog())].into();
+        }
 
         // A button that cannot do anything right now shows it by being greyed out.
         let position = format!(
@@ -1314,6 +1742,7 @@ impl App {
             button("Split").on_press_maybe(self.split_edit().map(|_| Message::Split)),
             button("Delete").on_press_maybe(self.delete_edit().map(|_| Message::Delete)),
             button("Add track").on_press(Message::AddTrack),
+            self.volume_control(),
             one_line(position).center_x(Fill),
             button(
                 text(if self.playback.is_some() { "Pause" } else { "Play" })
@@ -1337,8 +1766,10 @@ impl App {
             self.playhead,
             self.timeline_view,
             self.selected,
+            &self.waveforms,
             Message::Timeline,
         );
+        let panel = row![self.track_headers(), panel].spacing(8);
         let status = container(
             text(self.readout())
                 .size(STATUS_TEXT_SIZE)
@@ -1351,6 +1782,152 @@ impl App {
             .spacing(10)
             .padding(12)
             .into()
+    }
+
+    /// The export choices: how large and how good, what that makes, and the way on.
+    fn export_dialog(&self) -> Element<'_, Message> {
+        let options = self.settings.export;
+        let timeline = self.history.timeline();
+        let rate = timeline.rate();
+        let source = self
+            .film_clip()
+            .and_then(|clip| clip.media.target.as_ref())
+            .and_then(|target| self.picture_sizes.get(target))
+            .copied();
+        let about = match source {
+            Some(source) => {
+                let (width, height) = options.resolution.film_size(source);
+                let bytes = options.estimated_bytes(source, rate, timeline.duration());
+                let fps = if rate.den == 1 {
+                    rate.num.to_string()
+                } else {
+                    format!("{:.2}", rate.as_f64())
+                };
+                format!(
+                    "{width}x{height} at {fps} fps, up to about {:.0} MB",
+                    (bytes as f64 / BYTES_PER_MEGABYTE).ceil()
+                )
+            }
+            None => "Working out the size".to_string(),
+        };
+        let choice = |label: &'static str, list: Element<'static, Message>| {
+            row![text(label).width(DIALOG_LABEL_WIDTH), list]
+                .spacing(12)
+                .align_y(Center)
+        };
+        let card = column![
+            text("Export").size(DIALOG_TITLE_SIZE),
+            choice(
+                "Resolution",
+                pick_list(
+                    &Resolution::CHOICES[..],
+                    Some(options.resolution),
+                    Message::ExportResolution
+                )
+                .into()
+            ),
+            choice(
+                "Quality",
+                pick_list(&Quality::CHOICES[..], Some(options.quality), Message::ExportQuality)
+                    .into()
+            ),
+            text(about).size(STATUS_TEXT_SIZE),
+            row![
+                button("Cancel")
+                    .on_press(Message::ExportClosed)
+                    .style(button::secondary),
+                button("Export").on_press(Message::ExportRequested),
+            ]
+            .spacing(12),
+        ]
+        .spacing(16);
+        container(card)
+            .padding(20)
+            .width(DIALOG_WIDTH)
+            .style(container::rounded_box)
+            .into()
+    }
+
+    /// Export, or how the export under way is getting on and a way to stop it.
+    fn export_control(&self) -> Element<'_, Message> {
+        let Some(exporting) = &self.exporting else {
+            let has_clips = self.history.timeline().duration() > 0;
+            return button("Export")
+                .on_press_maybe(has_clips.then_some(Message::ExportOpened))
+                .into();
+        };
+        let share = exporting.done as f32 / exporting.total.max(1) as f32;
+        let elapsed = exporting.started.elapsed().as_secs_f64();
+        let left = match exporting.done {
+            0 => String::new(),
+            done => {
+                let rest = (exporting.total - done) as f64 * elapsed / done as f64;
+                format!(", {rest:.0} s left")
+            }
+        };
+        let encoder = exporting
+            .encoder
+            .map_or(String::new(), |encoder| format!(" with {encoder}"));
+        row![
+            button("Cancel export").on_press(Message::ExportCancelled),
+            progress_bar(0.0..=1.0, share)
+                .length(EXPORT_BAR_WIDTH)
+                .girth(EXPORT_BAR_HEIGHT),
+            one_line(format!("Exporting {:.0}%{left}{encoder}", share * 100.0)),
+        ]
+        .spacing(8)
+        .align_y(Center)
+        .into()
+    }
+
+    /// A button beside each lane of the timeline panel to mute its track, lined up with it.
+    fn track_headers(&self) -> Element<'_, Message> {
+        let tracks = self.history.timeline().tracks();
+        // The top of the stack is the top lane.
+        let buttons = tracks.enumerate().rev().map(|(index, track)| {
+            let label = if track.muted { "Muted" } else { "Mute" };
+            let style = if track.muted {
+                button::danger
+            } else {
+                button::secondary
+            };
+            let toggle = button(text(label).size(HEADER_TEXT_SIZE))
+                .on_press(Message::ToggleMute(index))
+                .style(style)
+                .padding([4, 10]);
+            container(toggle).height(LANE_HEIGHT).center_y(LANE_HEIGHT).into()
+        });
+        let column = Column::with_children(buttons)
+            .spacing(LANE_GAP)
+            .padding(iced::Padding {
+                top: RULER_HEIGHT + LANE_GAP,
+                ..iced::Padding::ZERO
+            });
+        container(column)
+            .width(HEADER_WIDTH)
+            .height(PANEL_HEIGHT)
+            .clip(true)
+            .into()
+    }
+
+    /// The selected clip's volume, to drag; nothing when no clip is selected.
+    fn volume_control(&self) -> Element<'_, Message> {
+        let Some((_, clip, _)) = self.selected.and_then(|id| self.history.timeline().clip(id))
+        else {
+            return row![].into();
+        };
+        let volume = self.volume_drag.unwrap_or(clip.volume).clamp(0.0, MAX_VOLUME);
+        row![
+            text("Volume"),
+            slider(0.0..=MAX_VOLUME, volume, Message::VolumeChanged)
+                .step(0.01_f32)
+                .on_release(Message::VolumeReleased)
+                .width(VOLUME_SLIDER_WIDTH),
+            text(format!("{:.0}%", volume * 100.0)).width(VOLUME_LABEL_WIDTH),
+        ]
+        .spacing(8)
+        .align_y(Center)
+        .into()
     }
 
     /// The line next to the add button: what went wrong, or what the playhead is on.
@@ -1453,6 +2030,16 @@ async fn pick_project() -> Option<PathBuf> {
         .pick_file()
         .await
         .map(|file| file.path().to_path_buf())
+}
+
+async fn pick_film_path(name: String) -> Option<PathBuf> {
+    let chosen = rfd::AsyncFileDialog::new()
+        .set_title("Export a film")
+        .add_filter("Film", &[FILM_EXTENSION])
+        .set_file_name(format!("{name}.{FILM_EXTENSION}"))
+        .save_file()
+        .await?;
+    Some(chosen.path().with_extension(FILM_EXTENSION))
 }
 
 async fn pick_save_path(name: String) -> Option<PathBuf> {

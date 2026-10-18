@@ -449,6 +449,7 @@ name = "cannotcut-app"
 version = "0.1.0"
 dependencies = [
  "cannotcut-audio",
+ "cannotcut-export",
  "cannotcut-media",
  "cannotcut-timeline",
  "iced",
@@ -467,6 +468,15 @@ dependencies = [
  "cpal",
  "rtrb",
  "windows 0.62.2",
+]
+
+[[package]]
+name = "cannotcut-export"
+version = "0.1.0"
+dependencies = [
+ "cannotcut-audio",
+ "cannotcut-media",
+ "cannotcut-timeline",
 ]
 
 [[package]]

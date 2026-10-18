@@ -70,6 +70,17 @@ impl AudioReader {
             .decoder()
             .audio()
             .map_err(|error| Error::new("open audio decoder", error))?;
+        let mut input = input;
+        // Only the sound is wanted. The demuxer then steps over the pictures instead of reading
+        // them, which in a long, sharp recording is most of the file.
+        unsafe {
+            let context = input.as_mut_ptr();
+            for index in 0..(*context).nb_streams as usize {
+                if index != stream_index {
+                    (**(*context).streams.add(index)).discard = ffi::AVDiscard::AVDISCARD_ALL;
+                }
+            }
+        }
         let mut reader = Self {
             input,
             decoder,
@@ -122,6 +133,11 @@ impl AudioReader {
         Ok(())
     }
 
+    /// Whether everything the file holds has been read; from here on there is only silence.
+    pub fn exhausted(&self) -> bool {
+        self.ended && self.pending.is_empty()
+    }
+
     /// Fills `out`, interleaved with [`CHANNELS`] values per sample, with the sound from where
     /// the last read or seek left off. Past the end of the sound it is silence.
     pub fn read(&mut self, out: &mut [f32]) -> Result<(), Error> {
@@ -130,17 +146,15 @@ impl AudioReader {
             let available = (self.pending.len() / CHANNELS) as i64;
             match self.pending_at {
                 // Sound from before the wanted point, left by the seek's run-up, is dropped.
-                Some(at) if at < self.wanted => {
+                Some(at) if at < self.wanted && available > 0 => {
                     let dropped = (self.wanted - at).min(available);
                     self.pending.drain(..dropped as usize * CHANNELS);
                     self.pending_at = Some(at + dropped);
-                    if dropped == available {
-                        self.decode_more()?;
-                    }
                 }
-                // The sound starts later than asked: silence until it does.
+                // The sound starts later than asked: silence until it does. Once the file has
+                // no more, the rest is silence too.
                 Some(at) if at > self.wanted || (available == 0 && self.ended) => {
-                    let silent = if self.ended {
+                    let silent = if available == 0 && self.ended {
                         out.len() / CHANNELS
                     } else {
                         ((at - self.wanted) as usize).min(out.len() / CHANNELS)
@@ -338,5 +352,60 @@ impl Resampler {
 impl Drop for Resampler {
     fn drop(&mut self) {
         unsafe { ffi::swr_free(&mut self.context) };
+    }
+}
+
+/// Sound read for a waveform is resampled to this rate first: low enough to be quick, high
+/// enough to keep the peaks of speech and music.
+const WAVEFORM_SAMPLE_RATE: u32 = 8000;
+/// Waveforms are read this many samples at a time.
+const WAVEFORM_CHUNK: usize = 8000;
+
+/// How loud a file's sound is along its length, for drawing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Waveform {
+    /// Peaks per second.
+    pub rate: u32,
+    /// The loudest sample in each stretch of `1 / rate` seconds, from 0 to 1 (louder sound is
+    /// cut off at 1), from the media's first video frame on.
+    pub peaks: Vec<f32>,
+}
+
+impl Waveform {
+    /// Reads the whole of the sound of `path`, which takes a while for a long file: call it off
+    /// the UI thread. Gives about `rate` peaks a second; None when the file has no sound.
+    pub fn read(path: &Path, rate: u32) -> Result<Option<Self>, Error> {
+        let Some(mut reader) = AudioReader::open(path, WAVEFORM_SAMPLE_RATE)? else {
+            return Ok(None);
+        };
+        let per_peak = (WAVEFORM_SAMPLE_RATE / rate.max(1)).max(1) as usize;
+        let mut chunk = vec![0.0; WAVEFORM_CHUNK / per_peak * per_peak * CHANNELS];
+        let mut peaks = Vec::new();
+        while !reader.exhausted() {
+            reader.read(&mut chunk)?;
+            peaks.extend(chunk.chunks(per_peak * CHANNELS).map(|stretch| {
+                let loudest = stretch.iter().map(|sample| sample.abs()).fold(0.0, f32::max);
+                loudest.min(1.0)
+            }));
+        }
+        // The last read went on past the end of the sound.
+        while peaks.last() == Some(&0.0) {
+            peaks.pop();
+        }
+        Ok(Some(Self {
+            rate: WAVEFORM_SAMPLE_RATE / per_peak as u32,
+            peaks,
+        }))
+    }
+
+    /// The loudest peak from `from` to `to` seconds after the media's first video frame; 0 where
+    /// there is no sound.
+    pub fn peak(&self, from: f64, to: f64) -> f32 {
+        let rate = f64::from(self.rate);
+        let first = (from * rate).floor().max(0.0) as usize;
+        let last = ((to * rate).ceil().max(0.0) as usize).max(first + 1);
+        self.peaks
+            .get(first.min(self.peaks.len())..last.min(self.peaks.len()))
+            .map_or(0.0, |peaks| peaks.iter().copied().fold(0.0, f32::max))
     }
 }
