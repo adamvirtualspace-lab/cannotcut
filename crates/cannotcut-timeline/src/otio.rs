@@ -1,9 +1,10 @@
 //! Reading and writing timelines as OpenTimelineIO JSON.
 //!
 //! The file is the standard format, so other tools can open it. What cannotcut cannot edit yet
-//! (transitions, nested compositions, generated media) is refused by name when reading, instead
-//! of being dropped quietly. Metadata, effects and markers it does not understand are carried
-//! through unchanged.
+//! (transitions, nested stacks, generated media) is refused by name when reading, instead of
+//! being dropped quietly. A project used inside another is a clip whose media is the other
+//! `.otio` file; see the `nest` module. Metadata, effects and markers it does not understand are
+//! carried through unchanged.
 
 use std::fs;
 use std::path::Path;
@@ -26,11 +27,6 @@ const FALLBACK_RATE: Rate = Rate::new(30, 1);
 type Object = Map<String, Value>;
 
 impl Timeline {
-    pub fn load(path: &Path) -> Result<Self, Error> {
-        let text = fs::read_to_string(path).map_err(|error| Error::new("read project", error))?;
-        Self::from_otio(&text)
-    }
-
     /// Writes the file under another name first and swaps it in, so a crash while saving cannot
     /// leave half a project behind.
     pub fn save(&self, path: &Path) -> Result<(), Error> {
@@ -71,6 +67,9 @@ impl Timeline {
     }
 
     pub fn from_otio(text: &str) -> Result<Self, Error> {
+        // Some Windows tools start a UTF-8 file with a byte-order mark, which JSON does not
+        // allow; it says nothing, so it goes.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let root: Value =
             serde_json::from_str(text).map_err(|error| Error::new("read project", error))?;
         let root = object(&root, "the project file")?;
@@ -276,6 +275,8 @@ fn read_clip(clip: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error
         }),
         name: text_of(reference, "name"),
         metadata: media_metadata,
+        // Loaded by `Timeline::load`, which knows where the file is.
+        project: None,
     };
     let mut extras = extras(clip);
     let own = extras.metadata.remove(OWN_METADATA);
@@ -564,6 +565,9 @@ mod tests {
     fn saving_and_loading_gives_the_same_timeline() {
         let foreign = Timeline::from_otio(FOREIGN).unwrap();
         assert_eq!(Timeline::from_otio(&foreign.to_otio()).unwrap(), foreign);
+        // As Windows PowerShell writes it: with a byte-order mark first.
+        let marked = format!("\u{feff}{FOREIGN}");
+        assert_eq!(Timeline::from_otio(&marked).unwrap(), foreign);
 
         let rate = Rate::new(30000, 1001);
         let sixty = Arc::new(Media::from_path(

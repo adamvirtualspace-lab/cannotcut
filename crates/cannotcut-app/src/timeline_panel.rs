@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cannotcut_media::Waveform;
 use cannotcut_timeline::{
@@ -14,6 +15,7 @@ use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer, text};
 use iced::advanced::{Renderer as _, text::Renderer as _};
 use iced::keyboard::{self, key};
+use iced::theme::palette::Pair;
 use iced::{
     Border, Color, Element, Event, Length, Pixels, Point, Rectangle, Size, Theme, alignment,
     border, mouse, touch, window,
@@ -33,6 +35,15 @@ const WAVEFORM_HEIGHT: f32 = 16.0;
 const WAVEFORM_RANGE_DB: f32 = 48.0;
 /// Pixels from one bar of a waveform to the next.
 const WAVEFORM_STEP: f32 = 2.0;
+/// The colour of a clip that plays another project: unlike the theme's grey, it does not look
+/// switched off, and unlike its blue and green, it is no video or sound track's colour.
+const NESTED_CLIP: Color = Color::from_rgb8(0x17, 0x80, 0x7f);
+/// Two presses on the same clip this close together are a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// Each of the two frames of the badge on a clip that plays another project.
+const NEST_BADGE: Size = Size::new(9.0, 7.0);
+/// How far the badge's second frame sits from the first, right and down.
+const NEST_BADGE_SHIFT: f32 = 3.0;
 /// Room left of frame zero and right of the last frame when everything is shown.
 const MARGIN: f32 = 12.0;
 /// How much of an empty timeline is shown.
@@ -121,6 +132,8 @@ pub enum Action {
     Commit(Edit),
     /// The drag came back to where nothing changes, or was given up.
     Cancel,
+    /// Double-clicked a clip that plays another project: open that project to edit it.
+    Open(ClipId),
 }
 
 /// The waveforms of the media files that have been read, by the files' names in the project.
@@ -170,6 +183,8 @@ struct State {
     modifiers: keyboard::Modifiers,
     /// Where the playhead was when the panel last made sure it is in sight.
     followed: Option<i64>,
+    /// The clip last pressed on, and when: a second press soon after is a double-click.
+    last_press: Option<(ClipId, Instant)>,
 }
 
 /// What a press that is still held down is doing.
@@ -442,6 +457,24 @@ impl<Message> TimelinePanel<'_, Message> {
         if picked != self.selected {
             self.publish(Action::Select(picked), shell);
         }
+        if let Hit::Body { id, .. } = hit {
+            let now = Instant::now();
+            let again = state.last_press.is_some_and(|(last, at)| {
+                last == id && now.saturating_duration_since(at) <= DOUBLE_CLICK
+            });
+            state.last_press = Some((id, now));
+            let nested = self
+                .timeline
+                .clip(id)
+                .is_some_and(|(_, clip, _)| clip.media.project.is_some());
+            if again && nested {
+                state.last_press = None;
+                state.gesture = Gesture::None;
+                self.publish(Action::Open(id), shell);
+                shell.capture_event();
+                return;
+            }
+        }
         state.gesture = match hit {
             Hit::Empty { .. } => {
                 self.scrub(point.x, width, shell);
@@ -710,6 +743,14 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                     );
                     let dimmed = if track.enabled && clip.enabled { 1.0 } else { 0.4 };
                     let selected = self.selected == Some(clip.id);
+                    // A clip that plays another project stands out; one whose project could not
+                    // be loaded is marked as a problem.
+                    let nested = clip.media.is_project();
+                    let pair = match (nested, &clip.media.project) {
+                        (false, _) => pair,
+                        (true, Some(_)) => Pair::new(NESTED_CLIP, Color::WHITE),
+                        (true, None) => palette.danger.base,
+                    };
                     renderer.fill_quad(
                         renderer::Quad {
                             bounds: area,
@@ -766,11 +807,34 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                         .filter(|_| width >= MIN_LABELLED_WIDTH)
                     {
                         // The name stays in sight while any of the clip is, above the sound.
-                        let position = Point::new(visible.x + 8.0, y + LANE_HEIGHT * 0.3);
+                        let mut position = Point::new(visible.x + 8.0, y + LANE_HEIGHT * 0.3);
                         let color = Color {
                             a: dimmed,
                             ..pair.text
                         };
+                        if nested {
+                            // Two stacked frames before the name: a project inside.
+                            for shift in [0.0, NEST_BADGE_SHIFT] {
+                                let corner = Point::new(
+                                    position.x + shift,
+                                    position.y - NEST_BADGE.height / 2.0 - NEST_BADGE_SHIFT / 2.0
+                                        + shift,
+                                );
+                                renderer.fill_quad(
+                                    renderer::Quad {
+                                        bounds: Rectangle::new(corner, NEST_BADGE),
+                                        border: Border {
+                                            color,
+                                            width: 1.0,
+                                            radius: 1.5.into(),
+                                        },
+                                        ..renderer::Quad::default()
+                                    },
+                                    Color::TRANSPARENT,
+                                );
+                            }
+                            position.x += NEST_BADGE.width + NEST_BADGE_SHIFT + 5.0;
+                        }
                         let mut name = clip.name.clone();
                         if clip.volume != 1.0 {
                             name.push_str(&format!("  {:.0}%", clip.volume * 100.0));

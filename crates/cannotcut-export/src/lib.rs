@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use cannotcut_audio::{Mixer, frame_to_sample};
 use cannotcut_media::{CHANNELS, ClipReader, FilmFormat, FilmWriter, picture_size};
-use cannotcut_timeline::{Clip, ClipId, Timeline};
+use cannotcut_timeline::{ClipId, Shot, Timeline};
 
 const SAMPLE_RATE: u32 = 48_000;
 /// Sound is mixed this many samples at a time.
@@ -96,27 +96,19 @@ fn run(
     if total == 0 {
         return Err("there is nothing on the timeline to export".to_string());
     }
-    let locate = |clip: &Clip| -> Result<PathBuf, String> {
-        let path = clip
-            .media
-            .path()
-            .ok_or_else(|| format!("the media of \"{}\" is missing", clip.name))?;
-        Ok(match folder {
-            Some(folder) if path.is_relative() => folder.join(path),
-            _ => path,
-        })
+    let locate = |shot: &Shot| -> Result<PathBuf, String> {
+        shot.file(folder)
+            .ok_or_else(|| format!("the media of \"{}\" is missing", shot.clip.name))
     };
 
     // The film takes its shape from the first clip on the main track, as the project's
-    // pictures were first seen.
+    // pictures were first seen; inside a nested project if that is what it plays.
     let first = timeline
-        .tracks()
-        .flat_map(|track| track.clips().map(|(_, clip)| clip))
-        .next()
-        .ok_or_else(|| "there are no clips on the timeline".to_string())?;
-    let first_path = locate(first)?;
+        .first_shot()
+        .ok_or_else(|| "there are no clips with media on the timeline".to_string())?;
+    let first_path = locate(&first)?;
     let source =
-        picture_size(&first_path).map_err(|error| format!("{}: {error}", first.name))?;
+        picture_size(&first_path).map_err(|error| format!("{}: {error}", first.clip.name))?;
     let rate = timeline.rate();
     let (width, height) = options.resolution.film_size(source);
     let film = FilmFormat {
@@ -155,7 +147,7 @@ fn make(
     film: FilmFormat,
     cancelled: &AtomicBool,
     sink: &mut dyn FnMut(Event),
-    locate: &dyn Fn(&Clip) -> Result<PathBuf, String>,
+    locate: &dyn Fn(&Shot) -> Result<PathBuf, String>,
 ) -> Result<(), String> {
     let mut writer = FilmWriter::create(path, film).map_err(|error| error.to_string())?;
     sink(Event::Started {
@@ -167,7 +159,8 @@ fn make(
     let rate = timeline.rate();
     let mut mixer = Mixer::new(timeline.clone(), 0, SAMPLE_RATE, folder.map(Path::to_path_buf));
     let mut sound = vec![0.0; CHUNK * CHANNELS];
-    let mut readers: Vec<(ClipId, ClipReader)> = Vec::new();
+    // By the clips a picture is seen through: each clip reads its media from front to back.
+    let mut readers: Vec<(Vec<ClipId>, ClipReader)> = Vec::new();
     let mut reported = Instant::now();
 
     for index in 0..total {
@@ -175,21 +168,22 @@ fn make(
             return Err("cancelled".to_string());
         }
         let picture = writer.picture();
-        match timeline.picture_at(index) {
-            Some((clip, offset)) => {
-                let place = match readers.iter().position(|(id, _)| *id == clip.id) {
+        match timeline.shot_at(index) {
+            Some(shot) => {
+                let clip = shot.clip;
+                let place = match readers.iter().position(|(key, _)| *key == shot.key) {
                     Some(place) => place,
                     None => {
-                        let reader = ClipReader::open(&locate(clip)?, true)
+                        let reader = ClipReader::open(&locate(&shot)?, true)
                             .map_err(|error| format!("{}: {error}", clip.name))?;
-                        readers.push((clip.id, reader));
+                        readers.push((shot.key.clone(), reader));
                         if readers.len() > OPEN_READERS {
                             readers.remove(0);
                         }
                         readers.len() - 1
                     }
                 };
-                let frame = clip.media_frame(offset, rate).max(0) as u64;
+                let frame = shot.media_frame.max(0) as u64;
                 let reader = &mut readers[place].1;
                 // Past the end of its media a clip shows its last picture, which stays drawn.
                 reader

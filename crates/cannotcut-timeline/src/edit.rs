@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::RangeInclusive;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::model::{
     Clip, ClipId, Extras, Item, MAX_FRAMES, Media, Rate, Timeline, Track, TrackKind, new_id,
 };
+use crate::nest::Projects;
 
 /// How many edits can be undone; older ones are forgotten.
 const MAX_UNDO_STEPS: usize = 500;
@@ -451,6 +454,17 @@ impl History {
         }
         self.redo.clear();
         Ok(created)
+    }
+
+    /// Puts freshly loaded copies of the projects it uses into every state, the undone ones too,
+    /// so that going back and forth never brings an old copy back. Not an edit: nothing is
+    /// added to undo.
+    pub fn adopt_projects(&mut self, projects: &Projects, folder: &Path) {
+        let mut canonical = HashMap::new();
+        let states = self.undo.iter_mut().chain(self.redo.iter_mut());
+        for timeline in std::iter::once(&mut self.timeline).chain(states.map(|(_, state)| state)) {
+            timeline.adopt_projects_with(projects, folder, &mut canonical);
+        }
     }
 
     /// Name of the edit [`undo`](Self::undo) would take back.

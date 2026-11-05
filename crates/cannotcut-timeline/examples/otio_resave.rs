@@ -1,5 +1,6 @@
 //! Loads a timeline, prints what cannotcut understood of it, and optionally saves it again. For
-//! checking files against other OpenTimelineIO tools.
+//! checking files against other OpenTimelineIO tools. Projects used as clips are printed inside
+//! the clip that uses them.
 //!
 //! Usage: `cargo run -p cannotcut-timeline --example otio_resave -- <in.otio> [<out.otio>]`
 
@@ -13,32 +14,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("usage: otio_resave <in.otio> [<out.otio>]")?;
     let timeline = Timeline::load(&input)?;
+    print(&timeline, "");
+    if let Some(output) = arguments.next() {
+        timeline.save(&output)?;
+        println!("saved     {}", output.display());
+    }
+    Ok(())
+}
+
+fn print(timeline: &Timeline, indent: &str) {
     let rate = timeline.rate();
     println!(
-        "timeline  \"{}\" at {}/{} fps, {} frames",
+        "{indent}timeline  \"{}\" at {}/{} fps, {} frames",
         timeline.name,
         rate.num,
         rate.den,
         timeline.duration()
     );
     for (index, track) in timeline.tracks().enumerate() {
-        println!("track {index}   {:?} \"{}\"", track.kind, track.name);
+        println!("{indent}track {index}   {:?} \"{}\"", track.kind, track.name);
         for (start, item) in track.placed() {
             match item {
-                Item::Clip(clip) => println!(
-                    "  {start:>6}  clip \"{}\", {} frames from media frame {} of {}",
-                    clip.name,
-                    clip.duration,
-                    clip.media_frame(0, rate),
-                    clip.media.target.as_deref().unwrap_or("missing media")
-                ),
-                Item::Gap(duration) => println!("  {start:>6}  gap, {duration} frames"),
+                Item::Clip(clip) => {
+                    let media = &clip.media;
+                    let what = match (media.is_project(), &media.project) {
+                        (true, None) => "project that could not be loaded",
+                        (true, Some(_)) => "project",
+                        (false, _) => "media",
+                    };
+                    println!(
+                        "{indent}  {start:>6}  clip \"{}\", {} frames from {what} frame {} of {}",
+                        clip.name,
+                        clip.duration,
+                        clip.media_frame(0, rate),
+                        media.target.as_deref().unwrap_or("missing media")
+                    );
+                    if let Some(nested) = &media.project {
+                        print(&nested.timeline, &format!("{indent}          | "));
+                    }
+                }
+                Item::Gap(duration) => println!("{indent}  {start:>6}  gap, {duration} frames"),
             }
         }
     }
-    if let Some(output) = arguments.next() {
-        timeline.save(&output)?;
-        println!("saved     {}", output.display());
-    }
-    Ok(())
 }

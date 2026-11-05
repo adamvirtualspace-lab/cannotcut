@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
+use crate::nest::Nested;
+
 /// No timeline is longer than this many frames; keeps frame arithmetic far from overflowing.
 pub(crate) const MAX_FRAMES: i64 = 1 << 40;
 
@@ -45,6 +47,12 @@ impl Rate {
     /// The frame at rate `to` that is showing when frame `frame` at this rate starts.
     pub fn rescale(self, frame: i64, to: Rate) -> i64 {
         self.scaled(frame, to).0
+    }
+
+    /// The first frame at rate `to` that starts no earlier than frame `frame` at this rate.
+    pub(crate) fn rescale_up(self, frame: i64, to: Rate) -> i64 {
+        let (floor, remainder, _) = self.scaled(frame, to);
+        floor + i64::from(remainder > 0)
     }
 
     /// Like [`rescale`](Self::rescale), but to the nearest frame instead of the one showing.
@@ -98,6 +106,9 @@ pub struct Media {
     pub available: Option<FrameRange>,
     pub name: String,
     pub metadata: Map<String, Value>,
+    /// When the media is another project: that project, loaded. It is not saved; it is loaded
+    /// again from `target` with the project that uses it.
+    pub project: Option<Arc<Nested>>,
 }
 
 impl Media {
@@ -112,6 +123,7 @@ impl Media {
             }),
             name: String::new(),
             metadata: Map::new(),
+            project: None,
         }
     }
 
@@ -489,17 +501,13 @@ impl Timeline {
     /// on `frame`, or from none: the next cut as the viewer sees it. None when the picture stays
     /// as it is to the end.
     pub fn next_picture_change(&self, frame: i64) -> Option<i64> {
-        let shown = |frame: i64| self.picture_at(frame).map(|(clip, _)| clip.id);
+        let shown = |frame: i64| self.shot_at(frame).map(|shot| shot.key);
         let now = shown(frame);
-        // The picture can only change where a clip begins or ends.
-        let mut edges: Vec<i64> = self
-            .tracks()
-            .filter(|track| track.kind == TrackKind::Video)
-            .flat_map(|track| track.clips())
-            .flat_map(|(start, clip)| [start, start + clip.duration])
-            .filter(|edge| *edge > frame)
-            .collect();
+        // The picture can only change where a clip begins or ends, here or in a nested project.
+        let mut edges = self.picture_edges();
+        edges.retain(|edge| *edge > frame);
         edges.sort_unstable();
+        edges.dedup();
         edges.into_iter().find(|edge| shown(*edge) != now)
     }
 }

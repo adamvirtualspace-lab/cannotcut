@@ -16,8 +16,8 @@ use cannotcut_media::{
     ClipInfo, Event, Options, Output, Pixels, Scrubber, Waveform, picture_size,
 };
 use cannotcut_timeline::{
-    Clip, ClipId, Edge, Edit, History, Media as TimelineMedia, NewClip, Placement, Rate,
-    Timeline, TrackKind,
+    ClipId, Edge, Edit, History, Media as TimelineMedia, Nested, NewClip, Placement, Projects,
+    Rate, Shot, Timeline, TrackKind,
 };
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
@@ -48,6 +48,9 @@ const SOUND_DELAY_FLAG: &str = "--sound-delay=";
 const EXPORT_FLAG: &str = "--export=";
 /// Starts with the playhead on a frame, to look at a spot without touching the mouse.
 const PLAYHEAD_FLAG: &str = "--at=";
+/// Adds a file to the end of the main track as "Add clips" does; for a project, that puts it in
+/// as a clip instead of opening it.
+const ADD_FLAG: &str = "--add=";
 const PROJECT_EXTENSION: &str = "otio";
 const FILM_EXTENSION: &str = "mp4";
 const EXPORT_BAR_WIDTH: f32 = 160.0;
@@ -182,6 +185,16 @@ enum Message {
     VolumeReleased,
     /// A media file's waveform has been read, or could not be.
     WaveformRead(String, Option<Arc<Waveform>>),
+    /// A project chosen to go on the timeline as a clip has been loaded, or could not be.
+    NestedLoaded(PathBuf, Result<Arc<Nested>, String>),
+    /// Open the project a clip plays, to edit it in place of the one it sits in.
+    StepInside(ClipId),
+    /// Go back to the project at this place on the path, outermost first.
+    StepOut(usize),
+    /// Back in a project after stepping out of one or more: the projects left that had changes
+    /// are saved (named here), and those it uses are loaded afresh. Tagged with the step it
+    /// belongs to.
+    SteppedOut(u64, Result<(Arc<Projects>, Vec<String>), String>),
     Key(keyboard::Event),
     MemoryTick,
 }
@@ -420,6 +433,16 @@ struct App {
     adding: VecDeque<PathBuf>,
     /// The source being opened for the first file in `adding`.
     opening: Option<u64>,
+    /// A project for the first file in `adding` is being loaded.
+    opening_project: bool,
+    /// The projects stepped out of to edit one they use, outermost first.
+    parents: Vec<Parent>,
+    /// Inside a nested project: how it was when stepped into or last saved, which tells whether
+    /// it has changes to save on the way out.
+    unchanged: Option<Timeline>,
+    /// Counts steps in and out, so that what was loaded for a project no longer shown is left
+    /// alone.
+    nest_step: u64,
     /// The source of the clip under the playhead; pictures from any other are out of date.
     active: Option<u64>,
     /// The source being got ready for the clip after the next cut.
@@ -452,8 +475,12 @@ struct App {
     timeline_view: Option<View>,
     notice: Option<String>,
     memory_mb: Option<usize>,
-    /// The waveforms read so far, by the media files' names in the project.
+    /// The waveforms of the media files the project shown uses, by their names in it, as the
+    /// panel finds them.
     waveforms: Waveforms,
+    /// Every waveform read so far, by file ([`file_key`]): projects stepped into and out of
+    /// share them.
+    waveform_files: HashMap<String, Arc<Waveform>>,
     /// Files whose waveform has been asked for, whether it has come yet or not.
     waveforms_asked: HashSet<String>,
     /// Files waiting for their waveform to be read, one at a time.
@@ -483,7 +510,7 @@ struct Exporting {
 /// An open media file: a decode thread that makes pictures of its frames.
 struct Source {
     generation: u64,
-    /// The file's location as the clips on the timeline give it.
+    /// The file's key: its full path ([`file_key`]).
     target: String,
     name: String,
     scrubber: Scrubber,
@@ -505,6 +532,17 @@ impl Source {
         self.last_frame = Some(frame);
         self.scrubber.request(frame)
     }
+}
+
+/// A project stepped out of to edit one of the projects it uses, as it was left.
+struct Parent {
+    history: History,
+    path: Option<PathBuf>,
+    folder: Option<PathBuf>,
+    unchanged: Option<Timeline>,
+    playhead: i64,
+    selected: Option<ClipId>,
+    view: Option<View>,
 }
 
 /// The newest request, kept to time how long its pictures take to reach the UI.
@@ -548,6 +586,10 @@ impl App {
             generation: 0,
             adding: VecDeque::new(),
             opening: None,
+            opening_project: false,
+            parents: Vec::new(),
+            unchanged: None,
+            nest_step: 0,
             active: None,
             warming: None,
             sound: Player::start(),
@@ -569,6 +611,7 @@ impl App {
             notice: None,
             memory_mb: None,
             waveforms: Waveforms::new(),
+            waveform_files: HashMap::new(),
             waveforms_asked: HashSet::new(),
             waveform_queue: VecDeque::new(),
             reading_waveform: false,
@@ -593,6 +636,8 @@ impl App {
                 export = Some(PathBuf::from(film));
             } else if let Some(frame) = text.strip_prefix(PLAYHEAD_FLAG) {
                 playhead = frame.parse().unwrap_or(0);
+            } else if let Some(added) = text.strip_prefix(ADD_FLAG) {
+                app.adding.push_back(PathBuf::from(added));
             } else if path.extension().is_some_and(|extension| extension == PROJECT_EXTENSION) {
                 match Timeline::load(&path) {
                     Ok(timeline) => drop(app.adopt_project(path, timeline)),
@@ -613,6 +658,10 @@ impl App {
     /// Replaces what is being edited with a project read from `path`.
     fn adopt_project(&mut self, path: PathBuf, timeline: Timeline) -> Task<Message> {
         self.history = History::new(timeline);
+        // Whatever projects were stepped out of are left behind with the old project.
+        self.parents.clear();
+        self.unchanged = None;
+        self.nest_step += 1;
         self.project_folder = path.parent().map(Path::to_path_buf);
         self.project_path = Some(path);
         self.selected = None;
@@ -624,6 +673,7 @@ impl App {
         self.sources.clear();
         self.adding.clear();
         self.opening = None;
+        self.opening_project = false;
         self.active = None;
         self.pending = None;
         self.shown = None;
@@ -647,12 +697,23 @@ impl App {
     /// which takes opening it; files go on one at a time so they keep the order they were
     /// chosen in.
     fn add_next(&mut self) -> Task<Message> {
-        if self.opening.is_some() {
+        if self.opening.is_some() || self.opening_project {
             return Task::none();
         }
         while let Some(path) = self.adding.front().cloned() {
-            let target = TimelineMedia::target_for(&path);
-            let (index, task) = match self.source(&target, &path, 0, false) {
+            if is_project(&path) {
+                // Read off the UI thread with the projects it uses in turn.
+                self.opening_project = true;
+                let loading = path.clone();
+                let load = async move { Nested::load(&loading).map_err(|error| error.to_string()) };
+                let shown = self.show_playhead();
+                let loaded = Task::perform(load, move |loaded| {
+                    Message::NestedLoaded(path.clone(), loaded)
+                });
+                return Task::batch([loaded, shown]);
+            }
+            let key = file_key(&path);
+            let (index, task) = match self.source(&key, &path, 0, false) {
                 Ok(found) => found,
                 Err(error) => {
                     self.notice = Some(error);
@@ -677,6 +738,86 @@ impl App {
         self.show_playhead()
     }
 
+    /// Opens the project a clip plays in place of the one it sits in, which waits on the path
+    /// in the header. The playhead goes to the frame of that project it stood on.
+    fn step_inside(&mut self, id: ClipId) -> Task<Message> {
+        let timeline = self.history.timeline();
+        let Some((_, clip, start)) = timeline.clip(id) else {
+            return Task::none();
+        };
+        let Some(nested) = clip.media.project.clone() else {
+            if clip.media.is_project() {
+                self.notice = Some(format!("the project of \"{}\" could not be read", clip.name));
+            }
+            return Task::none();
+        };
+        let offset = (self.playhead - start).clamp(0, clip.duration - 1);
+        let frame = clip.media_frame(offset, timeline.rate());
+        self.stop_playing();
+        self.preview = None;
+        let parent = Parent {
+            history: std::mem::replace(&mut self.history, History::new(nested.timeline.clone())),
+            path: self.project_path.replace(nested.path.clone()),
+            folder: self.project_folder.replace(nested.folder.clone()),
+            unchanged: self.unchanged.replace(nested.timeline.clone()),
+            playhead: self.playhead,
+            selected: self.selected.take(),
+            view: self.timeline_view.take(),
+        };
+        self.parents.push(parent);
+        self.nest_step += 1;
+        self.notice = None;
+        self.playhead = frame;
+        // Decoders stay open: they are known by file, so the pictures inside carry on.
+        self.timeline_changed()
+    }
+
+    /// Goes back to the project at `level` of the path. Each project stepped out of that has
+    /// changes is saved, so the projects using it show them, and the one arrived at loads the
+    /// projects it uses afresh; both off the UI thread.
+    fn step_out(&mut self, level: usize) -> Task<Message> {
+        if level >= self.parents.len() {
+            return Task::none();
+        }
+        self.stop_playing();
+        self.preview = None;
+        // Innermost first, so that a project is saved before the one around it is read.
+        let mut saves = Vec::new();
+        while self.parents.len() > level {
+            let parent = self.parents.pop().expect("there are parents left");
+            let left = std::mem::replace(&mut self.history, parent.history);
+            if let Some(path) = self.project_path.take()
+                && self.unchanged.as_ref() != Some(left.timeline())
+            {
+                saves.push((left.timeline().clone(), path));
+            }
+            self.project_path = parent.path;
+            self.project_folder = parent.folder;
+            self.unchanged = parent.unchanged;
+            self.playhead = parent.playhead;
+            self.selected = parent.selected;
+            self.timeline_view = parent.view;
+        }
+        self.nest_step += 1;
+        let step = self.nest_step;
+        let timeline = self.history.timeline().clone();
+        let folder = self.project_folder.clone().unwrap_or_default();
+        let work = async move {
+            let mut saved = Vec::new();
+            for (timeline, path) in saves {
+                timeline.save(&path).map_err(|error| error.to_string())?;
+                saved.push(file_name(&path));
+            }
+            let projects = Projects::load(&timeline, &folder).map_err(|error| error.to_string())?;
+            Ok((Arc::new(projects), saved))
+        };
+        let shown = self.timeline_changed();
+        Task::batch([
+            Task::perform(work, move |result| Message::SteppedOut(step, result)),
+            shown,
+        ])
+    }
+
     /// Puts all of a media file on the main track, after what is there.
     fn place_at_end(&mut self, path: &Path, info: &ClipInfo) {
         let media_rate = Rate::new(
@@ -684,6 +825,24 @@ impl App {
             info.frame_rate.den.max(1) as u32,
         );
         let media = TimelineMedia::from_path(path, media_rate, info.frame_count as i64);
+        self.place_media_at_end(path, media);
+    }
+
+    /// Puts all of another project on the main track, after what is there, unless that project
+    /// holds the one being edited: a project cannot go inside itself.
+    fn place_project_at_end(&mut self, path: &Path, nested: Arc<Nested>) {
+        if let Some(own) = &self.project_path
+            && nested.holds(own)
+        {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            self.notice = Some(format!("{name} uses this project, so it cannot go inside it"));
+            return;
+        }
+        self.place_media_at_end(path, TimelineMedia::from_project(path, nested));
+    }
+
+    fn place_media_at_end(&mut self, path: &Path, media: TimelineMedia) {
+        let media_rate = media.rate;
         // The first clip decides the project's frame rate.
         let empty = |timeline: &Timeline| timeline.tracks().all(|track| track.items().is_empty());
         if empty(self.history.timeline()) && self.history.timeline().rate() != media_rate {
@@ -711,10 +870,11 @@ impl App {
         }
     }
 
-    /// An open source for a media file to show `frame` from, opening one if need be. A file can
-    /// be open more than once; the source whose decoder is nearest that frame is taken. With
-    /// `spare` the source showing the picture now is left alone. Returns the source's place in
-    /// `sources` and the task that brings in its events.
+    /// An open source for a media file to show `frame` from, opening one if need be. `target`
+    /// is the file's key ([`file_key`]). A file can be open more than once; the source whose
+    /// decoder is nearest that frame is taken. With `spare` the source showing the picture now
+    /// is left alone. Returns the source's place in `sources` and the task that brings in its
+    /// events.
     fn source(
         &mut self,
         target: &str,
@@ -796,7 +956,7 @@ impl App {
             Some(preview) => &preview.timeline,
             None => self.history.timeline(),
         };
-        let Some((clip, offset)) = timeline.picture_at(at) else {
+        let Some(shot) = timeline.shot_at(at) else {
             // Nothing plays here: the viewer goes black. While playing that waits for the
             // clock to get there.
             self.active = None;
@@ -806,9 +966,9 @@ impl App {
             }
             return Task::none();
         };
-        let frame = clip.media_frame(offset, timeline.rate()).max(0) as u64;
-        let Some((target, path)) = self.location(clip) else {
-            self.notice = Some(format!("the media of \"{}\" is missing", clip.name));
+        let frame = shot.media_frame.max(0) as u64;
+        let Some((target, path)) = self.location(&shot) else {
+            self.notice = Some(format!("the media of \"{}\" is missing", shot.clip.name));
             self.active = None;
             self.shown = None;
             return Task::none();
@@ -845,14 +1005,11 @@ impl App {
         }
     }
 
-    /// Where a clip's media file is: its name in the project, and its path on disk.
-    fn location(&self, clip: &Clip) -> Option<(String, PathBuf)> {
-        let path = clip.media.path()?;
-        let path = match &self.project_folder {
-            Some(folder) if path.is_relative() => folder.join(path),
-            _ => path,
-        };
-        Some((clip.media.target.clone()?, path))
+    /// Where the media file of a picture is: its key ([`file_key`]) and its path on disk. None
+    /// when it is missing.
+    fn location(&self, shot: &Shot) -> Option<(String, PathBuf)> {
+        let path = shot.file(self.project_folder.as_deref())?;
+        Some((file_key(&path), path))
     }
 
     /// While playing, gets the decoder for the clip after the next cut ready a little ahead of
@@ -876,21 +1033,24 @@ impl App {
             return Task::none();
         }
         playback.warmed = true;
-        let Some((clip, offset)) = timeline.picture_at(cut) else {
+        let Some(shot) = timeline.shot_at(cut) else {
             // Nothing plays after the cut.
             return Task::none();
         };
-        let frame = clip.media_frame(offset, rate).max(0) as u64;
-        // Where the next clip goes on in the file from where this one stops, the decoder at
-        // work simply carries on.
-        let carries_on = timeline.picture_at(cut - 1).is_some_and(|(before, offset)| {
-            let stops_at = before.media_frame(offset, rate).max(0) as u64;
-            before.media.target == clip.media.target
-                && (stops_at..=stops_at + CARRY_ON_FRAMES).contains(&frame)
-        });
-        let Some((target, path)) = self.location(clip).filter(|_| !carries_on) else {
+        let frame = shot.media_frame.max(0) as u64;
+        let Some((target, path)) = self.location(&shot) else {
             return Task::none();
         };
+        // Where the next clip goes on in the file from where this one stops, the decoder at
+        // work simply carries on.
+        let carries_on = timeline.shot_at(cut - 1).is_some_and(|before| {
+            let stops_at = before.media_frame.max(0) as u64;
+            self.location(&before).is_some_and(|(key, _)| key == target)
+                && (stops_at..=stops_at + CARRY_ON_FRAMES).contains(&frame)
+        });
+        if carries_on {
+            return Task::none();
+        }
         match self.source(&target, &path, frame, true) {
             Ok((index, task)) => {
                 let source = &mut self.sources[index];
@@ -965,7 +1125,7 @@ impl App {
                 stats.last = Some(now);
             }
         }
-        if self.history.timeline().picture_at(frame).is_none() {
+        if self.history.timeline().shot_at(frame).is_none() {
             // Nothing plays here. The wait for the next picture is no stutter.
             self.shown = None;
             if let Some(stats) = &mut self.play_stats {
@@ -993,18 +1153,27 @@ impl App {
     /// Asks for the waveform of every media file on the timeline that has none yet.
     fn read_waveforms(&mut self) -> Task<Message> {
         let mut wanted = Vec::new();
+        let mut shown = Waveforms::new();
+        let folder = self.project_folder.as_deref();
         for track in self.history.timeline().tracks() {
             for (_, clip) in track.clips() {
-                if let Some((target, path)) = self.location(clip)
-                    && !self.waveforms_asked.contains(&target)
-                {
-                    wanted.push((target, path));
+                let (Some(target), Some(path)) = (&clip.media.target, clip.media.file(folder))
+                else {
+                    continue;
+                };
+                // Read by file, found by the panel by the media's name in the project.
+                let key = file_key(&path);
+                match self.waveform_files.get(&key) {
+                    Some(waveform) => drop(shown.insert(target.clone(), waveform.clone())),
+                    None if !self.waveforms_asked.contains(&key) => wanted.push((key, path)),
+                    None => {}
                 }
             }
         }
-        for (target, path) in wanted {
-            if self.waveforms_asked.insert(target.clone()) {
-                self.waveform_queue.push_back((target, path));
+        self.waveforms = shown;
+        for (key, path) in wanted {
+            if self.waveforms_asked.insert(key.clone()) {
+                self.waveform_queue.push_back((key, path));
             }
         }
         self.next_waveform()
@@ -1137,6 +1306,10 @@ impl App {
             }
             Message::Saved(Ok(path)) => {
                 self.notice = Some(format!("Saved {}", path.display()));
+                // Inside a nested project, what was saved is nothing to save on the way out.
+                if !self.parents.is_empty() && self.project_path.as_ref() == Some(&path) {
+                    self.unchanged = Some(self.history.timeline().clone());
+                }
                 self.project_folder = path.parent().map(Path::to_path_buf);
                 self.project_path = Some(path);
             }
@@ -1168,6 +1341,7 @@ impl App {
                     }
                 }
                 Action::Commit(edit) => return self.edit(&edit),
+                Action::Open(clip) => return self.step_inside(clip),
                 Action::Cancel => {
                     if self.preview.take().is_some() {
                         return self.show_playhead();
@@ -1273,10 +1447,40 @@ impl App {
                     return self.sound_edit(&Edit::SetVolume { clip, volume });
                 }
             }
+            Message::StepInside(clip) => return self.step_inside(clip),
+            Message::StepOut(level) => return self.step_out(level),
+            Message::SteppedOut(step, result) => match result {
+                Ok((projects, saved)) => {
+                    if !saved.is_empty() {
+                        self.notice = Some(format!("Saved {}", saved.join(", ")));
+                    }
+                    if step == self.nest_step {
+                        let folder = self.project_folder.clone().unwrap_or_default();
+                        self.history.adopt_projects(&projects, &folder);
+                        if let Some(unchanged) = &mut self.unchanged {
+                            unchanged.adopt_projects(&projects, &folder);
+                        }
+                        return self.timeline_changed();
+                    }
+                }
+                Err(error) => self.notice = Some(error),
+            },
+            Message::NestedLoaded(path, loaded) => {
+                self.opening_project = false;
+                if self.adding.front() == Some(&path) {
+                    self.adding.pop_front();
+                }
+                match loaded {
+                    Ok(nested) => self.place_project_at_end(&path, nested),
+                    Err(error) => self.notice = Some(error),
+                }
+                return self.add_next();
+            }
             Message::WaveformRead(target, waveform) => {
                 self.reading_waveform = false;
                 if let Some(waveform) = waveform {
-                    self.waveforms.insert(target, waveform);
+                    // Shown once `read_waveforms` has gone over the timeline again.
+                    self.waveform_files.insert(target, waveform);
                 }
                 return self.next_waveform();
             }
@@ -1541,20 +1745,17 @@ impl App {
         Task::run(events, Message::Exported)
     }
 
-    /// The clip a film takes its shape from: the first on the main track, or else the first
-    /// anywhere. The export works it out the same way.
-    fn film_clip(&self) -> Option<&Clip> {
-        let timeline = self.history.timeline();
-        timeline
-            .tracks()
-            .flat_map(|track| track.clips().map(|(_, clip)| clip))
-            .next()
+    /// The media file a film takes its shape from: that of the first clip on the main track,
+    /// or else the first anywhere, looking into nested projects. The export works it out the
+    /// same way.
+    fn film_source(&self) -> Option<(String, PathBuf)> {
+        self.location(&self.history.timeline().first_shot()?)
     }
 
-    /// Reads the picture size of the clip a film takes its shape from, in the background,
+    /// Reads the picture size of the media a film takes its shape from, in the background,
     /// unless it is known already.
     fn read_film_size(&mut self) -> Task<Message> {
-        let Some((target, path)) = self.film_clip().and_then(|clip| self.location(clip)) else {
+        let Some((target, path)) = self.film_source() else {
             return Task::none();
         };
         if self.picture_sizes.contains_key(&target) || !self.sizing.insert(target.clone()) {
@@ -1695,15 +1896,21 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let timeline = self.history.timeline();
-        let header = row![
+        let mut header = row![
             button("Add clips").on_press(Message::AddRequested),
             button("Open").on_press(Message::OpenRequested),
             button("Save").on_press(Message::SaveRequested),
             self.export_control(),
-            one_line(self.headline()).width(Fill),
+            // Up here, not with the editing buttons: on the GPD's screen at 225% those already
+            // fill the row while a clip is selected.
+            self.step_inside_control(),
         ]
         .spacing(12)
         .align_y(Center);
+        if !self.parents.is_empty() {
+            header = header.push(self.project_path_bar());
+        }
+        let header = header.push(one_line(self.headline()).width(Fill));
 
         let picture: Element<'_, Message> = match self.shown.as_ref().map(|shown| &shown.picture) {
             Some(Displayed::Yuv(planes)) => shader(planes).width(Fill).height(Fill).into(),
@@ -1784,15 +1991,44 @@ impl App {
             .into()
     }
 
+    /// Where the project shown sits: the projects stepped out of, each a button back, and its
+    /// own name.
+    fn project_path_bar(&self) -> Element<'_, Message> {
+        let mut bar = row![].spacing(4).align_y(Center);
+        for (level, parent) in self.parents.iter().enumerate() {
+            let name = project_name(parent.path.as_deref(), parent.history.timeline());
+            bar = bar
+                .push(
+                    button(text(name))
+                        .style(button::text)
+                        .on_press(Message::StepOut(level)),
+                )
+                .push(text(">"));
+        }
+        let own = project_name(self.project_path.as_deref(), self.history.timeline());
+        bar.push(text(own).wrapping(text::Wrapping::None)).into()
+    }
+
+    /// A way into the selected clip's project, for when double-clicking is not at hand.
+    fn step_inside_control(&self) -> Element<'_, Message> {
+        let nested = self.selected.filter(|clip| {
+            let found = self.history.timeline().clip(*clip);
+            found.is_some_and(|(_, clip, _)| clip.media.project.is_some())
+        });
+        match nested {
+            Some(clip) => button("Step inside").on_press(Message::StepInside(clip)).into(),
+            None => row![].into(),
+        }
+    }
+
     /// The export choices: how large and how good, what that makes, and the way on.
     fn export_dialog(&self) -> Element<'_, Message> {
         let options = self.settings.export;
         let timeline = self.history.timeline();
         let rate = timeline.rate();
         let source = self
-            .film_clip()
-            .and_then(|clip| clip.media.target.as_ref())
-            .and_then(|target| self.picture_sizes.get(target))
+            .film_source()
+            .and_then(|(target, _)| self.picture_sizes.get(&target))
             .copied();
         let about = match source {
             Some(source) => {
@@ -2060,15 +2296,48 @@ async fn load_project(path: PathBuf) -> Result<(PathBuf, Timeline), String> {
 }
 
 async fn pick_clips() -> Vec<PathBuf> {
+    let both: Vec<&str> = VIDEO_EXTENSIONS
+        .iter()
+        .copied()
+        .chain([PROJECT_EXTENSION])
+        .collect();
     rfd::AsyncFileDialog::new()
-        .set_title("Add video clips")
+        .set_title("Add video clips or projects")
+        .add_filter("Video or project", &both)
         .add_filter("Video", VIDEO_EXTENSIONS)
+        .add_filter("Project", &[PROJECT_EXTENSION])
         .pick_files()
         .await
         .unwrap_or_default()
         .iter()
         .map(|file| file.path().to_path_buf())
         .collect()
+}
+
+/// What a project is called on the path in the header: its file's name, or the name in it
+/// while it has no file.
+fn project_name(path: Option<&Path>, timeline: &Timeline) -> String {
+    match path.and_then(Path::file_stem) {
+        Some(stem) => stem.to_string_lossy().into_owned(),
+        None if timeline.name.is_empty() => "Untitled".to_string(),
+        None => timeline.name.clone(),
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into())
+}
+
+fn is_project(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(PROJECT_EXTENSION))
+}
+
+/// What open media files, their picture sizes and decoders are known by: the full path. Two
+/// nested projects can each have an `a.mp4` of their own, so names in a project do not do.
+fn file_key(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 /// Non-drop-frame timecode.
