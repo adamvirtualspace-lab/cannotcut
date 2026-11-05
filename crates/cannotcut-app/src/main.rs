@@ -24,7 +24,7 @@ use iced::keyboard::{self, key};
 use iced::futures::channel::oneshot;
 use iced::widget::{
     Column, button, center, column, container, image, pick_list, progress_bar, row, sensor,
-    shader, slider, stack, text,
+    shader, slider, space, stack, text, tooltip,
 };
 use iced::{
     Center, Color, ContentFit, Element, Fill, Size, Subscription, Task, Theme, time, window,
@@ -94,13 +94,22 @@ const NEAR_TICK: f64 = 0.03;
 const TICK_NUDGE: f64 = 0.1;
 /// How long playing waits for the sound card to start before following the system clock.
 const SOUND_START_LIMIT: Duration = Duration::from_secs(1);
+/// The frame-step buttons' signs: the small triangles, because the large ones have an emoji
+/// form that Windows draws as coloured tiles whatever the text asks for.
+const STEP_BACK: &str = "\u{25C2}";
+const STEP_ON: &str = "\u{25B8}";
+const SIGN_SIZE: f32 = 24.0;
+/// The line height of the words on buttons: iced's 16-pixel text at 1.3 lines.
+const SIGN_LINE_HEIGHT: f32 = 20.8;
+/// How far the signs are let down to look centred.
+const SIGN_DROP: f32 = 4.0;
 /// Wide enough for either word, so the buttons after it stay put.
 const PLAY_LABEL_WIDTH: f32 = 44.0;
 /// Peaks a second in a waveform: enough to see words and beats.
 const WAVEFORM_RATE: u32 = 100;
 /// The loudest a clip can be turned up to: twice as strong as recorded.
 const MAX_VOLUME: f32 = 2.0;
-const VOLUME_SLIDER_WIDTH: f32 = 140.0;
+const VOLUME_SLIDER_WIDTH: f32 = 110.0;
 /// Wide enough for "200%", so the slider beside it stays put.
 const VOLUME_LABEL_WIDTH: f32 = 44.0;
 /// The column of track buttons left of the timeline panel.
@@ -1936,12 +1945,13 @@ impl App {
             viewer = stack![viewer, center(self.export_dialog())].into();
         }
 
-        // A button that cannot do anything right now shows it by being greyed out.
+        // Editing on the left, playing on the right, so that the row fits the GPD's screen at
+        // 225% (1138 logical pixels) with a clip's volume showing. A button that cannot do
+        // anything right now shows it by being greyed out.
         let position = format!(
-            "{}   frame {} of {}",
+            "{} / {}",
             timecode(self.playhead, timeline.rate()),
-            self.playhead,
-            self.last_frame()
+            timecode(timeline.duration(), timeline.rate())
         );
         let toolbar = row![
             button("Undo").on_press_maybe(self.history.undo_label().map(|_| Message::Undo)),
@@ -1950,15 +1960,25 @@ impl App {
             button("Delete").on_press_maybe(self.delete_edit().map(|_| Message::Delete)),
             button("Add track").on_press(Message::AddTrack),
             self.volume_control(),
-            one_line(position).center_x(Fill),
-            button(
-                text(if self.playback.is_some() { "Pause" } else { "Play" })
-                    .width(PLAY_LABEL_WIDTH)
-                    .align_x(Center)
-            )
-            .on_press_maybe((timeline.duration() > 0).then_some(Message::PlayToggled)),
-            button("Previous frame").on_press(Message::Stepped(-1)),
-            button("Next frame").on_press(Message::Stepped(1)),
+            space().width(Fill),
+            hint(
+                button(sign(STEP_BACK)).on_press(Message::Stepped(-1)),
+                "Previous frame (Left arrow)"
+            ),
+            hint(
+                button(
+                    text(if self.playback.is_some() { "Pause" } else { "Play" })
+                        .width(PLAY_LABEL_WIDTH)
+                        .align_x(Center)
+                )
+                .on_press_maybe((timeline.duration() > 0).then_some(Message::PlayToggled)),
+                "Play or pause (Space)"
+            ),
+            hint(
+                button(sign(STEP_ON)).on_press(Message::Stepped(1)),
+                "Next frame (Right arrow)"
+            ),
+            text(position).wrapping(text::Wrapping::None),
         ]
         .spacing(12)
         .align_y(Center);
@@ -2202,6 +2222,8 @@ impl App {
             None => "...".to_string(),
         };
         let mut parts = vec![
+            // The toolbar gives the time; the frame number is for looking things up.
+            format!("frame {} of {}", self.playhead, self.last_frame()),
             format!("first {}", milliseconds(self.latency.first_picture)),
             format!("exact {}", milliseconds(self.latency.exact)),
         ];
@@ -2250,6 +2272,35 @@ impl App {
         }
         parts.join("   ")
     }
+}
+
+/// A sign on a button, drawn larger than the words on the other buttons but taking no more
+/// height, so the row they share stays as it is.
+fn sign(sign: &str) -> container::Container<'_, Message> {
+    // The triangles sit high in their line; the same height, part of it above them, puts
+    // them level with the words beside them.
+    let line = SIGN_LINE_HEIGHT - SIGN_DROP;
+    container(
+        text(sign)
+            .size(SIGN_SIZE)
+            .line_height(text::LineHeight::Absolute(iced::Pixels(line))),
+    )
+    .padding(iced::padding::top(SIGN_DROP))
+}
+
+/// A control with a word on what it does, shown while the pointer rests on it: for buttons
+/// that carry a sign instead of a name.
+fn hint<'a>(
+    control: impl Into<Element<'a, Message>>,
+    words: &'a str,
+) -> Element<'a, Message> {
+    tooltip(
+        control,
+        container(text(words).size(STATUS_TEXT_SIZE)).padding(6).style(container::rounded_box),
+        tooltip::Position::Top,
+    )
+    .gap(4)
+    .into()
 }
 
 /// Text that is cut off instead of wrapped when it runs out of room. The rows around the viewer
