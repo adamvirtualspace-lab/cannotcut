@@ -950,6 +950,32 @@ mod tests {
     }
 
     #[test]
+    fn a_project_edited_and_undone_is_the_same_as_before() {
+        let (film, [x, ..]) = film();
+        let mut history = crate::History::new(film.clone());
+        assert!(history.timeline().same_as(&film));
+        history.apply(&Edit::Remove { clip: x, ripple: false }).unwrap();
+        assert!(!history.timeline().same_as(&film));
+        assert!(history.undo());
+        assert!(history.timeline().same_as(&film));
+        // The same edit made again makes an equal project, with tracks of its own.
+        history.redo();
+        let mut again = film.clone();
+        again.apply(&Edit::Remove { clip: x, ripple: false }).unwrap();
+        assert!(history.timeline().same_as(&again));
+        let mut renamed = film.clone();
+        renamed.name = "other".to_string();
+        assert!(!renamed.same_as(&film));
+        // Media put back as it was, as stepping out of a compound clip with nothing changed
+        // does, leaves it the same.
+        let (_, clip, _) = film.clip(x).unwrap();
+        let media = Arc::new((*clip.media).clone());
+        let mut swapped = film.clone();
+        swapped.apply(&Edit::SetMedia { clip: x, media }).unwrap();
+        assert!(swapped.same_as(&film));
+    }
+
+    #[test]
     fn linked_projects_inside_a_compound_clip_are_loaded_and_taken_up() {
         let folder = Folder::new("inside");
         save_inner(&folder);

@@ -465,6 +465,23 @@ impl Timeline {
         self.rate
     }
 
+    /// Whether the two hold the same project, as its file would have it. Quick when one is a
+    /// copy of the other: tracks still shared are not looked into. The ids left to give out do
+    /// not count.
+    pub fn same_as(&self, other: &Timeline) -> bool {
+        self.name == other.name
+            && self.metadata == other.metadata
+            && self.rate == other.rate
+            && self.start == other.start
+            && self.stack == other.stack
+            && self.tracks.len() == other.tracks.len()
+            && self
+                .tracks
+                .iter()
+                .zip(&other.tracks)
+                .all(|(own, theirs)| Arc::ptr_eq(own, theirs) || own == theirs)
+    }
+
     pub fn tracks(&self) -> impl DoubleEndedIterator<Item = &Track> + ExactSizeIterator {
         self.tracks.iter().map(Arc::as_ref)
     }

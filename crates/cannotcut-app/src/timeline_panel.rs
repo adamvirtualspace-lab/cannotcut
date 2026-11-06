@@ -151,6 +151,8 @@ pub struct TimelinePanel<'a, Message> {
     playhead: i64,
     view: Option<View>,
     selected: &'a [ClipId],
+    /// A press on a clip adds it to the selection or takes it out, as Ctrl-click does.
+    selecting: bool,
     waveforms: &'a Waveforms,
     on_action: Box<dyn Fn(Action) -> Message + 'a>,
 }
@@ -172,8 +174,17 @@ pub fn timeline_panel<'a, Message>(
         playhead,
         view,
         selected,
+        selecting: false,
         waveforms,
         on_action: Box::new(on_action),
+    }
+}
+
+impl<Message> TimelinePanel<'_, Message> {
+    /// Presses on clips pick several, for touch, where there is no Ctrl to hold.
+    pub fn selecting(mut self, selecting: bool) -> Self {
+        self.selecting = selecting;
+        self
     }
 }
 
@@ -452,7 +463,7 @@ impl<Message> TimelinePanel<'_, Message> {
     fn press(&self, state: &mut State, point: Point, width: f32, shell: &mut Shell<'_, Message>) {
         let view = self.view(width);
         let hit = self.hit(view, point);
-        let adding = state.modifiers.command() || state.modifiers.shift();
+        let adding = self.selecting || state.modifiers.command() || state.modifiers.shift();
         if let (Hit::Body { id, .. } | Hit::Grip { id, .. }, true) = (hit, adding) {
             // Into the selection, or out of it if it was in; nothing is dragged.
             let mut picked = self.selected.to_vec();
@@ -468,9 +479,10 @@ impl<Message> TimelinePanel<'_, Message> {
         }
         let picked = match hit {
             Hit::Body { id, .. } | Hit::Grip { id, .. } => vec![id],
-            // A press on the ruler leaves the selection alone; one on empty track clears it.
-            Hit::Empty { lane: false } => self.selected.to_vec(),
-            Hit::Empty { lane: true } => Vec::new(),
+            // A press on the ruler leaves the selection alone; one on empty track clears it,
+            // but not while picking several, where a stray tap would lose them all.
+            Hit::Empty { lane } if !lane || self.selecting => self.selected.to_vec(),
+            Hit::Empty { .. } => Vec::new(),
         };
         if picked != self.selected {
             self.publish(Action::Select(picked), shell);

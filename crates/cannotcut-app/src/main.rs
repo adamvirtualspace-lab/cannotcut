@@ -125,7 +125,7 @@ const EMPTY_PROJECT_RATE: Rate = Rate::new(30, 1);
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
-        .title("cannotcut")
+        .title(App::title)
         .subscription(App::subscription)
         .theme(Theme::Dark)
         // Maximized, as an editor wants every pixel; the size is what "restore" goes back to,
@@ -134,6 +134,8 @@ fn main() -> iced::Result {
             size: Size::new(1280.0, 720.0),
             maximized: true,
             min_size: Some(Size::new(640.0, 480.0)),
+            // Closing asks first while there are unsaved changes.
+            exit_on_close_request: false,
             ..window::Settings::default()
         })
         .run()
@@ -219,6 +221,20 @@ enum Message {
     /// are saved (named here), and those it uses are loaded afresh. Tagged with the step it
     /// belongs to.
     SteppedOut(u64, Result<(Arc<Projects>, Vec<String>), String>),
+    /// The window's close button, or the like.
+    CloseRequested,
+    /// Asked about unsaved changes: save them, then go on.
+    LeaveSave,
+    /// Where a project never saved goes, before going on.
+    LeaveSaveChosen(Option<PathBuf>),
+    /// The projects saved before going on, and what went wrong if one could not be.
+    LeaveSaved(Vec<SavedProject>, Option<String>),
+    /// Go on without saving.
+    LeaveDiscard,
+    /// Stay.
+    LeaveCancel,
+    /// Tapping clips picks several, or goes back to picking one.
+    SelectToggled,
     Key(keyboard::Event),
     MemoryTick,
 }
@@ -230,6 +246,15 @@ enum Keep {
     Linked,
     /// In the file of the project it is in, for this clip alone.
     Inside,
+}
+
+/// What waits on the question of unsaved changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Leave {
+    /// Opening another project.
+    Open,
+    /// Closing the window, which ends the app.
+    Close,
 }
 
 /// A project file that was saved: where, what was in it, and which project of the path in the
@@ -481,9 +506,9 @@ struct App {
     opening_project: bool,
     /// The projects stepped out of to edit one they use, outermost first.
     parents: Vec<Parent>,
-    /// Inside a nested project: how it was when stepped into or last saved, which tells whether
-    /// it has changes to save on the way out.
-    unchanged: Option<Timeline>,
+    /// How the project shown was when opened, stepped into or last saved: whether it has
+    /// changes to save, or inside a compound clip to pass on, is told against it.
+    unchanged: Timeline,
     /// Counts steps in and out, so that what was loaded for a project no longer shown is left
     /// alone.
     nest_step: u64,
@@ -541,6 +566,12 @@ struct App {
     compounding: Vec<ClipId>,
     /// Where a linked compound clip goes without asking, as asked on the command line.
     compound_file: Option<PathBuf>,
+    /// Waiting on the question of unsaved changes, which is on show.
+    leaving: Option<Leave>,
+    /// The changes are being saved before leaving.
+    leave_saving: bool,
+    /// A tap on a clip adds it to the selection or takes it out, as Ctrl-click does.
+    selecting: bool,
     /// The picture sizes of media files, by their names in the project, as far as known.
     picture_sizes: HashMap<String, (u32, u32)>,
     /// Files whose picture size is being read.
@@ -591,7 +622,7 @@ struct Parent {
     /// around it.
     path: Option<PathBuf>,
     folder: Option<PathBuf>,
-    unchanged: Option<Timeline>,
+    unchanged: Timeline,
     playhead: i64,
     selected: Vec<ClipId>,
     view: Option<View>,
@@ -645,7 +676,7 @@ impl App {
             opening: None,
             opening_project: false,
             parents: Vec::new(),
-            unchanged: None,
+            unchanged: Timeline::new("Untitled", EMPTY_PROJECT_RATE),
             nest_step: 0,
             active: None,
             warming: None,
@@ -678,6 +709,9 @@ impl App {
             compound_dialog: false,
             compounding: Vec::new(),
             compound_file: None,
+            leaving: None,
+            leave_saving: false,
+            selecting: false,
             picture_sizes: HashMap::new(),
             sizing: HashSet::new(),
         };
@@ -719,15 +753,16 @@ impl App {
 
     /// Replaces what is being edited with a project read from `path`.
     fn adopt_project(&mut self, path: PathBuf, timeline: Timeline) -> Task<Message> {
-        self.history = History::new(timeline);
+        self.history = History::new(timeline.clone());
         // Whatever projects were stepped out of are left behind with the old project.
         self.parents.clear();
-        self.unchanged = None;
+        self.unchanged = timeline;
         self.nest_step += 1;
         self.project_folder = path.parent().map(Path::to_path_buf);
         self.project_path = Some(path);
         self.selected.clear();
         self.compound_dialog = false;
+        self.selecting = false;
         self.preview = None;
         self.stop_playing();
         self.warming = None;
@@ -782,8 +817,13 @@ impl App {
     /// That project, as it is saved: with the edits made inside the compound clips stepped
     /// into from it put in place, as stepping out will put them.
     fn file_level(&self) -> (usize, Timeline) {
-        let mut level = self.parents.len();
-        let mut timeline = self.history.timeline().clone();
+        self.fold_up(self.parents.len(), self.history.timeline().clone())
+    }
+
+    /// `timeline`, the project at `level` of the path, put in place in the projects around
+    /// it for as long as it is a compound clip kept inside one: the project whose file holds
+    /// it, at the level given back.
+    fn fold_up(&self, mut level: usize, mut timeline: Timeline) -> (usize, Timeline) {
         while level > 0 && self.parents[level - 1].inside {
             let parent = &self.parents[level - 1];
             let mut outer = parent.history.timeline().clone();
@@ -812,6 +852,99 @@ impl App {
     /// The file the project shown is saved in: see [`file_level_index`](Self::file_level_index).
     fn own_file(&self) -> Option<&Path> {
         self.level_path(self.file_level_index())
+    }
+
+    /// The projects of the path in the header whose files are not as they would be saved now,
+    /// innermost first: which project of the path each is, and what would be saved. A project
+    /// never saved counts once it has anything in it.
+    fn unsaved(&self) -> Vec<(usize, Timeline)> {
+        let mut found = Vec::new();
+        let (mut level, mut timeline) = self.file_level();
+        loop {
+            let unchanged = match self.parents.get(level) {
+                Some(parent) => &parent.unchanged,
+                None => &self.unchanged,
+            };
+            if !unchanged.same_as(&timeline) {
+                found.push((level, timeline));
+            }
+            if level == 0 {
+                return found;
+            }
+            let parent = self.parents[level - 1].history.timeline().clone();
+            (level, timeline) = self.fold_up(level - 1, parent);
+        }
+    }
+
+    /// Saves the projects that have changes before leaving them, then leaves as asked. A
+    /// project never saved needs a file first, which `chosen` is once picked.
+    fn save_and_leave(&mut self, chosen: Option<PathBuf>) -> Task<Message> {
+        let mut saves = Vec::new();
+        for (level, timeline) in self.unsaved() {
+            let path = match self.level_path(level) {
+                Some(path) => path.to_path_buf(),
+                None => match &chosen {
+                    Some(path) => path.clone(),
+                    None => {
+                        let name = timeline.name.clone();
+                        return Task::perform(pick_save_path(name), Message::LeaveSaveChosen);
+                    }
+                },
+            };
+            saves.push((level, timeline, path));
+        }
+        self.leave_saving = true;
+        let step = self.nest_step;
+        let saving = async move {
+            let mut saved = Vec::new();
+            for (level, timeline, path) in saves {
+                if let Err(error) = timeline.save(&path) {
+                    return (saved, Some(format!("{}: {error}", file_name(&path))));
+                }
+                saved.push(SavedProject {
+                    path,
+                    level,
+                    step,
+                    timeline,
+                });
+            }
+            (saved, None)
+        };
+        Task::perform(saving, |(saved, error)| Message::LeaveSaved(saved, error))
+    }
+
+    /// Does what was waiting on the question of unsaved changes.
+    fn leave(&mut self) -> Task<Message> {
+        self.leave_saving = false;
+        match self.leaving.take() {
+            Some(Leave::Open) => Task::perform(pick_project(), Message::ProjectChosen),
+            Some(Leave::Close) => iced::exit(),
+            None => Task::none(),
+        }
+    }
+
+    /// Leaves now if nothing would be lost, or else asks first.
+    fn ask_to_leave(&mut self, leave: Leave) -> Task<Message> {
+        if self.leave_saving {
+            return Task::none();
+        }
+        self.leaving = Some(leave);
+        if self.unsaved().is_empty() {
+            return self.leave();
+        }
+        self.export_dialog = false;
+        self.compound_dialog = false;
+        Task::none()
+    }
+
+    /// The window's title: the project's file, marked while it has changes not saved.
+    fn title(&self) -> String {
+        let outermost = match self.parents.first() {
+            Some(parent) => project_name(parent.path.as_deref(), parent.history.timeline()),
+            None => project_name(self.project_path.as_deref(), self.history.timeline()),
+        };
+        let mark = if self.unsaved().is_empty() { "" } else { "*" };
+        format!("{mark}{outermost} - cannotcut")
     }
 
     /// Starts on the next file waiting to go on the timeline. Its length has to be known first,
@@ -877,6 +1010,7 @@ impl App {
         self.stop_playing();
         self.preview = None;
         self.compound_dialog = false;
+        self.selecting = false;
         // A linked project's paths start at its file; those of one kept inside start where
         // this project's do, and it has no file to save.
         let inside = nested.path.is_none();
@@ -888,7 +1022,7 @@ impl App {
             history: std::mem::replace(&mut self.history, History::new(nested.timeline.clone())),
             path: std::mem::replace(&mut self.project_path, path),
             folder: std::mem::replace(&mut self.project_folder, folder),
-            unchanged: self.unchanged.replace(nested.timeline.clone()),
+            unchanged: std::mem::replace(&mut self.unchanged, nested.timeline.clone()),
             playhead: self.playhead,
             selected: std::mem::take(&mut self.selected),
             view: self.timeline_view.take(),
@@ -914,13 +1048,14 @@ impl App {
         self.stop_playing();
         self.preview = None;
         self.compound_dialog = false;
+        self.selecting = false;
         // Innermost first, so that what changed inside reaches the project around it before
         // that one is passed on or read.
         let mut saves = Vec::new();
         while self.parents.len() > level {
             let parent = self.parents.pop().expect("there are parents left");
             let left = std::mem::replace(&mut self.history, parent.history);
-            let changed = self.unchanged.as_ref() != Some(left.timeline());
+            let changed = !self.unchanged.same_as(left.timeline());
             if parent.inside {
                 if changed {
                     let media = Arc::new(TimelineMedia::inside(left.timeline().clone()));
@@ -1399,9 +1534,30 @@ impl App {
                 }
                 None => self.notice = Some("could not upload a picture to the GPU".to_string()),
             },
-            Message::OpenRequested => {
-                return Task::perform(pick_project(), Message::ProjectChosen);
+            Message::OpenRequested => return self.ask_to_leave(Leave::Open),
+            Message::CloseRequested => return self.ask_to_leave(Leave::Close),
+            Message::LeaveSave => return self.save_and_leave(None),
+            Message::LeaveSaveChosen(Some(path)) => return self.save_and_leave(Some(path)),
+            Message::LeaveSaveChosen(None) => {}
+            Message::LeaveSaved(saved, error) => {
+                let names: Vec<String> = saved.iter().map(|saved| file_name(&saved.path)).collect();
+                for saved in saved {
+                    if saved.step == self.nest_step {
+                        self.project_saved(saved);
+                    }
+                }
+                if let Some(error) = error {
+                    // The question stays, to go on without saving or to stay.
+                    self.leave_saving = false;
+                    self.notice = Some(error);
+                    return Task::none();
+                }
+                self.notice = Some(format!("Saved {}", names.join(", ")));
+                return self.leave();
             }
+            Message::LeaveDiscard => return self.leave(),
+            Message::LeaveCancel => self.leaving = None,
+            Message::SelectToggled => self.selecting = !self.selecting,
             Message::ProjectChosen(Some(path)) => {
                 return Task::perform(load_project(path), Message::ProjectLoaded);
             }
@@ -1591,6 +1747,7 @@ impl App {
             Message::CompoundClosed => self.compound_dialog = false,
             Message::CompoundKept(keep) => {
                 self.compound_dialog = false;
+                self.selecting = false;
                 self.compounding = self.selected.clone();
                 let name = self.compound_name();
                 match keep {
@@ -1644,9 +1801,7 @@ impl App {
                     if step == self.nest_step {
                         let folder = self.project_folder.clone().unwrap_or_default();
                         self.history.adopt_projects(&projects, &folder);
-                        if let Some(unchanged) = &mut self.unchanged {
-                            unchanged.adopt_projects(&projects, &folder);
-                        }
+                        self.unchanged.adopt_projects(&projects, &folder);
                         return self.timeline_changed();
                     }
                 }
@@ -1694,10 +1849,14 @@ impl App {
                     }
                     Some(key::Named::Delete | key::Named::Backspace) => Some(Message::Delete),
                     Some(key::Named::Space) => Some(Message::PlayToggled),
+                    Some(key::Named::Escape) if self.leaving.is_some() && !self.leave_saving => {
+                        Some(Message::LeaveCancel)
+                    }
                     Some(key::Named::Escape) if self.export_dialog => Some(Message::ExportClosed),
                     Some(key::Named::Escape) if self.compound_dialog => {
                         Some(Message::CompoundClosed)
                     }
+                    Some(key::Named::Escape) if self.selecting => Some(Message::SelectToggled),
                     // Back out of a nested project, one level at a time.
                     Some(key::Named::Escape) if !self.parents.is_empty() => {
                         Some(Message::StepOut(self.parents.len() - 1))
@@ -1852,9 +2011,7 @@ impl App {
         let folder = saved.path.parent().map(Path::to_path_buf);
         let shown = self.parents.len();
         if saved.level == shown {
-            if shown > 0 {
-                self.unchanged = Some(saved.timeline);
-            }
+            self.unchanged = saved.timeline;
             self.project_path = Some(saved.path);
             self.project_folder = folder;
             return;
@@ -1862,9 +2019,7 @@ impl App {
         let Some(parent) = self.parents.get_mut(saved.level) else {
             return;
         };
-        if saved.level > 0 {
-            parent.unchanged = Some(saved.timeline);
-        }
+        parent.unchanged = saved.timeline;
         parent.path = Some(saved.path);
         parent.folder = folder.clone();
         // The compound clips kept inside it, down to the one shown, start their paths there
@@ -2166,6 +2321,8 @@ impl App {
         let timeline = self.history.timeline();
         self.preview = None;
         self.selected.retain(|id| timeline.clip(*id).is_some());
+        // With no clips left there is nothing to pick, and no Select button to stop it.
+        self.selecting &= timeline.duration() > 0;
         self.playhead = self.playhead.clamp(0, self.last_frame());
         self.show_playhead()
     }
@@ -2205,6 +2362,7 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let mut subscriptions = vec![
             keyboard::listen().map(Message::Key),
+            window::close_requests().map(|_| Message::CloseRequested),
             time::every(MEMORY_REFRESH).map(|_| Message::MemoryTick),
             iced::event::listen_with(|event, _status, _window| match event {
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
@@ -2232,6 +2390,7 @@ impl App {
             self.export_control(),
             // Up here, not with the editing buttons: on the GPD's screen at 225% those already
             // fill the row while a clip is selected.
+            self.select_control(),
             self.step_inside_control(),
             self.compound_control(),
         ]
@@ -2267,6 +2426,9 @@ impl App {
         }
         if self.compound_dialog {
             viewer = stack![viewer, center(self.compound_dialog())].into();
+        }
+        if let Some(leave) = self.leaving {
+            viewer = stack![viewer, center(self.leave_dialog(leave))].into();
         }
 
         // Editing on the left, playing on the right, so that the row fits the GPD's screen at
@@ -2319,7 +2481,8 @@ impl App {
             &self.selected,
             &self.waveforms,
             Message::Timeline,
-        );
+        )
+        .selecting(self.selecting);
         let panel = row![self.track_headers(), panel].spacing(8);
         let status = container(
             text(self.readout())
@@ -2370,6 +2533,64 @@ impl App {
         }
         let own = project_name(self.project_path.as_deref(), self.history.timeline());
         bar.push(text(own).wrapping(text::Wrapping::None)).into()
+    }
+
+    /// Picking several clips by tapping them, for when Ctrl-click is not at hand.
+    fn select_control(&self) -> Element<'_, Message> {
+        if self.history.timeline().duration() == 0 {
+            return row![].into();
+        }
+        let (label, style, about): (_, fn(&Theme, button::Status) -> button::Style, _) =
+            if self.selecting {
+                ("Selecting", button::success, "Tap clips to add or remove them; tap here to stop")
+            } else {
+                ("Select", button::secondary, "Tap clips to pick several (or Ctrl-click them)")
+            };
+        hint(button(label).style(style).on_press(Message::SelectToggled), about)
+    }
+
+    /// What to do with unsaved changes before leaving them: the files they are in, and the
+    /// ways on.
+    fn leave_dialog(&self, leave: Leave) -> Element<'_, Message> {
+        let title = match leave {
+            Leave::Open => "Save changes before opening another project?",
+            Leave::Close => "Save changes before closing?",
+        };
+        let names: Vec<String> = self
+            .unsaved()
+            .iter()
+            .rev()
+            .map(|(level, timeline)| project_name(self.level_path(*level), timeline))
+            .collect();
+        let about = match names.as_slice() {
+            [] => String::new(),
+            [name] => format!("{name} has changes that are not saved."),
+            [names @ .., last] => {
+                format!("{} and {last} have changes that are not saved.", names.join(", "))
+            }
+        };
+        let busy = self.leave_saving;
+        let card = column![
+            text(title).size(DIALOG_TITLE_SIZE),
+            text(about),
+            row![
+                button("Save").on_press_maybe((!busy).then_some(Message::LeaveSave)),
+                button("Don't save")
+                    .style(button::danger)
+                    .on_press_maybe((!busy).then_some(Message::LeaveDiscard)),
+                space().width(Fill),
+                button("Cancel")
+                    .style(button::secondary)
+                    .on_press_maybe((!busy).then_some(Message::LeaveCancel)),
+            ]
+            .spacing(12),
+        ]
+        .spacing(16);
+        container(card)
+            .padding(20)
+            .width(DIALOG_WIDTH)
+            .style(container::rounded_box)
+            .into()
     }
 
     /// A way into the selected clip's project, for when double-clicking is not at hand.
