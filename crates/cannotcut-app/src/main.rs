@@ -1,6 +1,7 @@
 //! cannotcut: a timeline of clips that can be rearranged, trimmed, cut and played with their
 //! sound, a viewer showing the frame under the playhead, and live latency and memory readouts.
 
+mod fit;
 mod settings;
 mod timeline_panel;
 mod viewer;
@@ -23,13 +24,14 @@ use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
 use iced::futures::channel::oneshot;
 use iced::widget::{
-    Column, button, center, column, container, image, pick_list, progress_bar, row, sensor,
-    shader, slider, space, stack, text, tooltip,
+    Column, Stack, button, center, column, container, image, mouse_area, opaque, pick_list,
+    progress_bar, responsive, row, sensor, shader, slider, space, stack, text, tooltip,
 };
 use iced::{
     Center, Color, ContentFit, Element, Fill, Size, Subscription, Task, Theme, time, window,
 };
 use iced_runtime::image::{Allocation, allocate};
+use fit::{BUTTON_PADDING, Control, Fitted, button_width, fit, text_width};
 use settings::Settings;
 use timeline_panel::{
     Action, LANE_GAP, LANE_HEIGHT, MAIN_TRACK, PANEL_HEIGHT, RULER_HEIGHT, View, Waveforms,
@@ -53,9 +55,9 @@ const PLAYHEAD_FLAG: &str = "--at=";
 const ADD_FLAG: &str = "--add=";
 /// Saves a linked compound clip to this file without asking where.
 const COMPOUND_FILE_FLAG: &str = "--compound-file=";
-/// Of the projects stepped out of, the path in the header names the outermost and this many
-/// of the innermost; "..." stands for the rest.
-const PATH_PARENTS_SHOWN: usize = 3;
+/// A ">" between two names in the path in the header, with the gaps around it.
+const PATH_SEPARATOR_WIDTH: f32 = 20.0;
+const PATH_SPACING: f32 = 4.0;
 const PROJECT_EXTENSION: &str = "otio";
 const FILM_EXTENSION: &str = "mp4";
 const EXPORT_BAR_WIDTH: f32 = 160.0;
@@ -64,6 +66,27 @@ const DIALOG_LABEL_WIDTH: f32 = 90.0;
 const DIALOG_TITLE_SIZE: f32 = 20.0;
 const BYTES_PER_MEGABYTE: f64 = 1_000_000.0;
 const EXPORT_BAR_HEIGHT: f32 = 8.0;
+/// The export's progress bar when the header is short of room.
+const EXPORT_BAR_COMPACT_WIDTH: f32 = 60.0;
+const EXPORT_SPACING: f32 = 8.0;
+/// Around the window's contents, and between the rows down it.
+const PAGE_PADDING: f32 = 12.0;
+const ROW_GAP: f32 = 10.0;
+/// Between the controls along a row.
+const ROW_SPACING: f32 = 12.0;
+/// A row of buttons: their line of words and their padding above and below.
+const ROW_HEIGHT: f32 = SIGN_LINE_HEIGHT + 10.0;
+/// iced's line height, in the size of the text.
+const TEXT_LINE_HEIGHT: f32 = 1.3;
+/// The button that opens a row's menu of the controls with no room in it.
+const MORE_LABEL: &str = "\u{22EF}";
+const MENU_WIDTH: f32 = 200.0;
+/// Between a row and its menu.
+const MENU_GAP: f32 = 4.0;
+/// The most of the window's height the timeline panel takes, however many tracks there are.
+const PANEL_SHARE: f32 = 0.45;
+/// Darkens what is behind a dialog, which cannot be used meanwhile.
+const DIALOG_BACKDROP: Color = Color::from_rgba(0.0, 0.0, 0.0, 0.45);
 /// The small print of the status row.
 const STATUS_TEXT_SIZE: f32 = 13.0;
 const MEMORY_REFRESH: Duration = Duration::from_secs(1);
@@ -110,6 +133,8 @@ const SIGN_LINE_HEIGHT: f32 = 20.8;
 const SIGN_DROP: f32 = 4.0;
 /// Wide enough for either word, so the buttons after it stay put.
 const PLAY_LABEL_WIDTH: f32 = 44.0;
+/// A frame-step button, with its sign.
+const SIGN_BUTTON_WIDTH: f32 = 41.0;
 /// Peaks a second in a waveform: enough to see words and beats.
 const WAVEFORM_RATE: u32 = 100;
 /// The loudest a clip can be turned up to: twice as strong as recorded.
@@ -117,6 +142,11 @@ const MAX_VOLUME: f32 = 2.0;
 const VOLUME_SLIDER_WIDTH: f32 = 110.0;
 /// Wide enough for "200%", so the slider beside it stays put.
 const VOLUME_LABEL_WIDTH: f32 = 44.0;
+/// The volume slider when the toolbar is short of room.
+const VOLUME_SLIDER_COMPACT_WIDTH: f32 = 70.0;
+/// The volume slider on its own card, when the toolbar has no room for it.
+const VOLUME_SLIDER_CARD_WIDTH: f32 = 200.0;
+const VOLUME_SPACING: f32 = 8.0;
 /// The column of track buttons left of the timeline panel.
 const HEADER_WIDTH: f32 = 72.0;
 const HEADER_TEXT_SIZE: f32 = 12.0;
@@ -145,6 +175,8 @@ fn main() -> iced::Result {
 enum Message {
     AddRequested,
     FilesChosen(Vec<PathBuf>),
+    /// Start an empty project in place of this one.
+    NewRequested,
     OpenRequested,
     ProjectChosen(Option<PathBuf>),
     ProjectLoaded(Result<(PathBuf, Timeline), String>),
@@ -235,6 +267,14 @@ enum Message {
     LeaveCancel,
     /// Tapping clips picks several, or goes back to picking one.
     SelectToggled,
+    /// Open the menu of a row's controls that have no room in it.
+    MoreOpened(Bar),
+    MoreClosed,
+    /// Chosen from such a menu.
+    FromMenu(Box<Message>),
+    /// Show the selected clip's volume over the window, for when the toolbar has no room.
+    VolumeOpened,
+    VolumeClosed,
     Key(keyboard::Event),
     MemoryTick,
 }
@@ -248,9 +288,20 @@ enum Keep {
     Inside,
 }
 
+/// A row of controls around the viewer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Bar {
+    /// Above the viewer: projects and clips.
+    Header,
+    /// Below it: editing and playing.
+    Toolbar,
+}
+
 /// What waits on the question of unsaved changes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Leave {
+    /// Starting an empty project.
+    New,
     /// Opening another project.
     Open,
     /// Closing the window, which ends the app.
@@ -572,6 +623,10 @@ struct App {
     leave_saving: bool,
     /// A tap on a clip adds it to the selection or takes it out, as Ctrl-click does.
     selecting: bool,
+    /// The menu of a row's controls that have no room in it, while open.
+    more: Option<Bar>,
+    /// The selected clip's volume is on show over the window.
+    volume_card: bool,
     /// The picture sizes of media files, by their names in the project, as far as known.
     picture_sizes: HashMap<String, (u32, u32)>,
     /// Files whose picture size is being read.
@@ -712,6 +767,8 @@ impl App {
             leaving: None,
             leave_saving: false,
             selecting: false,
+            more: None,
+            volume_card: false,
             picture_sizes: HashMap::new(),
             sizing: HashSet::new(),
         };
@@ -736,7 +793,7 @@ impl App {
                 app.compound_file = Some(PathBuf::from(file));
             } else if path.extension().is_some_and(|extension| extension == PROJECT_EXTENSION) {
                 match Timeline::load(&path) {
-                    Ok(timeline) => drop(app.adopt_project(path, timeline)),
+                    Ok(timeline) => drop(app.adopt_project(Some(path), timeline)),
                     Err(error) => app.notice = Some(error.to_string()),
                 }
             } else {
@@ -751,15 +808,16 @@ impl App {
         (app, task)
     }
 
-    /// Replaces what is being edited with a project read from `path`.
-    fn adopt_project(&mut self, path: PathBuf, timeline: Timeline) -> Task<Message> {
+    /// Replaces what is being edited with a project read from `path`, or with a new one that
+    /// has no file yet.
+    fn adopt_project(&mut self, path: Option<PathBuf>, timeline: Timeline) -> Task<Message> {
         self.history = History::new(timeline.clone());
         // Whatever projects were stepped out of are left behind with the old project.
         self.parents.clear();
         self.unchanged = timeline;
         self.nest_step += 1;
-        self.project_folder = path.parent().map(Path::to_path_buf);
-        self.project_path = Some(path);
+        self.project_folder = path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+        self.project_path = path;
         self.selected.clear();
         self.compound_dialog = false;
         self.selecting = false;
@@ -917,6 +975,11 @@ impl App {
     fn leave(&mut self) -> Task<Message> {
         self.leave_saving = false;
         match self.leaving.take() {
+            Some(Leave::New) => {
+                let task = self.adopt_project(None, Timeline::new("Untitled", EMPTY_PROJECT_RATE));
+                self.timeline_view = None;
+                task
+            }
             Some(Leave::Open) => Task::perform(pick_project(), Message::ProjectChosen),
             Some(Leave::Close) => iced::exit(),
             None => Task::none(),
@@ -1534,6 +1597,7 @@ impl App {
                 }
                 None => self.notice = Some("could not upload a picture to the GPU".to_string()),
             },
+            Message::NewRequested => return self.ask_to_leave(Leave::New),
             Message::OpenRequested => return self.ask_to_leave(Leave::Open),
             Message::CloseRequested => return self.ask_to_leave(Leave::Close),
             Message::LeaveSave => return self.save_and_leave(None),
@@ -1558,11 +1622,19 @@ impl App {
             Message::LeaveDiscard => return self.leave(),
             Message::LeaveCancel => self.leaving = None,
             Message::SelectToggled => self.selecting = !self.selecting,
+            Message::MoreOpened(bar) => self.more = Some(bar),
+            Message::MoreClosed => self.more = None,
+            Message::FromMenu(message) => {
+                self.more = None;
+                return self.update(*message);
+            }
+            Message::VolumeOpened => self.volume_card = true,
+            Message::VolumeClosed => self.volume_card = false,
             Message::ProjectChosen(Some(path)) => {
                 return Task::perform(load_project(path), Message::ProjectLoaded);
             }
             Message::ProjectLoaded(Ok((path, timeline))) => {
-                return self.adopt_project(path, timeline);
+                return self.adopt_project(Some(path), timeline);
             }
             Message::SaveRequested => return self.save_project(None),
             Message::SaveChosen(Some(path)) => return self.save_project(Some(path)),
@@ -1611,7 +1683,10 @@ impl App {
             Message::Timeline(action) => match action {
                 Action::Scrub(frame) => return self.move_playhead(frame),
                 Action::View(view) => self.timeline_view = view,
-                Action::Select(clips) => self.selected = clips,
+                Action::Select(clips) => {
+                    self.volume_card = false;
+                    self.selected = clips;
+                }
                 Action::Preview(edit) => {
                     let mut timeline = self.history.timeline().clone();
                     if timeline.apply(&edit).is_ok() {
@@ -1852,6 +1927,8 @@ impl App {
                     Some(key::Named::Escape) if self.leaving.is_some() && !self.leave_saving => {
                         Some(Message::LeaveCancel)
                     }
+                    Some(key::Named::Escape) if self.more.is_some() => Some(Message::MoreClosed),
+                    Some(key::Named::Escape) if self.volume_card => Some(Message::VolumeClosed),
                     Some(key::Named::Escape) if self.export_dialog => Some(Message::ExportClosed),
                     Some(key::Named::Escape) if self.compound_dialog => {
                         Some(Message::CompoundClosed)
@@ -1866,6 +1943,7 @@ impl App {
                     _ if letter("b") => Some(Message::Split),
                     _ if letter("s") => Some(Message::SaveRequested),
                     _ if letter("o") => Some(Message::OpenRequested),
+                    _ if letter("n") => Some(Message::NewRequested),
                     _ => None,
                 };
                 if let Some(message) = meant {
@@ -2382,24 +2460,17 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        responsive(move |window| self.layout(window)).into()
+    }
+
+    /// Everything, laid out for a window of this size in logical pixels: the rows around the
+    /// viewer fit its width, the timeline panel takes the height its tracks want up to a share
+    /// of the window's, and the viewer the rest.
+    fn layout(&self, window: Size) -> Element<'_, Message> {
         let timeline = self.history.timeline();
-        let mut header = row![
-            button("Add clips").on_press(Message::AddRequested),
-            button("Open").on_press(Message::OpenRequested),
-            button("Save").on_press(Message::SaveRequested),
-            self.export_control(),
-            // Up here, not with the editing buttons: on the GPD's screen at 225% those already
-            // fill the row while a clip is selected.
-            self.select_control(),
-            self.step_inside_control(),
-            self.compound_control(),
-        ]
-        .spacing(12)
-        .align_y(Center);
-        if !self.parents.is_empty() {
-            header = header.push(self.project_path_bar());
-        }
-        let header = header.push(one_line(self.headline()).width(Fill));
+        let room = window.width - 2.0 * PAGE_PADDING;
+        let header = self.header(room);
+        let toolbar = self.toolbar(room);
 
         let picture: Element<'_, Message> = match self.shown.as_ref().map(|shown| &shown.picture) {
             Some(Displayed::Yuv(planes)) => shader(planes).width(Fill).height(Fill).into(),
@@ -2420,55 +2491,8 @@ impl App {
         if self.viewer.is_none() {
             viewer = stack![viewer, renderer_probe(Message::RendererProbed)].into();
         }
-        if self.export_dialog {
-            // Over the viewer, so that nothing around it moves.
-            viewer = stack![viewer, center(self.export_dialog())].into();
-        }
-        if self.compound_dialog {
-            viewer = stack![viewer, center(self.compound_dialog())].into();
-        }
-        if let Some(leave) = self.leaving {
-            viewer = stack![viewer, center(self.leave_dialog(leave))].into();
-        }
 
-        // Editing on the left, playing on the right, so that the row fits the GPD's screen at
-        // 225% (1138 logical pixels) with a clip's volume showing. A button that cannot do
-        // anything right now shows it by being greyed out.
-        let position = format!(
-            "{} / {}",
-            timecode(self.playhead, timeline.rate()),
-            timecode(timeline.duration(), timeline.rate())
-        );
-        let toolbar = row![
-            button("Undo").on_press_maybe(self.history.undo_label().map(|_| Message::Undo)),
-            button("Redo").on_press_maybe(self.history.redo_label().map(|_| Message::Redo)),
-            button("Split").on_press_maybe(self.split_edit().map(|_| Message::Split)),
-            button("Delete").on_press_maybe(self.delete_edit().map(|_| Message::Delete)),
-            button("Add track").on_press(Message::AddTrack),
-            self.volume_control(),
-            space().width(Fill),
-            hint(
-                button(sign(STEP_BACK)).on_press(Message::Stepped(-1)),
-                "Previous frame (Left arrow)"
-            ),
-            hint(
-                button(
-                    text(if self.playback.is_some() { "Pause" } else { "Play" })
-                        .width(PLAY_LABEL_WIDTH)
-                        .align_x(Center)
-                )
-                .on_press_maybe((timeline.duration() > 0).then_some(Message::PlayToggled)),
-                "Play or pause (Space)"
-            ),
-            hint(
-                button(sign(STEP_ON)).on_press(Message::Stepped(1)),
-                "Next frame (Right arrow)"
-            ),
-            text(position).wrapping(text::Wrapping::None),
-        ]
-        .spacing(12)
-        .align_y(Center);
-
+        let panel_height = self.panel_height(window.height);
         let shown = self
             .preview
             .as_ref()
@@ -2482,8 +2506,9 @@ impl App {
             &self.waveforms,
             Message::Timeline,
         )
-        .selecting(self.selecting);
-        let panel = row![self.track_headers(), panel].spacing(8);
+        .selecting(self.selecting)
+        .height(panel_height);
+        let panel = row![self.track_headers(panel_height), panel].spacing(8);
         let status = container(
             text(self.readout())
                 .size(STATUS_TEXT_SIZE)
@@ -2492,25 +2517,251 @@ impl App {
         .clip(true)
         .align_right(Fill);
 
-        column![header, viewer, toolbar, panel, status]
-            .spacing(10)
-            .padding(12)
-            .into()
+        let page = column![header.row, viewer, toolbar.row, panel, status]
+            .spacing(ROW_GAP)
+            .padding(PAGE_PADDING);
+        let mut layers: Vec<Element<'_, Message>> = vec![page.into()];
+
+        // A row's menu opens just under the header, or just over the toolbar, at its button.
+        let menu = match self.more {
+            Some(Bar::Header) if !header.menu.is_empty() => {
+                Some((header.menu, header.menu_x, Bar::Header))
+            }
+            Some(Bar::Toolbar) if !toolbar.menu.is_empty() => {
+                Some((toolbar.menu, toolbar.menu_x, Bar::Toolbar))
+            }
+            _ => None,
+        };
+        if let Some((entries, x, bar)) = menu {
+            let left = PAGE_PADDING + x.min(room - MENU_WIDTH).max(0.0);
+            let card = more_menu(entries);
+            let placed = match bar {
+                Bar::Header => container(card).padding(iced::Padding {
+                    top: PAGE_PADDING + ROW_HEIGHT + MENU_GAP,
+                    left,
+                    ..iced::Padding::ZERO
+                }),
+                Bar::Toolbar => container(card)
+                    .padding(iced::Padding {
+                        bottom: PAGE_PADDING
+                            + STATUS_TEXT_SIZE * TEXT_LINE_HEIGHT
+                            + ROW_GAP
+                            + panel_height
+                            + ROW_GAP
+                            + ROW_HEIGHT
+                            + MENU_GAP,
+                        left,
+                        ..iced::Padding::ZERO
+                    })
+                    .align_bottom(Fill),
+            };
+            let away = mouse_area(space().width(Fill).height(Fill)).on_press(Message::MoreClosed);
+            layers.push(away.into());
+            layers.push(placed.width(Fill).height(Fill).into());
+        }
+
+        // Over everything, so that it fits even a short window, and nothing behind it can be
+        // pressed meanwhile; pressing beside it is Cancel.
+        let dialog = if let Some(leave) = self.leaving {
+            let cancel = (!self.leave_saving).then_some(Message::LeaveCancel);
+            Some((self.leave_dialog(leave), cancel))
+        } else if self.export_dialog {
+            Some((self.export_dialog(), Some(Message::ExportClosed)))
+        } else if self.compound_dialog {
+            Some((self.compound_dialog(), Some(Message::CompoundClosed)))
+        } else if self.volume_card
+            && let Some(volume) = self.volume_row(false, VOLUME_SLIDER_CARD_WIDTH)
+        {
+            Some((volume_card(volume), Some(Message::VolumeClosed)))
+        } else {
+            None
+        };
+        if let Some((card, cancel)) = dialog {
+            let dim = container(space().width(Fill).height(Fill))
+                .style(|_| container::background(DIALOG_BACKDROP));
+            let backdrop: Element<'_, Message> = match cancel {
+                Some(cancel) => mouse_area(dim).on_press(cancel).into(),
+                None => dim.into(),
+            };
+            layers.push(opaque(backdrop));
+            layers.push(center(opaque(card)).into());
+        }
+        Stack::with_children(layers).into()
     }
 
-    /// Where the project shown sits: the projects stepped out of, each a button back, and its
-    /// own name. Deep down, "..." stands in for the middle of the path; it names what it hides
-    /// and goes back to the nearest of those.
-    fn project_path_bar(&self) -> Element<'_, Message> {
-        let mut bar = row![].spacing(4).align_y(Center);
-        let levels = self.parents.len();
-        let hidden = if levels > PATH_PARENTS_SHOWN + 1 {
-            1..levels - PATH_PARENTS_SHOWN
-        } else {
-            0..0
+    /// The row above the viewer, fitted to `room`: projects and clips, then the path and what
+    /// the playhead is on.
+    fn header(&self, room: f32) -> Fitted<'_, Message> {
+        let mut controls = vec![
+            Control::new(
+                button("Add clips").on_press(Message::AddRequested),
+                button_width("Add clips"),
+            )
+            .compact(
+                hint(button("Add").on_press(Message::AddRequested), "Add clips"),
+                button_width("Add"),
+            )
+            .or_in_menu(9, "Add clips", Some(Message::AddRequested)),
+            Control::new(
+                hint(
+                    button("New project").on_press(Message::NewRequested),
+                    "Start an empty project (Ctrl+N)",
+                ),
+                button_width("New project"),
+            )
+            .compact(
+                hint(
+                    button("New").on_press(Message::NewRequested),
+                    "Start an empty project (Ctrl+N)",
+                ),
+                button_width("New"),
+            )
+            .or_in_menu(3, "New project", Some(Message::NewRequested)),
+            Control::new(
+                button("Open").on_press(Message::OpenRequested),
+                button_width("Open"),
+            )
+            .or_in_menu(4, "Open", Some(Message::OpenRequested)),
+            Control::new(
+                button("Save").on_press(Message::SaveRequested),
+                button_width("Save"),
+            )
+            .or_in_menu(6, "Save", Some(Message::SaveRequested)),
+            self.export_control(),
+        ];
+        controls.extend(self.select_control());
+        controls.extend(self.step_inside_control());
+        controls.extend(self.compound_control());
+        let menu_after = controls.len();
+        // Whatever room the buttons leave: the path first, then what the playhead is on. The
+        // path wants at least the name of the project shown.
+        let path = responsive(|room| {
+            let path = self.project_path_bar(room.width);
+            row![path, one_line(self.headline()).width(Fill)]
+                .spacing(ROW_SPACING)
+                .align_y(Center)
+                .into()
+        })
+        .height(iced::Length::Shrink);
+        controls.push(Control::new(path, self.path_least_width()));
+        fit(
+            controls,
+            room,
+            ROW_SPACING,
+            more_button(Bar::Header, self.more),
+            button_width(MORE_LABEL),
+            menu_after,
+        )
+    }
+
+    /// The row below the viewer, fitted to `room`: editing on the left, playing on the right.
+    /// A button that cannot do anything right now shows it by being greyed out.
+    fn toolbar(&self, room: f32) -> Fitted<'_, Message> {
+        let timeline = self.history.timeline();
+        let simple = |words: &'static str, does: Option<Message>, keep: u8| {
+            Control::new(button(words).on_press_maybe(does.clone()), button_width(words))
+                .or_in_menu(keep, words, does)
         };
+        let mut controls = vec![
+            simple("Undo", self.history.undo_label().map(|_| Message::Undo), 6),
+            simple("Redo", self.history.redo_label().map(|_| Message::Redo), 5),
+            simple("Split", self.split_edit().map(|_| Message::Split), 7),
+            simple("Delete", self.delete_edit().map(|_| Message::Delete), 7),
+            Control::new(
+                button("Add track").on_press(Message::AddTrack),
+                button_width("Add track"),
+            )
+            .compact(
+                hint(button("+ Track").on_press(Message::AddTrack), "Add track"),
+                button_width("+ Track"),
+            )
+            .or_in_menu(2, "Add track", Some(Message::AddTrack)),
+        ];
+        controls.extend(self.volume_control());
+        let menu_after = controls.len();
+        let playing = self.playback.is_some();
+        let position = timecode(self.playhead, timeline.rate());
+        let both = format!("{position} / {}", timecode(timeline.duration(), timeline.rate()));
+        controls.extend([
+            Control::new(space().width(Fill), 0.0),
+            Control::new(
+                hint(
+                    button(sign(STEP_BACK)).on_press(Message::Stepped(-1)),
+                    "Previous frame (Left arrow)",
+                ),
+                SIGN_BUTTON_WIDTH,
+            )
+            .or_in_menu(8, "Previous frame", Some(Message::Stepped(-1))),
+            Control::new(
+                hint(
+                    button(
+                        text(if playing { "Pause" } else { "Play" })
+                            .width(PLAY_LABEL_WIDTH)
+                            .align_x(Center),
+                    )
+                    .on_press_maybe((timeline.duration() > 0).then_some(Message::PlayToggled)),
+                    "Play or pause (Space)",
+                ),
+                PLAY_LABEL_WIDTH + BUTTON_PADDING,
+            ),
+            Control::new(
+                hint(
+                    button(sign(STEP_ON)).on_press(Message::Stepped(1)),
+                    "Next frame (Right arrow)",
+                ),
+                SIGN_BUTTON_WIDTH,
+            )
+            .or_in_menu(8, "Next frame", Some(Message::Stepped(1))),
+            Control::new(
+                text(both.clone()).wrapping(text::Wrapping::None),
+                text_width(&both),
+            )
+            .compact(
+                hint(text(position.clone()).wrapping(text::Wrapping::None), both),
+                text_width(&position),
+            ),
+        ]);
+        fit(
+            controls,
+            room,
+            ROW_SPACING,
+            more_button(Bar::Toolbar, self.more),
+            button_width(MORE_LABEL),
+            menu_after,
+        )
+    }
+
+    /// The timeline panel's height in a window `window_height` tall: room for every track and
+    /// one more, but no less than it always had and no more than a share of the window.
+    fn panel_height(&self, window_height: f32) -> f32 {
+        let lanes = self.history.timeline().tracks().len() + 1;
+        let wanted = RULER_HEIGHT + LANE_GAP + lanes as f32 * (LANE_HEIGHT + LANE_GAP);
+        wanted.min(window_height * PANEL_SHARE).max(PANEL_HEIGHT)
+    }
+
+    /// What the path in the header needs at the least: the project shown, after "...".
+    fn path_least_width(&self) -> f32 {
+        if self.parents.is_empty() {
+            return 0.0;
+        }
+        let own = project_name(self.project_path.as_deref(), self.history.timeline());
+        text_width(&own) + button_width("...") + PATH_SEPARATOR_WIDTH
+    }
+
+    /// Where the project shown sits, in `room` logical pixels: the projects stepped out of,
+    /// each a button back, and its own name. When they do not all fit, "..." stands in for
+    /// those that do not; it names them and goes back to the nearest of them.
+    fn project_path_bar(&self, room: f32) -> Element<'_, Message> {
+        let mut bar = row![].spacing(PATH_SPACING).align_y(Center);
+        let levels = self.parents.len();
+        if levels == 0 {
+            return nothing();
+        }
         let name =
             |parent: &Parent| project_name(parent.path.as_deref(), parent.history.timeline());
+        let names: Vec<String> = self.parents.iter().map(name).collect();
+        let own = project_name(self.project_path.as_deref(), self.history.timeline());
+        let hidden = path_hidden(&names, &own, room);
         for (level, parent) in self.parents.iter().enumerate() {
             if hidden.contains(&level) {
                 if level + 1 == hidden.end {
@@ -2531,28 +2782,40 @@ impl App {
                 )
                 .push(text(">"));
         }
-        let own = project_name(self.project_path.as_deref(), self.history.timeline());
         bar.push(text(own).wrapping(text::Wrapping::None)).into()
     }
 
     /// Picking several clips by tapping them, for when Ctrl-click is not at hand.
-    fn select_control(&self) -> Element<'_, Message> {
+    fn select_control(&self) -> Option<Control<'_, Message>> {
         if self.history.timeline().duration() == 0 {
-            return row![].into();
+            return None;
         }
-        let (label, style, about): (_, fn(&Theme, button::Status) -> button::Style, _) =
+        let (label, style, about, entry): (_, fn(&Theme, button::Status) -> button::Style, _, _) =
             if self.selecting {
-                ("Selecting", button::success, "Tap clips to add or remove them; tap here to stop")
+                (
+                    "Selecting",
+                    button::success,
+                    "Tap clips to add or remove them; tap here to stop",
+                    "Stop selecting",
+                )
             } else {
-                ("Select", button::secondary, "Tap clips to pick several (or Ctrl-click them)")
+                (
+                    "Select",
+                    button::secondary,
+                    "Tap clips to pick several (or Ctrl-click them)",
+                    "Select several",
+                )
             };
-        hint(button(label).style(style).on_press(Message::SelectToggled), about)
+        let toggle = hint(button(label).style(style).on_press(Message::SelectToggled), about);
+        let control = Control::new(toggle, button_width(label));
+        Some(control.or_in_menu(7, entry, Some(Message::SelectToggled)))
     }
 
     /// What to do with unsaved changes before leaving them: the files they are in, and the
     /// ways on.
     fn leave_dialog(&self, leave: Leave) -> Element<'_, Message> {
         let title = match leave {
+            Leave::New => "Save changes before starting a new project?",
             Leave::Open => "Save changes before opening another project?",
             Leave::Close => "Save changes before closing?",
         };
@@ -2594,26 +2857,30 @@ impl App {
     }
 
     /// A way into the selected clip's project, for when double-clicking is not at hand.
-    fn step_inside_control(&self) -> Element<'_, Message> {
-        let nested = self.selected_clip().filter(|clip| {
+    fn step_inside_control(&self) -> Option<Control<'_, Message>> {
+        let clip = self.selected_clip().filter(|clip| {
             let found = self.history.timeline().clip(*clip);
             found.is_some_and(|(_, clip, _)| clip.media.project.is_some())
-        });
-        match nested {
-            Some(clip) => button("Step inside").on_press(Message::StepInside(clip)).into(),
-            None => row![].into(),
-        }
+        })?;
+        let open = Message::StepInside(clip);
+        let control = Control::new(
+            button("Step inside").on_press(open.clone()),
+            button_width("Step inside"),
+        );
+        Some(control.or_in_menu(8, "Step inside", Some(open)))
     }
 
     /// Making the selected clips into a compound clip, while any are selected.
-    fn compound_control(&self) -> Element<'_, Message> {
+    fn compound_control(&self) -> Option<Control<'_, Message>> {
         if self.selected.is_empty() {
-            return row![].into();
+            return None;
         }
-        hint(
+        let compound = hint(
             button("Compound").on_press(Message::CompoundOpened),
             "Make the selected clips one clip",
-        )
+        );
+        let control = Control::new(compound, button_width("Compound"));
+        Some(control.or_in_menu(8, "Compound", Some(Message::CompoundOpened)))
     }
 
     /// The two ways to keep a compound clip, the linked file first.
@@ -2717,12 +2984,15 @@ impl App {
     }
 
     /// Export, or how the export under way is getting on and a way to stop it.
-    fn export_control(&self) -> Element<'_, Message> {
+    fn export_control(&self) -> Control<'_, Message> {
         let Some(exporting) = &self.exporting else {
             let has_clips = self.history.timeline().duration() > 0;
-            return button("Export")
-                .on_press_maybe(has_clips.then_some(Message::ExportOpened))
-                .into();
+            let export = has_clips.then_some(Message::ExportOpened);
+            return Control::new(
+                button("Export").on_press_maybe(export.clone()),
+                button_width("Export"),
+            )
+            .or_in_menu(5, "Export", export);
         };
         let share = exporting.done as f32 / exporting.total.max(1) as f32;
         let elapsed = exporting.started.elapsed().as_secs_f64();
@@ -2736,20 +3006,38 @@ impl App {
         let encoder = exporting
             .encoder
             .map_or(String::new(), |encoder| format!(" with {encoder}"));
-        row![
-            button("Cancel export").on_press(Message::ExportCancelled),
+        let words = format!("Exporting {:.0}%{left}{encoder}", share * 100.0);
+        let cancel = || button("Cancel export").on_press(Message::ExportCancelled);
+        let bar = |length: f32| {
             progress_bar(0.0..=1.0, share)
-                .length(EXPORT_BAR_WIDTH)
-                .girth(EXPORT_BAR_HEIGHT),
-            one_line(format!("Exporting {:.0}%{left}{encoder}", share * 100.0)),
-        ]
-        .spacing(8)
-        .align_y(Center)
-        .into()
+                .length(length)
+                .girth(EXPORT_BAR_HEIGHT)
+        };
+        let full_width = button_width("Cancel export")
+            + EXPORT_BAR_WIDTH
+            + text_width(&words)
+            + 2.0 * EXPORT_SPACING;
+        let compact_width =
+            button_width("Cancel export") + EXPORT_BAR_COMPACT_WIDTH + EXPORT_SPACING;
+        Control::new(
+            row![cancel(), bar(EXPORT_BAR_WIDTH), one_line(words.clone())]
+                .spacing(EXPORT_SPACING)
+                .align_y(Center),
+            full_width,
+        )
+        .compact(
+            hint(
+                row![cancel(), bar(EXPORT_BAR_COMPACT_WIDTH)]
+                    .spacing(EXPORT_SPACING)
+                    .align_y(Center),
+                words,
+            ),
+            compact_width,
+        )
     }
 
     /// A button beside each lane of the timeline panel to mute its track, lined up with it.
-    fn track_headers(&self) -> Element<'_, Message> {
+    fn track_headers(&self, height: f32) -> Element<'_, Message> {
         let tracks = self.history.timeline().tracks();
         // The top of the stack is the top lane.
         let buttons = tracks.enumerate().rev().map(|(index, track)| {
@@ -2773,30 +3061,41 @@ impl App {
             });
         container(column)
             .width(HEADER_WIDTH)
-            .height(PANEL_HEIGHT)
+            .height(height)
             .clip(true)
             .into()
     }
 
-    /// The selected clip's volume, to drag; nothing when no clip is selected.
-    fn volume_control(&self) -> Element<'_, Message> {
-        let Some((_, clip, _)) =
-            self.selected_clip().and_then(|id| self.history.timeline().clip(id))
-        else {
-            return row![].into();
-        };
+    /// The selected clip's volume, to drag; none while no single clip is selected. With little
+    /// room, without its name and with a shorter slider; with none, in the menu.
+    fn volume_control(&self) -> Option<Control<'_, Message>> {
+        let full = self.volume_row(true, VOLUME_SLIDER_WIDTH)?;
+        let compact = self.volume_row(false, VOLUME_SLIDER_COMPACT_WIDTH)?;
+        let words = text_width("Volume") + VOLUME_SPACING;
+        let slider_and_label = VOLUME_SPACING + VOLUME_LABEL_WIDTH;
+        Some(
+            Control::new(full, words + VOLUME_SLIDER_WIDTH + slider_and_label)
+                .compact(compact, VOLUME_SLIDER_COMPACT_WIDTH + slider_and_label)
+                .or_in_menu(4, "Volume", Some(Message::VolumeOpened)),
+        )
+    }
+
+    /// The volume slider of the selected clip, `slider_width` long, its name before it if
+    /// `named`.
+    fn volume_row(&self, named: bool, slider_width: f32) -> Option<Element<'_, Message>> {
+        let (_, clip, _) = self.history.timeline().clip(self.selected_clip()?)?;
         let volume = self.volume_drag.unwrap_or(clip.volume).clamp(0.0, MAX_VOLUME);
-        row![
-            text("Volume"),
-            slider(0.0..=MAX_VOLUME, volume, Message::VolumeChanged)
-                .step(0.01_f32)
-                .on_release(Message::VolumeReleased)
-                .width(VOLUME_SLIDER_WIDTH),
-            text(format!("{:.0}%", volume * 100.0)).width(VOLUME_LABEL_WIDTH),
-        ]
-        .spacing(8)
-        .align_y(Center)
-        .into()
+        let slider = slider(0.0..=MAX_VOLUME, volume, Message::VolumeChanged)
+            .step(0.01_f32)
+            .on_release(Message::VolumeReleased)
+            .width(slider_width);
+        let label = text(format!("{:.0}%", volume * 100.0)).width(VOLUME_LABEL_WIDTH);
+        let row = if named {
+            row![text("Volume"), slider, label]
+        } else {
+            row![hint(slider, "Volume"), label]
+        };
+        Some(row.spacing(VOLUME_SPACING).align_y(Center).into())
     }
 
     /// The line next to the add button: what went wrong, or what the playhead is on.
@@ -2916,6 +3215,76 @@ fn hint<'a>(
     .into()
 }
 
+/// Which of the projects stepped out of (`names`, outermost first) the path in the header
+/// leaves to "...", so that it fits in `room` with `own`, the name of the project shown. As
+/// many of the nearest as fit are shown, and the outermost, which tells which film this is,
+/// while there is room for it too.
+fn path_hidden(names: &[String], own: &str, room: f32) -> std::ops::Range<usize> {
+    let words = text_width;
+    let step = |name: &str| button_width(name) + PATH_SEPARATOR_WIDTH;
+    let more = step("...");
+    let width = |hidden: &std::ops::Range<usize>| {
+        let shown: f32 = (0..names.len())
+            .filter(|level| !hidden.contains(level))
+            .map(|level| step(&names[level]))
+            .sum();
+        let more = if hidden.is_empty() { 0.0 } else { more };
+        shown + more + words(own)
+    };
+    let levels = names.len();
+    // Everything; then the outermost with fewer and fewer of the nearest; then the nearest
+    // alone. The last way is taken even if it does not fit.
+    let with_outermost = (0..levels.saturating_sub(1)).rev().map(|nearest| 1..levels - nearest);
+    let without = (0..levels).rev().map(|nearest| 0..levels - nearest);
+    std::iter::once(0..0)
+        .chain(with_outermost.filter(|hidden| !hidden.is_empty()))
+        .chain(without)
+        .find(|hidden| width(hidden) <= room)
+        .unwrap_or(0..levels)
+}
+
+/// The button that opens a row's menu of the controls with no room in it, or closes it.
+fn more_button<'a>(bar: Bar, open: Option<Bar>) -> Element<'a, Message> {
+    if open == Some(bar) {
+        // No word on it while open: it would cover the menu.
+        return button(MORE_LABEL).on_press(Message::MoreClosed).into();
+    }
+    hint(button(MORE_LABEL).on_press(Message::MoreOpened(bar)), "More")
+}
+
+/// A row's menu: its controls with no room in the row, one under another; those that can do
+/// nothing right now greyed out.
+fn more_menu<'a>(entries: Vec<(String, Option<Message>)>) -> Element<'a, Message> {
+    let entries = entries.into_iter().map(|(words, does)| {
+        button(text(words))
+            .width(Fill)
+            .style(button::text)
+            .on_press_maybe(does.map(|does| Message::FromMenu(Box::new(does))))
+            .into()
+    });
+    container(Column::with_children(entries).spacing(2))
+        .padding(6)
+        .width(MENU_WIDTH)
+        .style(container::rounded_box)
+        .into()
+}
+
+/// The selected clip's volume over the window, for when the toolbar has no room for it.
+fn volume_card(volume: Element<'_, Message>) -> Element<'_, Message> {
+    let card = column![
+        text("Volume").size(DIALOG_TITLE_SIZE),
+        volume,
+        button("Done").on_press(Message::VolumeClosed),
+    ]
+    .spacing(16);
+    container(card).padding(20).style(container::rounded_box).into()
+}
+
+/// Stands in for a control that is not on show; rows leave no gap for it.
+fn nothing<'a>() -> Element<'a, Message> {
+    Element::from(None::<Element<'a, Message>>)
+}
+
 /// Text that is cut off instead of wrapped when it runs out of room. The rows around the viewer
 /// must keep their height whatever they say: a row that grows squeezes the viewer, and the
 /// picture with it.
@@ -3027,4 +3396,28 @@ fn timecode(frame: i64, rate: Rate) -> String {
         seconds % 60,
         frame % base
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_path_keeps_the_nearest_projects_and_the_outermost_while_it_can() {
+        let names: Vec<String> = ["film", "deep2", "L3", "deep4", "L5"].map(String::from).into();
+        assert_eq!(path_hidden(&names, "deep6", 1000.0), 0..0);
+        // Narrower and narrower: the middle goes first, then more of it, then the outermost,
+        // and last the nearest.
+        let all = path_hidden(&names, "deep6", 1000.0);
+        let mut last = all;
+        let mut seen = Vec::new();
+        for room in (0..500).rev() {
+            let hidden = path_hidden(&names, "deep6", room as f32);
+            if hidden != last {
+                seen.push(hidden.clone());
+                last = hidden;
+            }
+        }
+        assert_eq!(seen, [1..2, 1..3, 1..4, 1..5, 0..4, 0..5]);
+    }
 }

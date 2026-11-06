@@ -25,7 +25,8 @@ use iced::{
 /// The track whose clips always sit back to back: taking one out closes the hole, and clips
 /// dropped on it go in between the others.
 pub const MAIN_TRACK: usize = 0;
-/// The panel never changes height: the viewer above it must not be squeezed by what it shows.
+/// The panel's least height, room for three tracks. It grows with the window to show more
+/// tracks, but never with what it shows: the viewer above it must not be squeezed by that.
 pub const PANEL_HEIGHT: f32 = 176.0;
 pub const RULER_HEIGHT: f32 = 24.0;
 pub const LANE_HEIGHT: f32 = 40.0;
@@ -153,6 +154,8 @@ pub struct TimelinePanel<'a, Message> {
     selected: &'a [ClipId],
     /// A press on a clip adds it to the selection or takes it out, as Ctrl-click does.
     selecting: bool,
+    /// In logical pixels; tracks below it are cut off.
+    height: f32,
     waveforms: &'a Waveforms,
     on_action: Box<dyn Fn(Action) -> Message + 'a>,
 }
@@ -175,6 +178,7 @@ pub fn timeline_panel<'a, Message>(
         view,
         selected,
         selecting: false,
+        height: PANEL_HEIGHT,
         waveforms,
         on_action: Box::new(on_action),
     }
@@ -184,6 +188,12 @@ impl<Message> TimelinePanel<'_, Message> {
     /// Presses on clips pick several, for touch, where there is no Ctrl to hold.
     pub fn selecting(mut self, selecting: bool) -> Self {
         self.selecting = selecting;
+        self
+    }
+
+    /// Taller than [`PANEL_HEIGHT`] shows more tracks.
+    pub fn height(mut self, height: f32) -> Self {
+        self.height = height;
         self
     }
 }
@@ -588,7 +598,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
     }
 
     fn size(&self) -> Size<Length> {
-        Size::new(Length::Fill, Length::Fixed(PANEL_HEIGHT))
+        Size::new(Length::Fill, Length::Fixed(self.height))
     }
 
     fn layout(
@@ -597,7 +607,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
         _renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        layout::atomic(limits, Length::Fill, PANEL_HEIGHT)
+        layout::atomic(limits, Length::Fill, self.height)
     }
 
     fn update(
