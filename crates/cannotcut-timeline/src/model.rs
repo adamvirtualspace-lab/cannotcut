@@ -97,7 +97,8 @@ pub struct Extras {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Media {
     /// Where the file is: a `file://` URL or a path, possibly relative to the project file.
-    /// None when the project knows the file is missing.
+    /// None when the project knows the file is missing, and for a project kept inside the one
+    /// that uses it, which is no file.
     pub target: Option<String>,
     /// The file's own frame rate.
     pub rate: Rate,
@@ -106,8 +107,9 @@ pub struct Media {
     pub available: Option<FrameRange>,
     pub name: String,
     pub metadata: Map<String, Value>,
-    /// When the media is another project: that project, loaded. It is not saved; it is loaded
-    /// again from `target` with the project that uses it.
+    /// When the media is another project: that project, loaded. A linked one is not saved
+    /// with the project using it; it is loaded again from `target`. One kept inside is saved
+    /// in the using project's file.
     pub project: Option<Arc<Nested>>,
 }
 

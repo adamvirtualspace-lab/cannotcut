@@ -71,6 +71,24 @@ pub enum Edit {
         track: usize,
         muted: bool,
     },
+    /// Turns clips into one that plays them: a compound clip. `media` is the project made of
+    /// them by [`Timeline::compound`], kept inside this one or saved as a file of its own. The
+    /// clips are taken off and the compound clip covers the time from the first one's start
+    /// to the last one's end, on the lowest track any of them is on.
+    Compound {
+        clips: Vec<ClipId>,
+        media: Arc<Media>,
+    },
+    /// Gives a clip other media to play, such as the project kept inside it, edited.
+    SetMedia {
+        clip: ClipId,
+        media: Arc<Media>,
+    },
+    /// Several edits made as one, to undo as one.
+    Many {
+        label: &'static str,
+        edits: Vec<Edit>,
+    },
 }
 
 impl Edit {
@@ -87,6 +105,9 @@ impl Edit {
             Self::SetVolume { .. } => "Volume",
             Self::SetMuted { muted: true, .. } => "Mute",
             Self::SetMuted { muted: false, .. } => "Unmute",
+            Self::Compound { .. } => "Compound clip",
+            Self::SetMedia { .. } => "Edit inside",
+            Self::Many { label, .. } => label,
         }
     }
 }
@@ -141,6 +162,10 @@ pub enum EditError {
     NothingToSplit,
     /// The edge cannot move that far; these are the amounts it can move.
     TrimTooFar { allowed: RangeInclusive<i64> },
+    /// An edit of chosen clips was given none.
+    NoClips,
+    /// This clip stands where the compound clip would go, and is not one of its clips.
+    InTheWay(ClipId),
 }
 
 impl fmt::Display for EditError {
@@ -156,6 +181,8 @@ impl fmt::Display for EditError {
                 allowed.start(),
                 allowed.end()
             ),
+            Self::NoClips => f.write_str("no clips are selected"),
+            Self::InTheWay(_) => f.write_str("another clip is in the way on that track"),
         }
     }
 }
@@ -289,7 +316,109 @@ impl Timeline {
                 Arc::make_mut(track).muted = *muted;
                 Ok(None)
             }
+            Edit::Compound { clips, media } => {
+                let (track, start, duration) = self.compound_place(clips)?;
+                let mut taken = Vec::new();
+                for id in clips {
+                    if !taken.contains(id) {
+                        self.take(*id, false)?;
+                        taken.push(*id);
+                    }
+                }
+                let name = media
+                    .project
+                    .as_ref()
+                    .map_or_else(|| media.name.clone(), |nested| nested.timeline.name.clone());
+                let clip = Clip {
+                    id: new_id(&mut self.next_id),
+                    name,
+                    media: media.clone(),
+                    source_start: 0,
+                    duration,
+                    enabled: true,
+                    volume: 1.0,
+                    extras: Extras::default(),
+                };
+                let id = clip.id;
+                self.place(track, start, clip, Placement::Overwrite)?;
+                Ok(Some(id))
+            }
+            Edit::SetMedia { clip, media } => {
+                let (track, index) = self.locate(*clip)?;
+                if let Item::Clip(clip) = &mut Arc::make_mut(&mut self.tracks[track]).items[index] {
+                    clip.media = media.clone();
+                }
+                Ok(None)
+            }
+            Edit::Many { edits, .. } => {
+                let mut created = None;
+                for edit in edits {
+                    created = self.perform(edit)?.or(created);
+                }
+                Ok(created)
+            }
         }
+    }
+
+    /// Where a compound clip of `clips` goes: the lowest track they are on, and the frames from
+    /// the first one's start to the last one's end. Refused when another clip stands there.
+    fn compound_place(&self, clips: &[ClipId]) -> Result<(usize, i64, i64), EditError> {
+        let mut place: Option<(usize, i64, i64)> = None;
+        for id in clips {
+            let (track, clip, start) = self.clip(*id).ok_or(EditError::NoSuchClip(*id))?;
+            let end = start + clip.duration;
+            place = Some(match place {
+                None => (track, start, end),
+                Some((lowest, first, last)) => (lowest.min(track), first.min(start), last.max(end)),
+            });
+        }
+        let (track, start, end) = place.ok_or(EditError::NoClips)?;
+        let in_the_way = self.tracks[track].clips().find(|(at, clip)| {
+            !clips.contains(&clip.id) && *at < end && at + clip.duration > start
+        });
+        if let Some((_, clip)) = in_the_way {
+            return Err(EditError::InTheWay(clip.id));
+        }
+        Ok((track, start, end - start))
+    }
+
+    /// The project a compound clip of `clips` plays, named `name`: the clips as they are, each
+    /// on a track of its own like the one it is on, from the first one's start on. Tracks that
+    /// would stay empty are left out. See [`Edit::Compound`].
+    pub fn compound(
+        &self,
+        clips: &[ClipId],
+        name: impl Into<String>,
+    ) -> Result<Timeline, EditError> {
+        let (_, start, _) = self.compound_place(clips)?;
+        let mut inner = Timeline::new(name, self.rate);
+        inner.tracks.clear();
+        for track in self.tracks() {
+            let chosen: Vec<(i64, &Clip)> = track
+                .clips()
+                .filter(|(_, clip)| clips.contains(&clip.id))
+                .collect();
+            if chosen.is_empty() {
+                continue;
+            }
+            let mut copy = Track::new(track.kind, track.name.clone());
+            copy.enabled = track.enabled;
+            copy.muted = track.muted;
+            let mut end = 0;
+            for (at, clip) in chosen {
+                let at = at - start;
+                if at > end {
+                    copy.items.push(Item::Gap(at - end));
+                }
+                copy.items.push(Item::Clip(Clip {
+                    id: new_id(&mut inner.next_id),
+                    ..clip.clone()
+                }));
+                end = at + clip.duration;
+            }
+            inner.tracks.push(Arc::new(copy));
+        }
+        Ok(inner)
     }
 
     /// How far [`Edit::Trim`] can move an edge of a clip, in frames (negative is earlier). The

@@ -39,6 +39,7 @@ fn print(timeline: &Timeline, indent: &str) {
                     let media = &clip.media;
                     let what = match (media.is_project(), &media.project) {
                         (true, None) => "project that could not be loaded",
+                        (true, Some(_)) if media.is_inside() => "compound clip kept inside",
                         (true, Some(_)) => "project",
                         (false, _) => "media",
                     };
@@ -47,7 +48,11 @@ fn print(timeline: &Timeline, indent: &str) {
                         clip.name,
                         clip.duration,
                         clip.media_frame(0, rate),
-                        media.target.as_deref().unwrap_or("missing media")
+                        media.target.as_deref().unwrap_or(if media.is_inside() {
+                            "this file"
+                        } else {
+                            "missing media"
+                        })
                     );
                     if let Some(nested) = &media.project {
                         print(&nested.timeline, &format!("{indent}          | "));

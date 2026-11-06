@@ -1,10 +1,11 @@
 //! Reading and writing timelines as OpenTimelineIO JSON.
 //!
 //! The file is the standard format, so other tools can open it. What cannotcut cannot edit yet
-//! (transitions, nested stacks, generated media) is refused by name when reading, instead of
-//! being dropped quietly. A project used inside another is a clip whose media is the other
-//! `.otio` file; see the `nest` module. Metadata, effects and markers it does not understand are
-//! carried through unchanged.
+//! (transitions, generated media) is refused by name when reading, instead of being dropped
+//! quietly. A linked project used inside another is a clip whose media is the other `.otio`
+//! file; one kept inside it (a compound clip) is a stack of tracks in place of a clip, as
+//! OpenTimelineIO nests timelines. See the `nest` module. Metadata, effects and markers it does
+//! not understand are carried through unchanged.
 
 use std::fs;
 use std::path::Path;
@@ -121,7 +122,13 @@ fn write_track(track: &Track, rate: Rate) -> Value {
         .items()
         .iter()
         .map(|item| match item {
-            Item::Clip(clip) => write_clip(clip, rate),
+            Item::Clip(clip) => {
+                let inside = clip.media.project.as_ref().filter(|_| clip.media.is_inside());
+                match inside {
+                    Some(nested) => write_inside(clip, &nested.timeline, rate),
+                    None => write_clip(clip, rate),
+                }
+            }
             Item::Gap(duration) => json!({
                 "OTIO_SCHEMA": "Gap.1",
                 "effects": [],
@@ -192,6 +199,38 @@ fn write_clip(clip: &Clip, rate: Rate) -> Value {
     })
 }
 
+/// A clip that plays a project kept inside this one, `inner`: a stack of its tracks in place of
+/// the clip. What the stack has no field for (the project's rate, the clip's volume) goes in its
+/// metadata.
+fn write_inside(clip: &Clip, inner: &Timeline, rate: Rate) -> Value {
+    let mut own = json!({ "rate": rate_json(inner.rate) });
+    if clip.volume != 1.0 {
+        own["volume"] = json!(clip.volume);
+    }
+    if inner.name != clip.name {
+        own["name"] = json!(inner.name);
+    }
+    if !inner.metadata.is_empty() {
+        own["metadata"] = Value::Object(inner.metadata.clone());
+    }
+    let mut metadata = clip.extras.metadata.clone();
+    metadata.insert(OWN_METADATA.to_string(), own);
+    let tracks: Vec<Value> = inner
+        .tracks()
+        .map(|track| write_track(track, inner.rate))
+        .collect();
+    json!({
+        "OTIO_SCHEMA": "Stack.1",
+        "children": tracks,
+        "effects": clip.extras.effects,
+        "enabled": clip.enabled,
+        "markers": clip.extras.markers,
+        "metadata": metadata,
+        "name": clip.name,
+        "source_range": range(clip.source_start, clip.duration, rate),
+    })
+}
+
 /// The media's first frame as a time at the timeline's rate: its start timecode.
 fn media_start(media: &Media, rate: Rate) -> i64 {
     media
@@ -211,6 +250,7 @@ fn read_track(track: &Object, rate: Rate, next_id: &mut u64) -> Result<Track, Er
         let child = object(child, "an item on a track")?;
         match schema_name(child) {
             "Clip" => items.push(Item::Clip(read_clip(child, rate, next_id)?)),
+            "Stack" => items.push(Item::Clip(read_inside(child, rate, next_id)?)),
             "Gap" => {
                 let Some((_, duration)) = read_range(child.get("source_range"))? else {
                     return Err(Error("a gap has no length".to_string()));
@@ -291,6 +331,69 @@ fn read_clip(clip: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error
         duration: frames(source_duration.0, source_duration.1, rate),
         media: Arc::new(media),
         enabled: flag(clip, "enabled"),
+        volume,
+        extras,
+    })
+}
+
+/// A stack of tracks on a track: a clip playing the project it makes up, kept inside this one.
+fn read_inside(stack: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error> {
+    let name = text_of(stack, "name");
+    let mut extras = extras(stack);
+    let own = extras.metadata.remove(OWN_METADATA).unwrap_or(Value::Null);
+    let inner_rate = read_own_rate(&own)
+        .or_else(|| first_rate(stack))
+        .unwrap_or(rate);
+    let mut inner = Timeline {
+        name: own
+            .get("name")
+            .and_then(Value::as_str)
+            .map_or_else(|| name.clone(), str::to_string),
+        metadata: own
+            .get("metadata")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default(),
+        rate: inner_rate,
+        start: 0,
+        tracks: Vec::new(),
+        stack: Extras::default(),
+        next_id: 0,
+    };
+    for child in children(stack) {
+        let child = object(child, "a track")?;
+        if schema_name(child) != "Track" {
+            return Err(unsupported(schema(child), "in place of a track"));
+        }
+        let track = read_track(child, inner_rate, &mut inner.next_id)?;
+        inner.tracks.push(Arc::new(track));
+    }
+    let media = Media::inside(inner);
+    let length = media
+        .available
+        .map_or(0, |available| inner_rate.rescale(available.duration, rate));
+    let (source_start, duration) = match read_range(stack.get("source_range"))? {
+        Some((start, duration)) => (
+            frames(start.0, start.1, rate),
+            frames(duration.0, duration.1, rate),
+        ),
+        None => (0, length),
+    };
+    if duration <= 0 {
+        return Err(Error(format!("compound clip \"{name}\" has no length")));
+    }
+    let volume = own
+        .get("volume")
+        .and_then(Value::as_f64)
+        .filter(|volume| volume.is_finite() && *volume >= 0.0)
+        .map_or(1.0, |volume| volume as f32);
+    Ok(Clip {
+        id: new_id(next_id),
+        name,
+        media: Arc::new(media),
+        source_start,
+        duration,
+        enabled: flag(stack, "enabled"),
         volume,
         extras,
     })

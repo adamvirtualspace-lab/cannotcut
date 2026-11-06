@@ -16,8 +16,8 @@ use cannotcut_media::{
     ClipInfo, Event, Options, Output, Pixels, Scrubber, Waveform, picture_size,
 };
 use cannotcut_timeline::{
-    ClipId, Edge, Edit, History, Media as TimelineMedia, Nested, NewClip, Placement, Projects,
-    Rate, Shot, Timeline, TrackKind,
+    ClipId, Edge, Edit, EditError, History, Media as TimelineMedia, Nested, NewClip, Placement,
+    Projects, Rate, Shot, Timeline, TrackKind,
 };
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
@@ -51,6 +51,11 @@ const PLAYHEAD_FLAG: &str = "--at=";
 /// Adds a file to the end of the main track as "Add clips" does; for a project, that puts it in
 /// as a clip instead of opening it.
 const ADD_FLAG: &str = "--add=";
+/// Saves a linked compound clip to this file without asking where.
+const COMPOUND_FILE_FLAG: &str = "--compound-file=";
+/// Of the projects stepped out of, the path in the header names the outermost and this many
+/// of the innermost; "..." stands for the rest.
+const PATH_PARENTS_SHOWN: usize = 3;
 const PROJECT_EXTENSION: &str = "otio";
 const FILM_EXTENSION: &str = "mp4";
 const EXPORT_BAR_WIDTH: f32 = 160.0;
@@ -156,7 +161,17 @@ enum Message {
     /// News from the export under way.
     Exported(ExportEvent),
     ExportCancelled,
-    Saved(Result<PathBuf, String>),
+    Saved(Result<SavedProject, String>),
+    /// Show the choice of how to keep a compound clip of the selected clips.
+    CompoundOpened,
+    CompoundClosed,
+    /// Make the compound clip, kept this way.
+    CompoundKept(Keep),
+    /// Where a linked compound clip's file goes.
+    CompoundPathChosen(Option<PathBuf>),
+    /// A linked compound clip's file has been saved, or could not be: its clips, its project
+    /// and its file. Tagged with the step it belongs to.
+    CompoundSaved(u64, Result<(Vec<ClipId>, Arc<Nested>, PathBuf), String>),
     /// Whether the window is drawn on the GPU, which decides the viewer's path.
     RendererProbed(bool),
     /// The viewer's area was laid out at this size, in logical pixels.
@@ -206,6 +221,25 @@ enum Message {
     SteppedOut(u64, Result<(Arc<Projects>, Vec<String>), String>),
     Key(keyboard::Event),
     MemoryTick,
+}
+
+/// How a compound clip keeps the clips it is made of.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Keep {
+    /// In a project file of its own, which other projects can use too.
+    Linked,
+    /// In the file of the project it is in, for this clip alone.
+    Inside,
+}
+
+/// A project file that was saved: where, what was in it, and which project of the path in the
+/// header it was (0 the outermost), at which step in or out.
+#[derive(Clone)]
+struct SavedProject {
+    path: PathBuf,
+    level: usize,
+    step: u64,
+    timeline: Timeline,
 }
 
 /// A decode event in the form the UI keeps: iced clones messages, so the pixels live behind an
@@ -430,7 +464,8 @@ struct App {
     project_path: Option<PathBuf>,
     /// Where the project file is; relative media paths start from here.
     project_folder: Option<PathBuf>,
-    selected: Option<ClipId>,
+    /// The selected clips, in the order they were picked.
+    selected: Vec<ClipId>,
     preview: Option<Preview>,
     /// The timeline frame the viewer shows.
     playhead: i64,
@@ -500,6 +535,12 @@ struct App {
     exporting: Option<Exporting>,
     /// The export choices are on show.
     export_dialog: bool,
+    /// The choice of how to keep a compound clip is on show.
+    compound_dialog: bool,
+    /// The clips a linked compound clip is being made of, while its file is chosen.
+    compounding: Vec<ClipId>,
+    /// Where a linked compound clip goes without asking, as asked on the command line.
+    compound_file: Option<PathBuf>,
     /// The picture sizes of media files, by their names in the project, as far as known.
     picture_sizes: HashMap<String, (u32, u32)>,
     /// Files whose picture size is being read.
@@ -546,12 +587,19 @@ impl Source {
 /// A project stepped out of to edit one of the projects it uses, as it was left.
 struct Parent {
     history: History,
+    /// Its file; None while it has none, and for a compound clip kept inside the project
+    /// around it.
     path: Option<PathBuf>,
     folder: Option<PathBuf>,
     unchanged: Option<Timeline>,
     playhead: i64,
-    selected: Option<ClipId>,
+    selected: Vec<ClipId>,
     view: Option<View>,
+    /// The clip stepped into from it.
+    entered: ClipId,
+    /// That clip keeps its project inside this one: its edits come back as an edit of this
+    /// project, not as a file of its own.
+    inside: bool,
 }
 
 /// The newest request, kept to time how long its pictures take to reach the UI.
@@ -588,7 +636,7 @@ impl App {
             history: History::new(Timeline::new("Untitled", EMPTY_PROJECT_RATE)),
             project_path: None,
             project_folder: None,
-            selected: None,
+            selected: Vec::new(),
             preview: None,
             playhead: 0,
             sources: Vec::new(),
@@ -627,6 +675,9 @@ impl App {
             volume_drag: None,
             exporting: None,
             export_dialog: false,
+            compound_dialog: false,
+            compounding: Vec::new(),
+            compound_file: None,
             picture_sizes: HashMap::new(),
             sizing: HashSet::new(),
         };
@@ -647,6 +698,8 @@ impl App {
                 playhead = frame.parse().unwrap_or(0);
             } else if let Some(added) = text.strip_prefix(ADD_FLAG) {
                 app.adding.push_back(PathBuf::from(added));
+            } else if let Some(file) = text.strip_prefix(COMPOUND_FILE_FLAG) {
+                app.compound_file = Some(PathBuf::from(file));
             } else if path.extension().is_some_and(|extension| extension == PROJECT_EXTENSION) {
                 match Timeline::load(&path) {
                     Ok(timeline) => drop(app.adopt_project(path, timeline)),
@@ -673,7 +726,8 @@ impl App {
         self.nest_step += 1;
         self.project_folder = path.parent().map(Path::to_path_buf);
         self.project_path = Some(path);
-        self.selected = None;
+        self.selected.clear();
+        self.compound_dialog = false;
         self.preview = None;
         self.stop_playing();
         self.warming = None;
@@ -690,16 +744,74 @@ impl App {
         self.show_playhead()
     }
 
-    fn save(&self, path: PathBuf) -> Task<Message> {
+    /// Saves the project shown; inside a compound clip kept in a project, that project's file,
+    /// with the clip's edits so far put in place. To `chosen`, or else to its file, or else to
+    /// where the user says.
+    fn save_project(&mut self, chosen: Option<PathBuf>) -> Task<Message> {
+        let (level, timeline) = self.file_level();
+        let Some(path) = chosen.or_else(|| self.level_path(level).map(Path::to_path_buf)) else {
+            let name = timeline.name.clone();
+            return Task::perform(pick_save_path(name), Message::SaveChosen);
+        };
+        let step = self.nest_step;
         // Tracks are shared, so the copy handed to the background is cheap.
-        let timeline = self.history.timeline().clone();
         let saving = async move {
             match timeline.save(&path) {
-                Ok(()) => Ok(path),
+                Ok(()) => Ok(SavedProject {
+                    path,
+                    level,
+                    step,
+                    timeline,
+                }),
                 Err(error) => Err(error.to_string()),
             }
         };
         Task::perform(saving, Message::Saved)
+    }
+
+    /// The project of the path in the header that the one shown is saved in: itself, unless
+    /// it is a compound clip kept inside another, which goes for that one in turn.
+    fn file_level_index(&self) -> usize {
+        let mut level = self.parents.len();
+        while level > 0 && self.parents[level - 1].inside {
+            level -= 1;
+        }
+        level
+    }
+
+    /// That project, as it is saved: with the edits made inside the compound clips stepped
+    /// into from it put in place, as stepping out will put them.
+    fn file_level(&self) -> (usize, Timeline) {
+        let mut level = self.parents.len();
+        let mut timeline = self.history.timeline().clone();
+        while level > 0 && self.parents[level - 1].inside {
+            let parent = &self.parents[level - 1];
+            let mut outer = parent.history.timeline().clone();
+            let media = Arc::new(TimelineMedia::inside(timeline));
+            // The clip stepped into is still there: a project waiting on the path is not
+            // edited.
+            let _ = outer.apply(&Edit::SetMedia {
+                clip: parent.entered,
+                media,
+            });
+            timeline = outer;
+            level -= 1;
+        }
+        (level, timeline)
+    }
+
+    /// The file of the project at `level` of the path in the header (the one shown at the end).
+    fn level_path(&self, level: usize) -> Option<&Path> {
+        if level == self.parents.len() {
+            self.project_path.as_deref()
+        } else {
+            self.parents.get(level)?.path.as_deref()
+        }
+    }
+
+    /// The file the project shown is saved in: see [`file_level_index`](Self::file_level_index).
+    fn own_file(&self) -> Option<&Path> {
+        self.level_path(self.file_level_index())
     }
 
     /// Starts on the next file waiting to go on the timeline. Its length has to be known first,
@@ -764,14 +876,24 @@ impl App {
         let frame = clip.media_frame(offset, timeline.rate());
         self.stop_playing();
         self.preview = None;
+        self.compound_dialog = false;
+        // A linked project's paths start at its file; those of one kept inside start where
+        // this project's do, and it has no file to save.
+        let inside = nested.path.is_none();
+        let (path, folder) = match &nested.path {
+            Some(path) => (Some(path.clone()), nested.folder.clone()),
+            None => (None, self.project_folder.clone()),
+        };
         let parent = Parent {
             history: std::mem::replace(&mut self.history, History::new(nested.timeline.clone())),
-            path: self.project_path.replace(nested.path.clone()),
-            folder: self.project_folder.replace(nested.folder.clone()),
+            path: std::mem::replace(&mut self.project_path, path),
+            folder: std::mem::replace(&mut self.project_folder, folder),
             unchanged: self.unchanged.replace(nested.timeline.clone()),
             playhead: self.playhead,
-            selected: self.selected.take(),
+            selected: std::mem::take(&mut self.selected),
             view: self.timeline_view.take(),
+            entered: id,
+            inside,
         };
         self.parents.push(parent);
         self.nest_step += 1;
@@ -782,22 +904,35 @@ impl App {
     }
 
     /// Goes back to the project at `level` of the path. Each project stepped out of that has
-    /// changes is saved, so the projects using it show them, and the one arrived at loads the
-    /// projects it uses afresh; both off the UI thread.
+    /// changes passes them on: a linked one is saved, so the projects using it show them; a
+    /// compound clip kept inside gives the project around it an edit to undo. The project
+    /// arrived at loads the projects it uses afresh; saving and loading are off the UI thread.
     fn step_out(&mut self, level: usize) -> Task<Message> {
         if level >= self.parents.len() {
             return Task::none();
         }
         self.stop_playing();
         self.preview = None;
-        // Innermost first, so that a project is saved before the one around it is read.
+        self.compound_dialog = false;
+        // Innermost first, so that what changed inside reaches the project around it before
+        // that one is passed on or read.
         let mut saves = Vec::new();
         while self.parents.len() > level {
             let parent = self.parents.pop().expect("there are parents left");
             let left = std::mem::replace(&mut self.history, parent.history);
-            if let Some(path) = self.project_path.take()
-                && self.unchanged.as_ref() != Some(left.timeline())
-            {
+            let changed = self.unchanged.as_ref() != Some(left.timeline());
+            if parent.inside {
+                if changed {
+                    let media = Arc::new(TimelineMedia::inside(left.timeline().clone()));
+                    let edit = Edit::SetMedia {
+                        clip: parent.entered,
+                        media,
+                    };
+                    if let Err(error) = self.history.apply(&edit) {
+                        self.notice = Some(error.to_string());
+                    }
+                }
+            } else if changed && let Some(path) = self.project_path.clone() {
                 saves.push((left.timeline().clone(), path));
             }
             self.project_path = parent.path;
@@ -840,7 +975,7 @@ impl App {
     /// Puts all of another project on the main track, after what is there, unless that project
     /// holds the one being edited: a project cannot go inside itself.
     fn place_project_at_end(&mut self, path: &Path, nested: Arc<Nested>) {
-        if let Some(own) = &self.project_path
+        if let Some(own) = self.own_file()
             && nested.holds(own)
         {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -1273,16 +1408,8 @@ impl App {
             Message::ProjectLoaded(Ok((path, timeline))) => {
                 return self.adopt_project(path, timeline);
             }
-            Message::SaveRequested => {
-                return match self.project_path.clone() {
-                    Some(path) => self.save(path),
-                    None => {
-                        let name = self.history.timeline().name.clone();
-                        Task::perform(pick_save_path(name), Message::SaveChosen)
-                    }
-                };
-            }
-            Message::SaveChosen(Some(path)) => return self.save(path),
+            Message::SaveRequested => return self.save_project(None),
+            Message::SaveChosen(Some(path)) => return self.save_project(Some(path)),
             Message::ExportOpened => {
                 if self.exporting.is_none() {
                     self.export_dialog = true;
@@ -1313,14 +1440,11 @@ impl App {
                     exporting.export.cancel();
                 }
             }
-            Message::Saved(Ok(path)) => {
-                self.notice = Some(format!("Saved {}", path.display()));
-                // Inside a nested project, what was saved is nothing to save on the way out.
-                if !self.parents.is_empty() && self.project_path.as_ref() == Some(&path) {
-                    self.unchanged = Some(self.history.timeline().clone());
+            Message::Saved(Ok(saved)) => {
+                self.notice = Some(format!("Saved {}", saved.path.display()));
+                if saved.step == self.nest_step {
+                    self.project_saved(saved);
                 }
-                self.project_folder = path.parent().map(Path::to_path_buf);
-                self.project_path = Some(path);
             }
             Message::ProjectLoaded(Err(error)) | Message::Saved(Err(error)) => {
                 self.notice = Some(error);
@@ -1331,7 +1455,7 @@ impl App {
             Message::Timeline(action) => match action {
                 Action::Scrub(frame) => return self.move_playhead(frame),
                 Action::View(view) => self.timeline_view = view,
-                Action::Select(clip) => self.selected = clip,
+                Action::Select(clips) => self.selected = clips,
                 Action::Preview(edit) => {
                     let mut timeline = self.history.timeline().clone();
                     if timeline.apply(&edit).is_ok() {
@@ -1439,7 +1563,7 @@ impl App {
             }
             Message::VolumeChanged(volume) => {
                 // Shown on the clip while dragging; heard once let go.
-                if let Some(clip) = self.selected {
+                if let Some(clip) = self.selected_clip() {
                     let mut timeline = self.history.timeline().clone();
                     if timeline.apply(&Edit::SetVolume { clip, volume }).is_ok() {
                         self.volume_drag = Some(volume);
@@ -1452,10 +1576,64 @@ impl App {
             }
             Message::VolumeReleased => {
                 self.preview = None;
-                if let (Some(clip), Some(volume)) = (self.selected, self.volume_drag.take()) {
+                let dragged = (self.selected_clip(), self.volume_drag.take());
+                if let (Some(clip), Some(volume)) = dragged {
                     return self.sound_edit(&Edit::SetVolume { clip, volume });
                 }
             }
+            Message::CompoundOpened => match self.compound_problem() {
+                Some(problem) => self.notice = Some(problem),
+                None => {
+                    self.export_dialog = false;
+                    self.compound_dialog = true;
+                }
+            },
+            Message::CompoundClosed => self.compound_dialog = false,
+            Message::CompoundKept(keep) => {
+                self.compound_dialog = false;
+                self.compounding = self.selected.clone();
+                let name = self.compound_name();
+                match keep {
+                    Keep::Inside => {
+                        let clips = std::mem::take(&mut self.compounding);
+                        return match self.history.timeline().compound(&clips, name) {
+                            Ok(inner) => {
+                                let media = Arc::new(TimelineMedia::inside(inner));
+                                self.compound_edit(&Edit::Compound { clips, media })
+                            }
+                            Err(error) => {
+                                self.notice = Some(error.to_string());
+                                Task::none()
+                            }
+                        };
+                    }
+                    Keep::Linked => {
+                        if let Some(path) = self.compound_file.clone() {
+                            return self.save_compound(path);
+                        }
+                        let folder = self.own_file().and_then(Path::parent).map(Path::to_path_buf);
+                        return Task::perform(
+                            pick_compound_path(name, folder),
+                            Message::CompoundPathChosen,
+                        );
+                    }
+                }
+            }
+            Message::CompoundPathChosen(Some(path)) => return self.save_compound(path),
+            Message::CompoundPathChosen(None) => self.compounding.clear(),
+            Message::CompoundSaved(step, result) => match result {
+                Ok((clips, nested, path)) if step == self.nest_step => {
+                    let media = Arc::new(TimelineMedia::from_project(&path, nested));
+                    let task = self.compound_edit(&Edit::Compound { clips, media });
+                    if self.notice.is_none() {
+                        self.notice = Some(format!("Saved {}", file_name(&path)));
+                    }
+                    return task;
+                }
+                // Made for a project no longer shown.
+                Ok(_) => {}
+                Err(error) => self.notice = Some(error),
+            },
             Message::StepInside(clip) => return self.step_inside(clip),
             Message::StepOut(level) => return self.step_out(level),
             Message::SteppedOut(step, result) => match result {
@@ -1517,6 +1695,13 @@ impl App {
                     Some(key::Named::Delete | key::Named::Backspace) => Some(Message::Delete),
                     Some(key::Named::Space) => Some(Message::PlayToggled),
                     Some(key::Named::Escape) if self.export_dialog => Some(Message::ExportClosed),
+                    Some(key::Named::Escape) if self.compound_dialog => {
+                        Some(Message::CompoundClosed)
+                    }
+                    // Back out of a nested project, one level at a time.
+                    Some(key::Named::Escape) if !self.parents.is_empty() => {
+                        Some(Message::StepOut(self.parents.len() - 1))
+                    }
                     _ if letter("z") && !modifiers.shift() => Some(Message::Undo),
                     _ if letter("z") || letter("y") => Some(Message::Redo),
                     _ if letter("b") => Some(Message::Split),
@@ -1661,6 +1846,126 @@ impl App {
         (self.history.timeline().duration() - 1).max(0)
     }
 
+    /// After a project file was saved: its project knows the file, and inside a nested
+    /// project, what was saved is nothing to save on the way out.
+    fn project_saved(&mut self, saved: SavedProject) {
+        let folder = saved.path.parent().map(Path::to_path_buf);
+        let shown = self.parents.len();
+        if saved.level == shown {
+            if shown > 0 {
+                self.unchanged = Some(saved.timeline);
+            }
+            self.project_path = Some(saved.path);
+            self.project_folder = folder;
+            return;
+        }
+        let Some(parent) = self.parents.get_mut(saved.level) else {
+            return;
+        };
+        if saved.level > 0 {
+            parent.unchanged = Some(saved.timeline);
+        }
+        parent.path = Some(saved.path);
+        parent.folder = folder.clone();
+        // The compound clips kept inside it, down to the one shown, start their paths there
+        // too.
+        for parent in &mut self.parents[saved.level + 1..] {
+            parent.folder = folder.clone();
+        }
+        self.project_folder = folder;
+    }
+
+    /// The selected clip, when exactly one is.
+    fn selected_clip(&self) -> Option<ClipId> {
+        match self.selected.as_slice() {
+            [clip] => Some(*clip),
+            _ => None,
+        }
+    }
+
+    /// A name for a new compound clip: the first "Compound N" no clip here has.
+    fn compound_name(&self) -> String {
+        let timeline = self.history.timeline();
+        let taken: HashSet<&str> = timeline
+            .tracks()
+            .flat_map(|track| track.clips())
+            .map(|(_, clip)| clip.name.as_str())
+            .collect();
+        (1..)
+            .map(|number| format!("Compound {number}"))
+            .find(|name| !taken.contains(name.as_str()))
+            .expect("names never run out")
+    }
+
+    /// Why the selected clips cannot become a compound clip, in words; None when they can.
+    fn compound_problem(&self) -> Option<String> {
+        let timeline = self.history.timeline();
+        match timeline.compound(&self.selected, "") {
+            Ok(_) => None,
+            Err(EditError::InTheWay(id)) => {
+                let name = timeline.clip(id).map_or_else(String::new, |(_, clip, _)| {
+                    clip.name.clone()
+                });
+                Some(format!(
+                    "\"{name}\" is where the compound clip would go: select it too, or move it"
+                ))
+            }
+            Err(error) => Some(error.to_string()),
+        }
+    }
+
+    /// Makes a compound clip, which is then the clip selected.
+    fn compound_edit(&mut self, edit: &Edit) -> Task<Message> {
+        match self.history.apply(edit) {
+            Ok(created) => {
+                self.notice = None;
+                self.selected = created.into_iter().collect();
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+        self.timeline_changed()
+    }
+
+    /// Saves a compound clip of the clips chosen as a project file of its own at `path`, off
+    /// the UI thread; the clip goes on the timeline once that is done.
+    fn save_compound(&mut self, path: PathBuf) -> Task<Message> {
+        let clips = std::mem::take(&mut self.compounding);
+        // Saving over a project open here would lose it.
+        let same = |open: &Path| {
+            let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+            canonical(open).is_some_and(|open| canonical(&path) == Some(open))
+        };
+        let open = self.parents.iter().filter_map(|parent| parent.path.as_deref());
+        if open.chain(self.project_path.as_deref()).any(same) {
+            let name = file_name(&path);
+            self.notice = Some(format!("{name} is open here: save the compound clip elsewhere"));
+            return Task::none();
+        }
+        let name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut inner = match self.history.timeline().compound(&clips, name) {
+            Ok(inner) => inner,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return Task::none();
+            }
+        };
+        // The file may be anywhere, where paths starting at this project's folder would lead
+        // nowhere.
+        if let Some(folder) = &self.project_folder {
+            inner.make_paths_absolute(folder);
+        }
+        let step = self.nest_step;
+        let saving = async move {
+            inner.save(&path).map_err(|error| error.to_string())?;
+            let canonical = std::fs::canonicalize(&path).map_err(|error| error.to_string())?;
+            Ok((clips, Arc::new(Nested::linked(inner, canonical)), path))
+        };
+        Task::perform(saving, move |result| Message::CompoundSaved(step, result))
+    }
+
     /// Makes an edit the user asked for; it can be undone.
     fn edit(&mut self, edit: &Edit) -> Task<Message> {
         match self.history.apply(edit) {
@@ -1679,7 +1984,7 @@ impl App {
             (offset > 0).then_some(track)
         };
         let selected = self
-            .selected
+            .selected_clip()
             .and_then(|id| timeline.clip(id))
             .filter(|(_, clip, start)| (start + 1..start + clip.duration).contains(&self.playhead))
             .map(|(track, ..)| track);
@@ -1690,13 +1995,28 @@ impl App {
         })
     }
 
-    /// Taking the selected clip away. On the main track the clips after it close up.
+    /// Taking the selected clips away. On the main track the clips after them close up.
     fn delete_edit(&self) -> Option<Edit> {
-        let (track, clip, _) = self.history.timeline().clip(self.selected?)?;
-        Some(Edit::Remove {
-            clip: clip.id,
-            ripple: track == MAIN_TRACK,
-        })
+        let timeline = self.history.timeline();
+        let mut edits: Vec<Edit> = self
+            .selected
+            .iter()
+            .filter_map(|id| {
+                let (track, clip, _) = timeline.clip(*id)?;
+                Some(Edit::Remove {
+                    clip: clip.id,
+                    ripple: track == MAIN_TRACK,
+                })
+            })
+            .collect();
+        match edits.len() {
+            0 => None,
+            1 => edits.pop(),
+            _ => Some(Edit::Many {
+                label: "Delete",
+                edits,
+            }),
+        }
     }
 
     /// How much later than the sound card reports the sound is heard, in milliseconds, when
@@ -1845,7 +2165,7 @@ impl App {
         self.stop_playing();
         let timeline = self.history.timeline();
         self.preview = None;
-        self.selected = self.selected.filter(|id| timeline.clip(*id).is_some());
+        self.selected.retain(|id| timeline.clip(*id).is_some());
         self.playhead = self.playhead.clamp(0, self.last_frame());
         self.show_playhead()
     }
@@ -1913,6 +2233,7 @@ impl App {
             // Up here, not with the editing buttons: on the GPD's screen at 225% those already
             // fill the row while a clip is selected.
             self.step_inside_control(),
+            self.compound_control(),
         ]
         .spacing(12)
         .align_y(Center);
@@ -1943,6 +2264,9 @@ impl App {
         if self.export_dialog {
             // Over the viewer, so that nothing around it moves.
             viewer = stack![viewer, center(self.export_dialog())].into();
+        }
+        if self.compound_dialog {
+            viewer = stack![viewer, center(self.compound_dialog())].into();
         }
 
         // Editing on the left, playing on the right, so that the row fits the GPD's screen at
@@ -1992,7 +2316,7 @@ impl App {
             shown,
             self.playhead,
             self.timeline_view,
-            self.selected,
+            &self.selected,
             &self.waveforms,
             Message::Timeline,
         );
@@ -2012,14 +2336,33 @@ impl App {
     }
 
     /// Where the project shown sits: the projects stepped out of, each a button back, and its
-    /// own name.
+    /// own name. Deep down, "..." stands in for the middle of the path; it names what it hides
+    /// and goes back to the nearest of those.
     fn project_path_bar(&self) -> Element<'_, Message> {
         let mut bar = row![].spacing(4).align_y(Center);
+        let levels = self.parents.len();
+        let hidden = if levels > PATH_PARENTS_SHOWN + 1 {
+            1..levels - PATH_PARENTS_SHOWN
+        } else {
+            0..0
+        };
+        let name =
+            |parent: &Parent| project_name(parent.path.as_deref(), parent.history.timeline());
         for (level, parent) in self.parents.iter().enumerate() {
-            let name = project_name(parent.path.as_deref(), parent.history.timeline());
+            if hidden.contains(&level) {
+                if level + 1 == hidden.end {
+                    let names: Vec<String> =
+                        self.parents[hidden.clone()].iter().map(name).collect();
+                    let more = button(text("..."))
+                        .style(button::text)
+                        .on_press(Message::StepOut(level));
+                    bar = bar.push(hint(more, names.join(" > "))).push(text(">"));
+                }
+                continue;
+            }
             bar = bar
                 .push(
-                    button(text(name))
+                    button(text(name(parent)))
                         .style(button::text)
                         .on_press(Message::StepOut(level)),
                 )
@@ -2031,7 +2374,7 @@ impl App {
 
     /// A way into the selected clip's project, for when double-clicking is not at hand.
     fn step_inside_control(&self) -> Element<'_, Message> {
-        let nested = self.selected.filter(|clip| {
+        let nested = self.selected_clip().filter(|clip| {
             let found = self.history.timeline().clip(*clip);
             found.is_some_and(|(_, clip, _)| clip.media.project.is_some())
         });
@@ -2039,6 +2382,54 @@ impl App {
             Some(clip) => button("Step inside").on_press(Message::StepInside(clip)).into(),
             None => row![].into(),
         }
+    }
+
+    /// Making the selected clips into a compound clip, while any are selected.
+    fn compound_control(&self) -> Element<'_, Message> {
+        if self.selected.is_empty() {
+            return row![].into();
+        }
+        hint(
+            button("Compound").on_press(Message::CompoundOpened),
+            "Make the selected clips one clip",
+        )
+    }
+
+    /// The two ways to keep a compound clip, the linked file first.
+    fn compound_dialog(&self) -> Element<'_, Message> {
+        let title = match self.selected.len() {
+            1 => "Compound clip of 1 clip".to_string(),
+            count => format!("Compound clip of {count} clips"),
+        };
+        let choice = |name: &'static str, about: &'static str, keep: Keep| {
+            button(column![text(name), text(about).size(STATUS_TEXT_SIZE)].spacing(2))
+                .width(Fill)
+                .padding([8, 12])
+                .style(button::secondary)
+                .on_press(Message::CompoundKept(keep))
+        };
+        let card = column![
+            text(title).size(DIALOG_TITLE_SIZE),
+            choice(
+                "Linked file",
+                "An .otio of its own; changes show wherever it is used",
+                Keep::Linked
+            ),
+            choice(
+                "Inside this project",
+                "Kept in this project's file, for this clip alone",
+                Keep::Inside
+            ),
+            button("Cancel")
+                .on_press(Message::CompoundClosed)
+                .style(button::secondary),
+        ]
+        .spacing(12);
+        container(card)
+            .padding(20)
+            .width(DIALOG_WIDTH)
+            .style(container::rounded_box)
+            .into()
     }
 
     /// The export choices: how large and how good, what that makes, and the way on.
@@ -2168,7 +2559,8 @@ impl App {
 
     /// The selected clip's volume, to drag; nothing when no clip is selected.
     fn volume_control(&self) -> Element<'_, Message> {
-        let Some((_, clip, _)) = self.selected.and_then(|id| self.history.timeline().clip(id))
+        let Some((_, clip, _)) =
+            self.selected_clip().and_then(|id| self.history.timeline().clip(id))
         else {
             return row![].into();
         };
@@ -2292,7 +2684,7 @@ fn sign(sign: &str) -> container::Container<'_, Message> {
 /// that carry a sign instead of a name.
 fn hint<'a>(
     control: impl Into<Element<'a, Message>>,
-    words: &'a str,
+    words: impl text::IntoFragment<'a>,
 ) -> Element<'a, Message> {
     tooltip(
         control,
@@ -2336,6 +2728,18 @@ async fn pick_save_path(name: String) -> Option<PathBuf> {
         .set_file_name(format!("{name}.{PROJECT_EXTENSION}"))
         .save_file()
         .await?;
+    Some(chosen.path().with_extension(PROJECT_EXTENSION))
+}
+
+async fn pick_compound_path(name: String, folder: Option<PathBuf>) -> Option<PathBuf> {
+    let mut dialog = rfd::AsyncFileDialog::new()
+        .set_title("Save the compound clip as a project of its own")
+        .add_filter("Project", &[PROJECT_EXTENSION])
+        .set_file_name(format!("{name}.{PROJECT_EXTENSION}"));
+    if let Some(folder) = folder {
+        dialog = dialog.set_directory(folder);
+    }
+    let chosen = dialog.save_file().await?;
     Some(chosen.path().with_extension(PROJECT_EXTENSION))
 }
 

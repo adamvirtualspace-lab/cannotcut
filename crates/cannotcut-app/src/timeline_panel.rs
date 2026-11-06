@@ -1,7 +1,8 @@
 //! The timeline as the user sees and edits it: a ruler, a lane per track with its clips, and the
 //! playhead. Dragging in the ruler or on empty space moves the playhead; clips are picked up and
-//! moved by their body and trimmed by their edges; the wheel scrolls, and zooms with Ctrl. A
-//! clip's sound is drawn along its bottom, as loud as it will play.
+//! moved by their body and trimmed by their edges; Ctrl- or Shift-clicking adds a clip to the
+//! selection or takes it out; the wheel scrolls, and zooms with Ctrl. A clip's sound is drawn
+//! along its bottom, as loud as it will play.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,9 +36,11 @@ const WAVEFORM_HEIGHT: f32 = 16.0;
 const WAVEFORM_RANGE_DB: f32 = 48.0;
 /// Pixels from one bar of a waveform to the next.
 const WAVEFORM_STEP: f32 = 2.0;
-/// The colour of a clip that plays another project: unlike the theme's grey, it does not look
-/// switched off, and unlike its blue and green, it is no video or sound track's colour.
+/// The colour of a clip that plays another project's file: unlike the theme's grey, it does not
+/// look switched off, and unlike its blue and green, it is no video or sound track's colour.
 const NESTED_CLIP: Color = Color::from_rgb8(0x17, 0x80, 0x7f);
+/// The colour of a compound clip kept inside the project, told apart from a linked one.
+const INSIDE_CLIP: Color = Color::from_rgb8(0x7a, 0x52, 0xb3);
 /// Two presses on the same clip this close together are a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Each of the two frames of the badge on a clip that plays another project.
@@ -125,7 +128,8 @@ pub enum Action {
     Scrub(i64),
     /// Zoomed or scrolled; None shows everything.
     View(Option<View>),
-    Select(Option<ClipId>),
+    /// Chose these clips; none clears the selection.
+    Select(Vec<ClipId>),
     /// Is dragging towards this edit: show it without making it.
     Preview(Edit),
     /// Let go: make the edit.
@@ -146,7 +150,7 @@ pub struct TimelinePanel<'a, Message> {
     shown: &'a Timeline,
     playhead: i64,
     view: Option<View>,
-    selected: Option<ClipId>,
+    selected: &'a [ClipId],
     waveforms: &'a Waveforms,
     on_action: Box<dyn Fn(Action) -> Message + 'a>,
 }
@@ -158,7 +162,7 @@ pub fn timeline_panel<'a, Message>(
     shown: &'a Timeline,
     playhead: i64,
     view: Option<View>,
-    selected: Option<ClipId>,
+    selected: &'a [ClipId],
     waveforms: &'a Waveforms,
     on_action: impl Fn(Action) -> Message + 'a,
 ) -> TimelinePanel<'a, Message> {
@@ -448,11 +452,25 @@ impl<Message> TimelinePanel<'_, Message> {
     fn press(&self, state: &mut State, point: Point, width: f32, shell: &mut Shell<'_, Message>) {
         let view = self.view(width);
         let hit = self.hit(view, point);
+        let adding = state.modifiers.command() || state.modifiers.shift();
+        if let (Hit::Body { id, .. } | Hit::Grip { id, .. }, true) = (hit, adding) {
+            // Into the selection, or out of it if it was in; nothing is dragged.
+            let mut picked = self.selected.to_vec();
+            match picked.iter().position(|selected| *selected == id) {
+                Some(index) => drop(picked.remove(index)),
+                None => picked.push(id),
+            }
+            self.publish(Action::Select(picked), shell);
+            state.last_press = None;
+            state.gesture = Gesture::None;
+            shell.capture_event();
+            return;
+        }
         let picked = match hit {
-            Hit::Body { id, .. } | Hit::Grip { id, .. } => Some(id),
+            Hit::Body { id, .. } | Hit::Grip { id, .. } => vec![id],
             // A press on the ruler leaves the selection alone; one on empty track clears it.
-            Hit::Empty { lane: false } => self.selected,
-            Hit::Empty { lane: true } => None,
+            Hit::Empty { lane: false } => self.selected.to_vec(),
+            Hit::Empty { lane: true } => Vec::new(),
         };
         if picked != self.selected {
             self.publish(Action::Select(picked), shell);
@@ -593,13 +611,15 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                 key: keyboard::Key::Named(key::Named::Escape),
                 ..
             }) if !matches!(state.gesture, Gesture::None | Gesture::Scrub) => {
-                // Gives the drag up: everything goes back to where it was.
+                // Gives the drag up: everything goes back to where it was. The key does nothing
+                // else, such as stepping out of a nested project.
                 *state = State {
                     modifiers: state.modifiers,
                     followed: state.followed,
                     ..State::default()
                 };
                 self.publish(Action::Cancel, shell);
+                shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(position) = cursor.position_over(bounds) {
@@ -742,12 +762,15 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                         Size::new(width, LANE_HEIGHT),
                     );
                     let dimmed = if track.enabled && clip.enabled { 1.0 } else { 0.4 };
-                    let selected = self.selected == Some(clip.id);
+                    let selected = self.selected.contains(&clip.id);
                     // A clip that plays another project stands out; one whose project could not
                     // be loaded is marked as a problem.
                     let nested = clip.media.is_project();
                     let pair = match (nested, &clip.media.project) {
                         (false, _) => pair,
+                        (true, Some(_)) if clip.media.is_inside() => {
+                            Pair::new(INSIDE_CLIP, Color::WHITE)
+                        }
                         (true, Some(_)) => Pair::new(NESTED_CLIP, Color::WHITE),
                         (true, None) => palette.danger.base,
                     };
@@ -1031,7 +1054,7 @@ mod tests {
     static NO_WAVEFORMS: std::sync::LazyLock<Waveforms> = std::sync::LazyLock::new(HashMap::new);
 
     fn panel(timeline: &Timeline, playhead: i64) -> TimelinePanel<'_, ()> {
-        timeline_panel(timeline, timeline, playhead, Some(PLAIN), None, &NO_WAVEFORMS, |_| ())
+        timeline_panel(timeline, timeline, playhead, Some(PLAIN), &[], &NO_WAVEFORMS, |_| ())
     }
 
     /// The height of the middle of a track's lane.
