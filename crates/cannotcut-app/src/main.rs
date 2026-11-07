@@ -2,7 +2,11 @@
 //! sound, a viewer showing the frame under the playhead, and live latency and memory readouts.
 
 mod fit;
+mod icons;
+mod panels;
+mod title_bar;
 mod settings;
+mod theme;
 mod timeline_panel;
 mod viewer;
 
@@ -24,15 +28,20 @@ use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
 use iced::futures::channel::oneshot;
 use iced::widget::{
-    Column, Stack, button, center, column, container, image, mouse_area, opaque, pick_list,
-    progress_bar, responsive, row, sensor, shader, slider, space, stack, text, tooltip,
+    Column, Stack, center, column, container, image, mouse_area, opaque, pick_list,
+    progress_bar, responsive, row, sensor, shader, slider, space, text, tooltip,
 };
 use iced::{
     Center, Color, ContentFit, Element, Fill, Size, Subscription, Task, Theme, time, window,
 };
+use iced::widget::button::{self};
 use iced_runtime::image::{Allocation, allocate};
-use fit::{BUTTON_PADDING, Control, Fitted, button_width, fit, text_width};
+use fit::{Control, Fitted, button_width, fit, text_width};
+use icons::{ICON_BUTTON_WIDTH, Icon};
+use panels::{DETAILS_WIDTH, DetailsTab, Divider, MEDIA_WIDTH, MediaTab, Side, icon_button,
+    labelled, labelled_width, tool_control};
 use settings::Settings;
+use theme::button;
 use timeline_panel::{
     Action, LANE_GAP, LANE_HEIGHT, MAIN_TRACK, PANEL_HEIGHT, RULER_HEIGHT, View, Waveforms,
     timecode_base, timeline_panel,
@@ -69,17 +78,9 @@ const EXPORT_BAR_HEIGHT: f32 = 8.0;
 /// The export's progress bar when the header is short of room.
 const EXPORT_BAR_COMPACT_WIDTH: f32 = 60.0;
 const EXPORT_SPACING: f32 = 8.0;
-/// Around the window's contents, and between the rows down it.
-const PAGE_PADDING: f32 = 12.0;
-const ROW_GAP: f32 = 10.0;
 /// Between the controls along a row.
 const ROW_SPACING: f32 = 12.0;
-/// A row of buttons: their line of words and their padding above and below.
-const ROW_HEIGHT: f32 = SIGN_LINE_HEIGHT + 10.0;
-/// iced's line height, in the size of the text.
-const TEXT_LINE_HEIGHT: f32 = 1.3;
 /// The button that opens a row's menu of the controls with no room in it.
-const MORE_LABEL: &str = "\u{22EF}";
 const MENU_WIDTH: f32 = 200.0;
 /// Between a row and its menu.
 const MENU_GAP: f32 = 4.0;
@@ -122,34 +123,17 @@ const NEAR_TICK: f64 = 0.03;
 const TICK_NUDGE: f64 = 0.1;
 /// How long playing waits for the sound card to start before following the system clock.
 const SOUND_START_LIMIT: Duration = Duration::from_secs(1);
-/// The frame-step buttons' signs: the small triangles, because the large ones have an emoji
-/// form that Windows draws as coloured tiles whatever the text asks for.
-const STEP_BACK: &str = "\u{25C2}";
-const STEP_ON: &str = "\u{25B8}";
-const SIGN_SIZE: f32 = 24.0;
-/// The line height of the words on buttons: iced's 16-pixel text at 1.3 lines.
-const SIGN_LINE_HEIGHT: f32 = 20.8;
-/// How far the signs are let down to look centred.
-const SIGN_DROP: f32 = 4.0;
-/// Wide enough for either word, so the buttons after it stay put.
-const PLAY_LABEL_WIDTH: f32 = 44.0;
-/// A frame-step button, with its sign.
-const SIGN_BUTTON_WIDTH: f32 = 41.0;
+/// Either side of the play button, to set it apart from the frame steps.
+const PLAY_MARGIN: f32 = 4.0;
 /// Peaks a second in a waveform: enough to see words and beats.
 const WAVEFORM_RATE: u32 = 100;
 /// The loudest a clip can be turned up to: twice as strong as recorded.
 const MAX_VOLUME: f32 = 2.0;
-const VOLUME_SLIDER_WIDTH: f32 = 110.0;
 /// Wide enough for "200%", so the slider beside it stays put.
 const VOLUME_LABEL_WIDTH: f32 = 44.0;
-/// The volume slider when the toolbar is short of room.
-const VOLUME_SLIDER_COMPACT_WIDTH: f32 = 70.0;
-/// The volume slider on its own card, when the toolbar has no room for it.
-const VOLUME_SLIDER_CARD_WIDTH: f32 = 200.0;
 const VOLUME_SPACING: f32 = 8.0;
 /// The column of track buttons left of the timeline panel.
-const HEADER_WIDTH: f32 = 72.0;
-const HEADER_TEXT_SIZE: f32 = 12.0;
+const HEADER_WIDTH: f32 = 48.0;
 /// The rate of a project until its first clip sets it.
 const EMPTY_PROJECT_RATE: Rate = Rate::new(30, 1);
 
@@ -157,7 +141,7 @@ fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
         .title(App::title)
         .subscription(App::subscription)
-        .theme(Theme::Dark)
+        .theme(|_: &App| theme::theme())
         // Maximized, as an editor wants every pixel; the size is what "restore" goes back to,
         // and fits a laptop screen.
         .window(window::Settings {
@@ -272,9 +256,22 @@ enum Message {
     MoreClosed,
     /// Chosen from such a menu.
     FromMenu(Box<Message>),
-    /// Show the selected clip's volume over the window, for when the toolbar has no room.
-    VolumeOpened,
-    VolumeClosed,
+    MediaTabChosen(MediaTab),
+    DetailsTabChosen(DetailsTab),
+    /// Slide a side panel out over the viewer, or put it away.
+    DrawerToggled(Side),
+    DrawerClosed,
+    /// A divider between panels taken hold of, to drag.
+    DividerPressed(Divider),
+    /// The window's size, asked for when a divider is taken hold of.
+    WindowSized(Size),
+    /// The pointer or finger dragging a divider is here, in the window.
+    DividerDragged(iced::Point),
+    DividerReleased,
+    /// Put a divider back where it started.
+    DividerReset(Divider),
+    /// The divider the pointer is over, if any.
+    DividerHovered(Option<Divider>),
     Key(keyboard::Event),
     MemoryTick,
 }
@@ -288,13 +285,13 @@ enum Keep {
     Inside,
 }
 
-/// A row of controls around the viewer.
+/// A menu that opens from a bar.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Bar {
-    /// Above the viewer: projects and clips.
-    Header,
-    /// Below it: editing and playing.
-    Toolbar,
+    /// The main menu, in the top bar: projects and clips.
+    Menu,
+    /// The tools above the tracks with no room in their bar.
+    Tools,
 }
 
 /// What waits on the question of unsaved changes.
@@ -625,8 +622,19 @@ struct App {
     selecting: bool,
     /// The menu of a row's controls that have no room in it, while open.
     more: Option<Bar>,
-    /// The selected clip's volume is on show over the window.
-    volume_card: bool,
+    /// The side panel slid out over the viewer, on a window too narrow for them beside it.
+    drawer: Option<Side>,
+    media_tab: MediaTab,
+    details_tab: DetailsTab,
+    /// How wide the side panels were dragged to, and the share of the window's height the
+    /// timeline was; with no share it is as tall as its tracks want.
+    media_width: f32,
+    details_width: f32,
+    timeline_share: Option<f32>,
+    /// The divider being dragged, and the window's size while it is, once known.
+    dividing: Option<Divider>,
+    dividing_window: Option<Size>,
+    divider_hover: Option<Divider>,
     /// The picture sizes of media files, by their names in the project, as far as known.
     picture_sizes: HashMap<String, (u32, u32)>,
     /// Files whose picture size is being read.
@@ -768,7 +776,15 @@ impl App {
             leave_saving: false,
             selecting: false,
             more: None,
-            volume_card: false,
+            drawer: None,
+            media_tab: MediaTab::default(),
+            details_tab: DetailsTab::default(),
+            media_width: MEDIA_WIDTH,
+            details_width: DETAILS_WIDTH,
+            timeline_share: None,
+            dividing: None,
+            dividing_window: None,
+            divider_hover: None,
             picture_sizes: HashMap::new(),
             sizing: HashSet::new(),
         };
@@ -801,7 +817,11 @@ impl App {
             }
         }
         app.playhead = playhead;
-        let mut task = app.add_next();
+        let layout = app.settings.layout;
+        app.media_width = layout.media_width.unwrap_or(MEDIA_WIDTH);
+        app.details_width = layout.details_width.unwrap_or(DETAILS_WIDTH);
+        app.timeline_share = layout.timeline_share;
+        let mut task = Task::batch([app.add_next(), title_bar::dress()]);
         if let Some(film) = export {
             task = Task::batch([task, app.export(film)]);
         }
@@ -1628,8 +1648,44 @@ impl App {
                 self.more = None;
                 return self.update(*message);
             }
-            Message::VolumeOpened => self.volume_card = true,
-            Message::VolumeClosed => self.volume_card = false,
+            Message::MediaTabChosen(tab) => self.media_tab = tab,
+            Message::DetailsTabChosen(tab) => self.details_tab = tab,
+            Message::DrawerToggled(side) => {
+                self.drawer = (self.drawer != Some(side)).then_some(side);
+            }
+            Message::DrawerClosed => self.drawer = None,
+            Message::DividerPressed(divider) => {
+                self.dividing = Some(divider);
+                self.dividing_window = None;
+                return window::latest()
+                    .and_then(window::size)
+                    .map(Message::WindowSized);
+            }
+            Message::WindowSized(size) => {
+                if self.dividing.is_some() {
+                    self.dividing_window = Some(size);
+                }
+            }
+            Message::DividerDragged(at) => {
+                if let (Some(divider), Some(window)) = (self.dividing, self.dividing_window) {
+                    self.divider_dragged(divider, at, window);
+                }
+            }
+            Message::DividerReleased => {
+                if self.dividing.take().is_some() {
+                    self.keep_layout();
+                }
+            }
+            Message::DividerReset(divider) => {
+                self.dividing = None;
+                match divider {
+                    Divider::Media => self.media_width = MEDIA_WIDTH,
+                    Divider::Details => self.details_width = DETAILS_WIDTH,
+                    Divider::Timeline => self.timeline_share = None,
+                }
+                self.keep_layout();
+            }
+            Message::DividerHovered(divider) => self.divider_hover = divider,
             Message::ProjectChosen(Some(path)) => {
                 return Task::perform(load_project(path), Message::ProjectLoaded);
             }
@@ -1683,10 +1739,7 @@ impl App {
             Message::Timeline(action) => match action {
                 Action::Scrub(frame) => return self.move_playhead(frame),
                 Action::View(view) => self.timeline_view = view,
-                Action::Select(clips) => {
-                    self.volume_card = false;
-                    self.selected = clips;
-                }
+                Action::Select(clips) => self.selected = clips,
                 Action::Preview(edit) => {
                     let mut timeline = self.history.timeline().clone();
                     if timeline.apply(&edit).is_ok() {
@@ -1928,7 +1981,9 @@ impl App {
                         Some(Message::LeaveCancel)
                     }
                     Some(key::Named::Escape) if self.more.is_some() => Some(Message::MoreClosed),
-                    Some(key::Named::Escape) if self.volume_card => Some(Message::VolumeClosed),
+                    Some(key::Named::Escape) if self.drawer.is_some() => {
+                        Some(Message::DrawerClosed)
+                    }
                     Some(key::Named::Escape) if self.export_dialog => Some(Message::ExportClosed),
                     Some(key::Named::Escape) if self.compound_dialog => {
                         Some(Message::CompoundClosed)
@@ -2452,6 +2507,23 @@ impl App {
         if self.resized_at.is_some() {
             subscriptions.push(time::every(RESIZE_POLL).map(|_| Message::ResizeTick));
         }
+        if self.dividing.is_some() {
+            // Wherever the pointer goes while a divider is held, not only over the divider.
+            subscriptions.push(iced::event::listen_with(|event, _status, _window| {
+                use iced::{Event, mouse, touch};
+                match event {
+                    Event::Mouse(mouse::Event::CursorMoved { position })
+                    | Event::Touch(touch::Event::FingerMoved { position, .. }) => {
+                        Some(Message::DividerDragged(position))
+                    }
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                    | Event::Touch(
+                        touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. },
+                    ) => Some(Message::DividerReleased),
+                    _ => None,
+                }
+            }));
+        }
         if self.playback.is_some() {
             // One tick for every frame the display shows.
             subscriptions.push(window::frames().map(|_| Message::PlayTick));
@@ -2463,272 +2535,14 @@ impl App {
         responsive(move |window| self.layout(window)).into()
     }
 
-    /// Everything, laid out for a window of this size in logical pixels: the rows around the
-    /// viewer fit its width, the timeline panel takes the height its tracks want up to a share
-    /// of the window's, and the viewer the rest.
-    fn layout(&self, window: Size) -> Element<'_, Message> {
-        let timeline = self.history.timeline();
-        let room = window.width - 2.0 * PAGE_PADDING;
-        let header = self.header(room);
-        let toolbar = self.toolbar(room);
-
-        let picture: Element<'_, Message> = match self.shown.as_ref().map(|shown| &shown.picture) {
-            Some(Displayed::Yuv(planes)) => shader(planes).width(Fill).height(Fill).into(),
-            Some(Displayed::Image(allocation)) => image(allocation.handle().clone())
-                .content_fit(ContentFit::Contain)
-                .width(Fill)
-                .height(Fill)
-                .into(),
-            None if timeline.duration() == 0 => center(text("Add a clip to start")).into(),
-            None => center(text("")).into(),
+    /// Remembers how the panels were sized, for next time.
+    fn keep_layout(&mut self) {
+        self.settings.layout = settings::Layout {
+            media_width: Some(self.media_width),
+            details_width: Some(self.details_width),
+            timeline_share: self.timeline_share,
         };
-        let viewer = container(picture)
-            .width(Fill)
-            .height(Fill)
-            .style(|_| container::background(Color::BLACK));
-        let mut viewer: Element<'_, Message> =
-            sensor(viewer).on_resize(Message::ViewerResized).into();
-        if self.viewer.is_none() {
-            viewer = stack![viewer, renderer_probe(Message::RendererProbed)].into();
-        }
-
-        let panel_height = self.panel_height(window.height);
-        let shown = self
-            .preview
-            .as_ref()
-            .map_or(timeline, |preview| &preview.timeline);
-        let panel = timeline_panel(
-            timeline,
-            shown,
-            self.playhead,
-            self.timeline_view,
-            &self.selected,
-            &self.waveforms,
-            Message::Timeline,
-        )
-        .selecting(self.selecting)
-        .height(panel_height);
-        let panel = row![self.track_headers(panel_height), panel].spacing(8);
-        let status = container(
-            text(self.readout())
-                .size(STATUS_TEXT_SIZE)
-                .wrapping(text::Wrapping::None),
-        )
-        .clip(true)
-        .align_right(Fill);
-
-        let page = column![header.row, viewer, toolbar.row, panel, status]
-            .spacing(ROW_GAP)
-            .padding(PAGE_PADDING);
-        let mut layers: Vec<Element<'_, Message>> = vec![page.into()];
-
-        // A row's menu opens just under the header, or just over the toolbar, at its button.
-        let menu = match self.more {
-            Some(Bar::Header) if !header.menu.is_empty() => {
-                Some((header.menu, header.menu_x, Bar::Header))
-            }
-            Some(Bar::Toolbar) if !toolbar.menu.is_empty() => {
-                Some((toolbar.menu, toolbar.menu_x, Bar::Toolbar))
-            }
-            _ => None,
-        };
-        if let Some((entries, x, bar)) = menu {
-            let left = PAGE_PADDING + x.min(room - MENU_WIDTH).max(0.0);
-            let card = more_menu(entries);
-            let placed = match bar {
-                Bar::Header => container(card).padding(iced::Padding {
-                    top: PAGE_PADDING + ROW_HEIGHT + MENU_GAP,
-                    left,
-                    ..iced::Padding::ZERO
-                }),
-                Bar::Toolbar => container(card)
-                    .padding(iced::Padding {
-                        bottom: PAGE_PADDING
-                            + STATUS_TEXT_SIZE * TEXT_LINE_HEIGHT
-                            + ROW_GAP
-                            + panel_height
-                            + ROW_GAP
-                            + ROW_HEIGHT
-                            + MENU_GAP,
-                        left,
-                        ..iced::Padding::ZERO
-                    })
-                    .align_bottom(Fill),
-            };
-            let away = mouse_area(space().width(Fill).height(Fill)).on_press(Message::MoreClosed);
-            layers.push(away.into());
-            layers.push(placed.width(Fill).height(Fill).into());
-        }
-
-        // Over everything, so that it fits even a short window, and nothing behind it can be
-        // pressed meanwhile; pressing beside it is Cancel.
-        let dialog = if let Some(leave) = self.leaving {
-            let cancel = (!self.leave_saving).then_some(Message::LeaveCancel);
-            Some((self.leave_dialog(leave), cancel))
-        } else if self.export_dialog {
-            Some((self.export_dialog(), Some(Message::ExportClosed)))
-        } else if self.compound_dialog {
-            Some((self.compound_dialog(), Some(Message::CompoundClosed)))
-        } else if self.volume_card
-            && let Some(volume) = self.volume_row(false, VOLUME_SLIDER_CARD_WIDTH)
-        {
-            Some((volume_card(volume), Some(Message::VolumeClosed)))
-        } else {
-            None
-        };
-        if let Some((card, cancel)) = dialog {
-            let dim = container(space().width(Fill).height(Fill))
-                .style(|_| container::background(DIALOG_BACKDROP));
-            let backdrop: Element<'_, Message> = match cancel {
-                Some(cancel) => mouse_area(dim).on_press(cancel).into(),
-                None => dim.into(),
-            };
-            layers.push(opaque(backdrop));
-            layers.push(center(opaque(card)).into());
-        }
-        Stack::with_children(layers).into()
-    }
-
-    /// The row above the viewer, fitted to `room`: projects and clips, then the path and what
-    /// the playhead is on.
-    fn header(&self, room: f32) -> Fitted<'_, Message> {
-        let mut controls = vec![
-            Control::new(
-                button("Add clips").on_press(Message::AddRequested),
-                button_width("Add clips"),
-            )
-            .compact(
-                hint(button("Add").on_press(Message::AddRequested), "Add clips"),
-                button_width("Add"),
-            )
-            .or_in_menu(9, "Add clips", Some(Message::AddRequested)),
-            Control::new(
-                hint(
-                    button("New project").on_press(Message::NewRequested),
-                    "Start an empty project (Ctrl+N)",
-                ),
-                button_width("New project"),
-            )
-            .compact(
-                hint(
-                    button("New").on_press(Message::NewRequested),
-                    "Start an empty project (Ctrl+N)",
-                ),
-                button_width("New"),
-            )
-            .or_in_menu(3, "New project", Some(Message::NewRequested)),
-            Control::new(
-                button("Open").on_press(Message::OpenRequested),
-                button_width("Open"),
-            )
-            .or_in_menu(4, "Open", Some(Message::OpenRequested)),
-            Control::new(
-                button("Save").on_press(Message::SaveRequested),
-                button_width("Save"),
-            )
-            .or_in_menu(6, "Save", Some(Message::SaveRequested)),
-            self.export_control(),
-        ];
-        controls.extend(self.select_control());
-        controls.extend(self.step_inside_control());
-        controls.extend(self.compound_control());
-        let menu_after = controls.len();
-        // Whatever room the buttons leave: the path first, then what the playhead is on. The
-        // path wants at least the name of the project shown.
-        let path = responsive(|room| {
-            let path = self.project_path_bar(room.width);
-            row![path, one_line(self.headline()).width(Fill)]
-                .spacing(ROW_SPACING)
-                .align_y(Center)
-                .into()
-        })
-        .height(iced::Length::Shrink);
-        controls.push(Control::new(path, self.path_least_width()));
-        fit(
-            controls,
-            room,
-            ROW_SPACING,
-            more_button(Bar::Header, self.more),
-            button_width(MORE_LABEL),
-            menu_after,
-        )
-    }
-
-    /// The row below the viewer, fitted to `room`: editing on the left, playing on the right.
-    /// A button that cannot do anything right now shows it by being greyed out.
-    fn toolbar(&self, room: f32) -> Fitted<'_, Message> {
-        let timeline = self.history.timeline();
-        let simple = |words: &'static str, does: Option<Message>, keep: u8| {
-            Control::new(button(words).on_press_maybe(does.clone()), button_width(words))
-                .or_in_menu(keep, words, does)
-        };
-        let mut controls = vec![
-            simple("Undo", self.history.undo_label().map(|_| Message::Undo), 6),
-            simple("Redo", self.history.redo_label().map(|_| Message::Redo), 5),
-            simple("Split", self.split_edit().map(|_| Message::Split), 7),
-            simple("Delete", self.delete_edit().map(|_| Message::Delete), 7),
-            Control::new(
-                button("Add track").on_press(Message::AddTrack),
-                button_width("Add track"),
-            )
-            .compact(
-                hint(button("+ Track").on_press(Message::AddTrack), "Add track"),
-                button_width("+ Track"),
-            )
-            .or_in_menu(2, "Add track", Some(Message::AddTrack)),
-        ];
-        controls.extend(self.volume_control());
-        let menu_after = controls.len();
-        let playing = self.playback.is_some();
-        let position = timecode(self.playhead, timeline.rate());
-        let both = format!("{position} / {}", timecode(timeline.duration(), timeline.rate()));
-        controls.extend([
-            Control::new(space().width(Fill), 0.0),
-            Control::new(
-                hint(
-                    button(sign(STEP_BACK)).on_press(Message::Stepped(-1)),
-                    "Previous frame (Left arrow)",
-                ),
-                SIGN_BUTTON_WIDTH,
-            )
-            .or_in_menu(8, "Previous frame", Some(Message::Stepped(-1))),
-            Control::new(
-                hint(
-                    button(
-                        text(if playing { "Pause" } else { "Play" })
-                            .width(PLAY_LABEL_WIDTH)
-                            .align_x(Center),
-                    )
-                    .on_press_maybe((timeline.duration() > 0).then_some(Message::PlayToggled)),
-                    "Play or pause (Space)",
-                ),
-                PLAY_LABEL_WIDTH + BUTTON_PADDING,
-            ),
-            Control::new(
-                hint(
-                    button(sign(STEP_ON)).on_press(Message::Stepped(1)),
-                    "Next frame (Right arrow)",
-                ),
-                SIGN_BUTTON_WIDTH,
-            )
-            .or_in_menu(8, "Next frame", Some(Message::Stepped(1))),
-            Control::new(
-                text(both.clone()).wrapping(text::Wrapping::None),
-                text_width(&both),
-            )
-            .compact(
-                hint(text(position.clone()).wrapping(text::Wrapping::None), both),
-                text_width(&position),
-            ),
-        ]);
-        fit(
-            controls,
-            room,
-            ROW_SPACING,
-            more_button(Bar::Toolbar, self.more),
-            button_width(MORE_LABEL),
-            menu_after,
-        )
+        self.settings.save_layout();
     }
 
     /// The timeline panel's height in a window `window_height` tall: room for every track and
@@ -2741,10 +2555,10 @@ impl App {
 
     /// What the path in the header needs at the least: the project shown, after "...".
     fn path_least_width(&self) -> f32 {
-        if self.parents.is_empty() {
-            return 0.0;
-        }
         let own = project_name(self.project_path.as_deref(), self.history.timeline());
+        if self.parents.is_empty() {
+            return text_width(&own);
+        }
         text_width(&own) + button_width("...") + PATH_SEPARATOR_WIDTH
     }
 
@@ -2753,10 +2567,6 @@ impl App {
     /// those that do not; it names them and goes back to the nearest of them.
     fn project_path_bar(&self, room: f32) -> Element<'_, Message> {
         let mut bar = row![].spacing(PATH_SPACING).align_y(Center);
-        let levels = self.parents.len();
-        if levels == 0 {
-            return nothing();
-        }
         let name =
             |parent: &Parent| project_name(parent.path.as_deref(), parent.history.timeline());
         let names: Vec<String> = self.parents.iter().map(name).collect();
@@ -2768,7 +2578,7 @@ impl App {
                     let names: Vec<String> =
                         self.parents[hidden.clone()].iter().map(name).collect();
                     let more = button(text("..."))
-                        .style(button::text)
+                        .style(theme::quiet)
                         .on_press(Message::StepOut(level));
                     bar = bar.push(hint(more, names.join(" > "))).push(text(">"));
                 }
@@ -2777,7 +2587,7 @@ impl App {
             bar = bar
                 .push(
                     button(text(name(parent)))
-                        .style(button::text)
+                        .style(theme::quiet)
                         .on_press(Message::StepOut(level)),
                 )
                 .push(text(">"));
@@ -2790,24 +2600,26 @@ impl App {
         if self.history.timeline().duration() == 0 {
             return None;
         }
-        let (label, style, about, entry): (_, fn(&Theme, button::Status) -> button::Style, _, _) =
+        let (style, ink, about, entry): (fn(&Theme, button::Status) -> button::Style, _, _, _) =
             if self.selecting {
                 (
-                    "Selecting",
-                    button::success,
-                    "Tap clips to add or remove them; tap here to stop",
+                    theme::on,
+                    theme::ON_ACCENT,
+                    "Selecting: tap clips to add or remove them; tap here to stop",
                     "Stop selecting",
                 )
             } else {
                 (
-                    "Select",
-                    button::secondary,
-                    "Tap clips to pick several (or Ctrl-click them)",
+                    theme::quiet,
+                    theme::TEXT,
+                    "Select several: tap clips to pick them (or Ctrl-click them)",
                     "Select several",
                 )
             };
-        let toggle = hint(button(label).style(style).on_press(Message::SelectToggled), about);
-        let control = Control::new(toggle, button_width(label));
+        let toggle = icon_button(Icon::Select, ink)
+            .style(style)
+            .on_press(Message::SelectToggled);
+        let control = Control::new(hint(toggle, about), ICON_BUTTON_WIDTH);
         Some(control.or_in_menu(7, entry, Some(Message::SelectToggled)))
     }
 
@@ -2837,13 +2649,15 @@ impl App {
             text(title).size(DIALOG_TITLE_SIZE),
             text(about),
             row![
-                button("Save").on_press_maybe((!busy).then_some(Message::LeaveSave)),
+                button("Save")
+                    .style(theme::primary)
+                    .on_press_maybe((!busy).then_some(Message::LeaveSave)),
                 button("Don't save")
-                    .style(button::danger)
+                    .style(theme::danger)
                     .on_press_maybe((!busy).then_some(Message::LeaveDiscard)),
                 space().width(Fill),
                 button("Cancel")
-                    .style(button::secondary)
+                    .style(theme::normal)
                     .on_press_maybe((!busy).then_some(Message::LeaveCancel)),
             ]
             .spacing(12),
@@ -2852,7 +2666,7 @@ impl App {
         container(card)
             .padding(20)
             .width(DIALOG_WIDTH)
-            .style(container::rounded_box)
+            .style(theme::card)
             .into()
     }
 
@@ -2863,11 +2677,13 @@ impl App {
             found.is_some_and(|(_, clip, _)| clip.media.project.is_some())
         })?;
         let open = Message::StepInside(clip);
-        let control = Control::new(
-            button("Step inside").on_press(open.clone()),
-            button_width("Step inside"),
-        );
-        Some(control.or_in_menu(8, "Step inside", Some(open)))
+        Some(tool_control(
+            Icon::StepInside,
+            "Step inside the clip's project",
+            "Step inside",
+            Some(open),
+            8,
+        ))
     }
 
     /// Making the selected clips into a compound clip, while any are selected.
@@ -2875,12 +2691,13 @@ impl App {
         if self.selected.is_empty() {
             return None;
         }
-        let compound = hint(
-            button("Compound").on_press(Message::CompoundOpened),
-            "Make the selected clips one clip",
-        );
-        let control = Control::new(compound, button_width("Compound"));
-        Some(control.or_in_menu(8, "Compound", Some(Message::CompoundOpened)))
+        Some(tool_control(
+            Icon::Compound,
+            "Compound: make the selected clips one clip",
+            "Compound",
+            Some(Message::CompoundOpened),
+            8,
+        ))
     }
 
     /// The two ways to keep a compound clip, the linked file first.
@@ -2893,7 +2710,7 @@ impl App {
             button(column![text(name), text(about).size(STATUS_TEXT_SIZE)].spacing(2))
                 .width(Fill)
                 .padding([8, 12])
-                .style(button::secondary)
+                .style(theme::normal)
                 .on_press(Message::CompoundKept(keep))
         };
         let card = column![
@@ -2910,13 +2727,13 @@ impl App {
             ),
             button("Cancel")
                 .on_press(Message::CompoundClosed)
-                .style(button::secondary),
+                .style(theme::normal),
         ]
         .spacing(12);
         container(card)
             .padding(20)
             .width(DIALOG_WIDTH)
-            .style(container::rounded_box)
+            .style(theme::card)
             .into()
     }
 
@@ -2970,8 +2787,8 @@ impl App {
             row![
                 button("Cancel")
                     .on_press(Message::ExportClosed)
-                    .style(button::secondary),
-                button("Export").on_press(Message::ExportRequested),
+                    .style(theme::normal),
+                button("Export").style(theme::primary).on_press(Message::ExportRequested),
             ]
             .spacing(12),
         ]
@@ -2979,7 +2796,7 @@ impl App {
         container(card)
             .padding(20)
             .width(DIALOG_WIDTH)
-            .style(container::rounded_box)
+            .style(theme::card)
             .into()
     }
 
@@ -2988,11 +2805,16 @@ impl App {
         let Some(exporting) = &self.exporting else {
             let has_clips = self.history.timeline().duration() > 0;
             let export = has_clips.then_some(Message::ExportOpened);
-            return Control::new(
-                button("Export").on_press_maybe(export.clone()),
-                button_width("Export"),
-            )
-            .or_in_menu(5, "Export", export);
+            let ink = if has_clips { theme::ON_ACCENT } else { theme::TEXT_DIM };
+            let full = button(labelled(Icon::Export, "Export", ink))
+                .style(theme::primary)
+                .on_press_maybe(export.clone());
+            let compact = icon_button(Icon::Export, ink)
+                .style(theme::primary)
+                .on_press_maybe(export.clone());
+            return Control::new(full, labelled_width("Export"))
+                .compact(hint_below(compact, "Export"), ICON_BUTTON_WIDTH)
+                .or_in_menu(5, "Export", export);
         };
         let share = exporting.done as f32 / exporting.total.max(1) as f32;
         let elapsed = exporting.started.elapsed().as_secs_f64();
@@ -3041,17 +2863,20 @@ impl App {
         let tracks = self.history.timeline().tracks();
         // The top of the stack is the top lane.
         let buttons = tracks.enumerate().rev().map(|(index, track)| {
-            let label = if track.muted { "Muted" } else { "Mute" };
-            let style = if track.muted {
-                button::danger
-            } else {
-                button::secondary
-            };
-            let toggle = button(text(label).size(HEADER_TEXT_SIZE))
+            let (which, about, style): (_, _, fn(&Theme, button::Status) -> button::Style) =
+                if track.muted {
+                    (Icon::Muted, "Muted: tap to hear the track", theme::danger)
+                } else {
+                    (Icon::Mute, "Mute the track", theme::quiet)
+                };
+            let toggle = icon_button(which, theme::TEXT)
                 .on_press(Message::ToggleMute(index))
-                .style(style)
-                .padding([4, 10]);
-            container(toggle).height(LANE_HEIGHT).center_y(LANE_HEIGHT).into()
+                .style(style);
+            container(hint(toggle, about))
+                .width(Fill)
+                .height(LANE_HEIGHT)
+                .center(LANE_HEIGHT)
+                .into()
         });
         let column = Column::with_children(buttons)
             .spacing(LANE_GAP)
@@ -3066,23 +2891,9 @@ impl App {
             .into()
     }
 
-    /// The selected clip's volume, to drag; none while no single clip is selected. With little
-    /// room, without its name and with a shorter slider; with none, in the menu.
-    fn volume_control(&self) -> Option<Control<'_, Message>> {
-        let full = self.volume_row(true, VOLUME_SLIDER_WIDTH)?;
-        let compact = self.volume_row(false, VOLUME_SLIDER_COMPACT_WIDTH)?;
-        let words = text_width("Volume") + VOLUME_SPACING;
-        let slider_and_label = VOLUME_SPACING + VOLUME_LABEL_WIDTH;
-        Some(
-            Control::new(full, words + VOLUME_SLIDER_WIDTH + slider_and_label)
-                .compact(compact, VOLUME_SLIDER_COMPACT_WIDTH + slider_and_label)
-                .or_in_menu(4, "Volume", Some(Message::VolumeOpened)),
-        )
-    }
-
-    /// The volume slider of the selected clip, `slider_width` long, its name before it if
-    /// `named`.
-    fn volume_row(&self, named: bool, slider_width: f32) -> Option<Element<'_, Message>> {
+    /// The volume slider of the selected clip, `slider_width` long, and the volume it is at;
+    /// none while no single clip is selected.
+    fn volume_row(&self, slider_width: impl Into<iced::Length>) -> Option<Element<'_, Message>> {
         let (_, clip, _) = self.history.timeline().clip(self.selected_clip()?)?;
         let volume = self.volume_drag.unwrap_or(clip.volume).clamp(0.0, MAX_VOLUME);
         let slider = slider(0.0..=MAX_VOLUME, volume, Message::VolumeChanged)
@@ -3090,15 +2901,10 @@ impl App {
             .on_release(Message::VolumeReleased)
             .width(slider_width);
         let label = text(format!("{:.0}%", volume * 100.0)).width(VOLUME_LABEL_WIDTH);
-        let row = if named {
-            row![text("Volume"), slider, label]
-        } else {
-            row![hint(slider, "Volume"), label]
-        };
-        Some(row.spacing(VOLUME_SPACING).align_y(Center).into())
+        Some(row![slider, label].spacing(VOLUME_SPACING).align_y(Center).into())
     }
 
-    /// The line next to the add button: what went wrong, or what the playhead is on.
+    /// What the viewer's title says: what went wrong, or what the playhead is on.
     fn headline(&self) -> String {
         if let Some(notice) = &self.notice {
             return notice.clone();
@@ -3186,30 +2992,32 @@ impl App {
     }
 }
 
-/// A sign on a button, drawn larger than the words on the other buttons but taking no more
-/// height, so the row they share stays as it is.
-fn sign(sign: &str) -> container::Container<'_, Message> {
-    // The triangles sit high in their line; the same height, part of it above them, puts
-    // them level with the words beside them.
-    let line = SIGN_LINE_HEIGHT - SIGN_DROP;
-    container(
-        text(sign)
-            .size(SIGN_SIZE)
-            .line_height(text::LineHeight::Absolute(iced::Pixels(line))),
-    )
-    .padding(iced::padding::top(SIGN_DROP))
-}
-
 /// A control with a word on what it does, shown while the pointer rests on it: for buttons
 /// that carry a sign instead of a name.
 fn hint<'a>(
     control: impl Into<Element<'a, Message>>,
     words: impl text::IntoFragment<'a>,
 ) -> Element<'a, Message> {
+    hint_at(control, words, tooltip::Position::Top)
+}
+
+/// The same, with the word under the control: for the bar along the window's top.
+fn hint_below<'a>(
+    control: impl Into<Element<'a, Message>>,
+    words: impl text::IntoFragment<'a>,
+) -> Element<'a, Message> {
+    hint_at(control, words, tooltip::Position::Bottom)
+}
+
+fn hint_at<'a>(
+    control: impl Into<Element<'a, Message>>,
+    words: impl text::IntoFragment<'a>,
+    position: tooltip::Position,
+) -> Element<'a, Message> {
     tooltip(
         control,
-        container(text(words).size(STATUS_TEXT_SIZE)).padding(6).style(container::rounded_box),
-        tooltip::Position::Top,
+        container(text(words).size(STATUS_TEXT_SIZE)).padding(6).style(theme::card),
+        position,
     )
     .gap(4)
     .into()
@@ -3247,9 +3055,17 @@ fn path_hidden(names: &[String], own: &str, room: f32) -> std::ops::Range<usize>
 fn more_button<'a>(bar: Bar, open: Option<Bar>) -> Element<'a, Message> {
     if open == Some(bar) {
         // No word on it while open: it would cover the menu.
-        return button(MORE_LABEL).on_press(Message::MoreClosed).into();
+        return icon_button(Icon::More, theme::ON_ACCENT)
+            .style(theme::on)
+            .on_press(Message::MoreClosed)
+            .into();
     }
-    hint(button(MORE_LABEL).on_press(Message::MoreOpened(bar)), "More")
+    hint(
+        icon_button(Icon::More, theme::TEXT)
+            .style(theme::quiet)
+            .on_press(Message::MoreOpened(bar)),
+        "More",
+    )
 }
 
 /// A row's menu: its controls with no room in the row, one under another; those that can do
@@ -3258,26 +3074,15 @@ fn more_menu<'a>(entries: Vec<(String, Option<Message>)>) -> Element<'a, Message
     let entries = entries.into_iter().map(|(words, does)| {
         button(text(words))
             .width(Fill)
-            .style(button::text)
+            .style(theme::quiet)
             .on_press_maybe(does.map(|does| Message::FromMenu(Box::new(does))))
             .into()
     });
     container(Column::with_children(entries).spacing(2))
         .padding(6)
         .width(MENU_WIDTH)
-        .style(container::rounded_box)
+        .style(theme::card)
         .into()
-}
-
-/// The selected clip's volume over the window, for when the toolbar has no room for it.
-fn volume_card(volume: Element<'_, Message>) -> Element<'_, Message> {
-    let card = column![
-        text("Volume").size(DIALOG_TITLE_SIZE),
-        volume,
-        button("Done").on_press(Message::VolumeClosed),
-    ]
-    .spacing(16);
-    container(card).padding(20).style(container::rounded_box).into()
 }
 
 /// Stands in for a control that is not on show; rows leave no gap for it.

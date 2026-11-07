@@ -715,7 +715,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
             renderer.fill_quad(
                 renderer::Quad {
                     bounds,
-                    border: border::rounded(6),
+                    border: border::rounded(0),
                     ..renderer::Quad::default()
                 },
                 palette.background.weak.color,
@@ -765,8 +765,8 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                     palette.background.base.color,
                 );
                 let pair = match track.kind {
-                    TrackKind::Video => palette.primary.base,
-                    TrackKind::Audio => palette.success.base,
+                    TrackKind::Video => Pair::new(crate::theme::VIDEO_CLIP, Color::WHITE),
+                    TrackKind::Audio => Pair::new(crate::theme::AUDIO_CLIP, Color::WHITE),
                 };
                 for (start, item) in track.placed() {
                     let Item::Clip(clip) = item else {
@@ -802,7 +802,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                             border: Border {
                                 color: if selected { ink } else { Color::TRANSPARENT },
                                 width: if selected { 2.0 } else { 0.0 },
-                                radius: 4.0.into(),
+                                radius: 0.0.into(),
                             },
                             ..renderer::Quad::default()
                         },

@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use cannotcut_export::{Options as ExportOptions, Quality, Resolution};
 use serde_json::{Map, Value, json};
@@ -10,6 +11,20 @@ use serde_json::{Map, Value, json};
 const FILE: &str = "settings.json";
 const SOUND_DELAYS: &str = "sound_delay_ms";
 const EXPORT: &str = "export";
+const LAYOUT: &str = "layout";
+const MEDIA_WIDTH: &str = "media_width";
+const DETAILS_WIDTH: &str = "details_width";
+const TIMELINE_SHARE: &str = "timeline_share";
+
+/// How the panels were sized; none where they were left as they start.
+#[derive(Clone, Copy, Default)]
+pub struct Layout {
+    /// In logical pixels.
+    pub media_width: Option<f32>,
+    pub details_width: Option<f32>,
+    /// The share of the window's height the timeline takes, from 0 to 1.
+    pub timeline_share: Option<f32>,
+}
 
 #[derive(Default)]
 pub struct Settings {
@@ -19,6 +34,7 @@ pub struct Settings {
     pub sound_delays: HashMap<String, u64>,
     /// What the last film was exported as.
     pub export: ExportOptions,
+    pub layout: Layout,
 }
 
 impl Settings {
@@ -43,35 +59,75 @@ impl Settings {
                 settings.export.quality = quality;
             }
         }
+        if let Some(layout) = saved.get(LAYOUT) {
+            let size = |name: &str| {
+                let size = layout.get(name).and_then(Value::as_f64)? as f32;
+                (size.is_finite() && size > 0.0).then_some(size)
+            };
+            settings.layout = Layout {
+                media_width: size(MEDIA_WIDTH),
+                details_width: size(DETAILS_WIDTH),
+                timeline_share: size(TIMELINE_SHARE).filter(|share| *share < 1.0),
+            };
+        }
         settings
     }
 
-    /// Keeps the export choices in the file. Whatever else it holds stays as it is. Returns
-    /// at once; the file is written on a thread of its own.
+    /// Keeps the export choices in the file.
     pub fn save_export(&self) {
-        let export = json!({
-            "resolution": self.export.resolution.key(),
-            "quality": self.export.quality.key(),
-        });
-        let written = std::thread::Builder::new()
-            .name("cannotcut-settings".to_string())
-            .spawn(move || {
-                let Some(path) = path() else {
-                    return;
-                };
-                let mut saved = read().unwrap_or_default();
-                saved.insert(EXPORT.to_string(), export);
-                if let Some(folder) = path.parent() {
-                    let _ = std::fs::create_dir_all(folder);
-                }
-                let mut text = serde_json::to_string_pretty(&Value::Object(saved))
-                    .expect("settings with text keys always serialize");
-                text.push('\n');
-                let _ = std::fs::write(path, text);
-            });
-        // Not remembering a choice for next time is no reason to stop anything now.
-        drop(written);
+        save(
+            EXPORT,
+            json!({
+                "resolution": self.export.resolution.key(),
+                "quality": self.export.quality.key(),
+            }),
+        );
     }
+
+    /// Keeps the panels' sizes in the file.
+    pub fn save_layout(&self) {
+        let mut layout = Map::new();
+        let widths = [
+            (MEDIA_WIDTH, self.layout.media_width),
+            (DETAILS_WIDTH, self.layout.details_width),
+        ];
+        for (name, width) in widths {
+            if let Some(width) = width {
+                layout.insert(name.to_string(), json!(width.round()));
+            }
+        }
+        if let Some(share) = self.layout.timeline_share {
+            let share = (f64::from(share) * 1000.0).round() / 1000.0;
+            layout.insert(TIMELINE_SHARE.to_string(), json!(share));
+        }
+        save(LAYOUT, Value::Object(layout));
+    }
+}
+
+/// Puts `value` in the file under `key`. Whatever else it holds stays as it is. Returns at
+/// once; the file is written on a thread of its own.
+fn save(key: &'static str, value: Value) {
+    static WRITING: Mutex<()> = Mutex::new(());
+    let written = std::thread::Builder::new()
+        .name("cannotcut-settings".to_string())
+        .spawn(move || {
+            let Some(path) = path() else {
+                return;
+            };
+            // One at a time, so that two keys saved together both stay.
+            let _writing = WRITING.lock();
+            let mut saved = read().unwrap_or_default();
+            saved.insert(key.to_string(), value);
+            if let Some(folder) = path.parent() {
+                let _ = std::fs::create_dir_all(folder);
+            }
+            let mut text = serde_json::to_string_pretty(&Value::Object(saved))
+                .expect("settings with text keys always serialize");
+            text.push('\n');
+            let _ = std::fs::write(path, text);
+        });
+    // Not remembering a choice for next time is no reason to stop anything now.
+    drop(written);
 }
 
 fn read() -> Option<Map<String, Value>> {
