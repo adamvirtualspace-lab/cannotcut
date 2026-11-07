@@ -718,7 +718,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                     border: border::rounded(0),
                     ..renderer::Quad::default()
                 },
-                palette.background.weak.color,
+                crate::theme::TRACKS,
             );
 
             // The ruler: a labelled tick every step, smaller ones in between.

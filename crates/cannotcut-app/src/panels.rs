@@ -444,7 +444,7 @@ impl App {
     /// panels' buttons while they slide out, and Export.
     fn top_bar(&self, room: f32, docked: bool) -> Fitted<'_, Message> {
         let open = self.more == Some(Bar::Menu);
-        let ink = if open { theme::ON_ACCENT } else { theme::TEXT };
+        let ink = if open { theme::ON_ACCENT } else { theme::ON_BUTTON };
         let menu = button(labelled(Icon::Menu, MENU_LABEL, ink))
             .style(if open { theme::on } else { theme::normal })
             .on_press(if open {
@@ -782,7 +782,8 @@ impl App {
         } else {
             (Icon::Mute, "Mute track")
         };
-        let mute = button(labelled(which, words, theme::TEXT))
+        let ink = if muted { theme::ON_DANGER } else { theme::ON_BUTTON };
+        let mute = button(labelled(which, words, ink))
             .style(if muted { theme::danger } else { theme::normal })
             .on_press(Message::ToggleMute(track));
         let mut rows = column![section("Volume".to_string())].spacing(PANEL_PADDING);

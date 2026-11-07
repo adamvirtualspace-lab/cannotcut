@@ -864,7 +864,7 @@ impl App {
         let (level, timeline) = self.file_level();
         let Some(path) = chosen.or_else(|| self.level_path(level).map(Path::to_path_buf)) else {
             let name = timeline.name.clone();
-            return Task::perform(pick_save_path(name), Message::SaveChosen);
+            return ask(move |dialog| pick_save_path(dialog, name), Message::SaveChosen);
         };
         let step = self.nest_step;
         // Tracks are shared, so the copy handed to the background is cheap.
@@ -965,7 +965,7 @@ impl App {
                     Some(path) => path.clone(),
                     None => {
                         let name = timeline.name.clone();
-                        return Task::perform(pick_save_path(name), Message::LeaveSaveChosen);
+                        return ask(move |dialog| pick_save_path(dialog, name), Message::LeaveSaveChosen);
                     }
                 },
             };
@@ -1000,7 +1000,7 @@ impl App {
                 self.timeline_view = None;
                 task
             }
-            Some(Leave::Open) => Task::perform(pick_project(), Message::ProjectChosen),
+            Some(Leave::Open) => ask(pick_project, Message::ProjectChosen),
             Some(Leave::Close) => iced::exit(),
             None => Task::none(),
         }
@@ -1568,7 +1568,7 @@ impl App {
 
     fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::AddRequested => return Task::perform(pick_clips(), Message::FilesChosen),
+            Message::AddRequested => return ask(pick_clips, Message::FilesChosen),
             Message::FilesChosen(paths) => {
                 self.adding.extend(paths);
                 return self.add_next();
@@ -1711,7 +1711,7 @@ impl App {
             }
             Message::ExportRequested => {
                 let name = self.history.timeline().name.clone();
-                return Task::perform(pick_film_path(name), Message::ExportChosen);
+                return ask(move |dialog| pick_film_path(dialog, name), Message::ExportChosen);
             }
             Message::ExportChosen(Some(path)) => {
                 self.export_dialog = false;
@@ -1897,8 +1897,8 @@ impl App {
                             return self.save_compound(path);
                         }
                         let folder = self.own_file().and_then(Path::parent).map(Path::to_path_buf);
-                        return Task::perform(
-                            pick_compound_path(name, folder),
+                        return ask(
+                            move |dialog| pick_compound_path(dialog, name, folder),
                             Message::CompoundPathChosen,
                         );
                     }
@@ -2869,7 +2869,8 @@ impl App {
                 } else {
                     (Icon::Mute, "Mute the track", theme::quiet)
                 };
-            let toggle = icon_button(which, theme::TEXT)
+            let ink = if track.muted { theme::ON_DANGER } else { theme::TEXT };
+            let toggle = icon_button(which, ink)
                 .on_press(Message::ToggleMute(index))
                 .style(style);
             container(hint(toggle, about))
@@ -3097,8 +3098,28 @@ fn one_line<'a>(content: String) -> container::Container<'a, Message> {
     container(text(content).wrapping(text::Wrapping::None)).clip(true)
 }
 
-async fn pick_project() -> Option<PathBuf> {
-    rfd::AsyncFileDialog::new()
+/// Opens a file dialog made by `pick`, owned by the app's window so that Windows puts it on
+/// the screen the window is on (without an owner it comes up where the last one was), and
+/// hands what it chose to `done`.
+fn ask<T, F>(
+    pick: impl FnOnce(rfd::AsyncFileDialog) -> F + Send + 'static,
+    done: fn(T) -> Message,
+) -> Task<Message>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut pick = Some(pick);
+    window::latest()
+        .and_then(|id| window::run(id, |window| rfd::AsyncFileDialog::new().set_parent(window)))
+        .then(move |dialog| match pick.take() {
+            Some(pick) => Task::perform(pick(dialog), done),
+            None => Task::none(),
+        })
+}
+
+async fn pick_project(dialog: rfd::AsyncFileDialog) -> Option<PathBuf> {
+    dialog
         .set_title("Open a project")
         .add_filter("Project", &[PROJECT_EXTENSION])
         .pick_file()
@@ -3106,8 +3127,8 @@ async fn pick_project() -> Option<PathBuf> {
         .map(|file| file.path().to_path_buf())
 }
 
-async fn pick_film_path(name: String) -> Option<PathBuf> {
-    let chosen = rfd::AsyncFileDialog::new()
+async fn pick_film_path(dialog: rfd::AsyncFileDialog, name: String) -> Option<PathBuf> {
+    let chosen = dialog
         .set_title("Export a film")
         .add_filter("Film", &[FILM_EXTENSION])
         .set_file_name(format!("{name}.{FILM_EXTENSION}"))
@@ -3116,8 +3137,8 @@ async fn pick_film_path(name: String) -> Option<PathBuf> {
     Some(chosen.path().with_extension(FILM_EXTENSION))
 }
 
-async fn pick_save_path(name: String) -> Option<PathBuf> {
-    let chosen = rfd::AsyncFileDialog::new()
+async fn pick_save_path(dialog: rfd::AsyncFileDialog, name: String) -> Option<PathBuf> {
+    let chosen = dialog
         .set_title("Save the project")
         .add_filter("Project", &[PROJECT_EXTENSION])
         .set_file_name(format!("{name}.{PROJECT_EXTENSION}"))
@@ -3126,8 +3147,12 @@ async fn pick_save_path(name: String) -> Option<PathBuf> {
     Some(chosen.path().with_extension(PROJECT_EXTENSION))
 }
 
-async fn pick_compound_path(name: String, folder: Option<PathBuf>) -> Option<PathBuf> {
-    let mut dialog = rfd::AsyncFileDialog::new()
+async fn pick_compound_path(
+    dialog: rfd::AsyncFileDialog,
+    name: String,
+    folder: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let mut dialog = dialog
         .set_title("Save the compound clip as a project of its own")
         .add_filter("Project", &[PROJECT_EXTENSION])
         .set_file_name(format!("{name}.{PROJECT_EXTENSION}"));
@@ -3145,13 +3170,13 @@ async fn load_project(path: PathBuf) -> Result<(PathBuf, Timeline), String> {
     }
 }
 
-async fn pick_clips() -> Vec<PathBuf> {
+async fn pick_clips(dialog: rfd::AsyncFileDialog) -> Vec<PathBuf> {
     let both: Vec<&str> = VIDEO_EXTENSIONS
         .iter()
         .copied()
         .chain([PROJECT_EXTENSION])
         .collect();
-    rfd::AsyncFileDialog::new()
+    dialog
         .set_title("Add video clips or projects")
         .add_filter("Video or project", &both)
         .add_filter("Video", VIDEO_EXTENSIONS)
