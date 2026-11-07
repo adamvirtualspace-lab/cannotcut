@@ -14,8 +14,9 @@ use std::f32::consts::PI;
 use iced::gradient::Linear;
 use iced::theme::Palette;
 use iced::widget::button::{self, Button};
-use iced::widget::container;
-use iced::{Background, Border, Color, Element, Shadow, Theme};
+use iced::widget::text::{IntoFragment, Text};
+use iced::widget::{container, text};
+use iced::{Background, Border, Color, Element, Font, Shadow, Theme};
 
 /// Behind everything.
 pub const WINDOW: Color = Color::from_rgb8(0x10, 0x10, 0x14);
@@ -65,6 +66,26 @@ const WHITER: f32 = 0.08;
 const DARKER: f32 = 0.22;
 /// How much of the panel shows through a button that cannot be used now.
 const DISABLED_FADE: f32 = 0.55;
+
+/// Words on buttons with a face of their own, and dialog titles: Anton SC, Anton with small
+/// capitals for its lower-case letters.
+pub const DISPLAY: Font = Font::with_name("Anton SC");
+/// Small words: second lines, hints, notes, readouts. Antonio.
+pub const SMALL: Font = Font::with_name("Antonio");
+/// Every other word: names, values, timecodes, the timeline. Oswald, the app's default font,
+/// so that it looks the same on every system (without it, Windows shows Segoe UI).
+pub const BODY: Font = Font::with_name("Oswald");
+/// The fonts above, for the app to load at start (see `fonts/README.md`).
+pub const FONTS: [&[u8]; 3] = [
+    include_bytes!("../fonts/AntonSC-Regular.ttf"),
+    include_bytes!("../fonts/Antonio-Regular.ttf"),
+    include_bytes!("../fonts/Oswald-Regular.ttf"),
+];
+
+/// Words for a button with a face of its own, in [`DISPLAY`].
+pub fn display<'a>(words: impl IntoFragment<'a>) -> Text<'a> {
+    text(words).font(DISPLAY)
+}
 
 /// The theme of the whole app: the colours above, for the widgets drawn by iced.
 pub fn theme() -> Theme {

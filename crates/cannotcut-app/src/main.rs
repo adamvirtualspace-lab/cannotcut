@@ -138,7 +138,12 @@ const HEADER_WIDTH: f32 = 48.0;
 const EMPTY_PROJECT_RATE: Rate = Rate::new(30, 1);
 
 fn main() -> iced::Result {
-    iced::application(App::boot, App::update, App::view)
+    let app = theme::FONTS
+        .into_iter()
+        .fold(iced::application(App::boot, App::update, App::view), |app, font| {
+            app.font(font)
+        });
+    app.default_font(theme::BODY)
         .title(App::title)
         .subscription(App::subscription)
         .theme(|_: &App| theme::theme())
@@ -965,7 +970,10 @@ impl App {
                     Some(path) => path.clone(),
                     None => {
                         let name = timeline.name.clone();
-                        return ask(move |dialog| pick_save_path(dialog, name), Message::LeaveSaveChosen);
+                        return ask(
+                            move |dialog| pick_save_path(dialog, name),
+                            Message::LeaveSaveChosen,
+                        );
                     }
                 },
             };
@@ -2646,17 +2654,17 @@ impl App {
         };
         let busy = self.leave_saving;
         let card = column![
-            text(title).size(DIALOG_TITLE_SIZE),
-            text(about),
+            text(title).size(DIALOG_TITLE_SIZE).font(theme::DISPLAY),
+            text(about).font(theme::SMALL),
             row![
-                button("Save")
+                button(theme::display("Save"))
                     .style(theme::primary)
                     .on_press_maybe((!busy).then_some(Message::LeaveSave)),
-                button("Don't save")
+                button(theme::display("Don't save"))
                     .style(theme::danger)
                     .on_press_maybe((!busy).then_some(Message::LeaveDiscard)),
                 space().width(Fill),
-                button("Cancel")
+                button(theme::display("Cancel"))
                     .style(theme::normal)
                     .on_press_maybe((!busy).then_some(Message::LeaveCancel)),
             ]
@@ -2707,14 +2715,15 @@ impl App {
             count => format!("Compound clip of {count} clips"),
         };
         let choice = |name: &'static str, about: &'static str, keep: Keep| {
-            button(column![text(name), text(about).size(STATUS_TEXT_SIZE)].spacing(2))
+            let about = text(about).size(STATUS_TEXT_SIZE).font(theme::SMALL);
+            button(column![theme::display(name), about].spacing(2))
                 .width(Fill)
                 .padding([8, 12])
                 .style(theme::normal)
                 .on_press(Message::CompoundKept(keep))
         };
         let card = column![
-            text(title).size(DIALOG_TITLE_SIZE),
+            text(title).size(DIALOG_TITLE_SIZE).font(theme::DISPLAY),
             choice(
                 "Linked file",
                 "An .otio of its own; changes show wherever it is used",
@@ -2725,7 +2734,7 @@ impl App {
                 "Kept in this project's file, for this clip alone",
                 Keep::Inside
             ),
-            button("Cancel")
+            button(theme::display("Cancel"))
                 .on_press(Message::CompoundClosed)
                 .style(theme::normal),
         ]
@@ -2763,12 +2772,12 @@ impl App {
             None => "Working out the size".to_string(),
         };
         let choice = |label: &'static str, list: Element<'static, Message>| {
-            row![text(label).width(DIALOG_LABEL_WIDTH), list]
+            row![text(label).font(theme::SMALL).width(DIALOG_LABEL_WIDTH), list]
                 .spacing(12)
                 .align_y(Center)
         };
         let card = column![
-            text("Export").size(DIALOG_TITLE_SIZE),
+            text("Export").size(DIALOG_TITLE_SIZE).font(theme::DISPLAY),
             choice(
                 "Resolution",
                 pick_list(
@@ -2783,12 +2792,14 @@ impl App {
                 pick_list(&Quality::CHOICES[..], Some(options.quality), Message::ExportQuality)
                     .into()
             ),
-            text(about).size(STATUS_TEXT_SIZE),
+            text(about).size(STATUS_TEXT_SIZE).font(theme::SMALL),
             row![
-                button("Cancel")
+                button(theme::display("Cancel"))
                     .on_press(Message::ExportClosed)
                     .style(theme::normal),
-                button("Export").style(theme::primary).on_press(Message::ExportRequested),
+                button(theme::display("Export"))
+                    .style(theme::primary)
+                    .on_press(Message::ExportRequested),
             ]
             .spacing(12),
         ]
@@ -2829,7 +2840,7 @@ impl App {
             .encoder
             .map_or(String::new(), |encoder| format!(" with {encoder}"));
         let words = format!("Exporting {:.0}%{left}{encoder}", share * 100.0);
-        let cancel = || button("Cancel export").on_press(Message::ExportCancelled);
+        let cancel = || button(theme::display("Cancel export")).on_press(Message::ExportCancelled);
         let bar = |length: f32| {
             progress_bar(0.0..=1.0, share)
                 .length(length)
@@ -3017,7 +3028,9 @@ fn hint_at<'a>(
 ) -> Element<'a, Message> {
     tooltip(
         control,
-        container(text(words).size(STATUS_TEXT_SIZE)).padding(6).style(theme::card),
+        container(text(words).size(STATUS_TEXT_SIZE).font(theme::SMALL))
+            .padding(6)
+            .style(theme::card),
         position,
     )
     .gap(4)

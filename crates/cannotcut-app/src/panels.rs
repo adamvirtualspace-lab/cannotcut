@@ -462,7 +462,8 @@ impl App {
                 .spacing(ROW_SPACING)
                 .align_y(Center);
             if unsaved && path_room >= self.path_least_width() {
-                path = path.push(text(note).size(DETAIL_TEXT_SIZE).color(theme::TEXT_DIM));
+                let note = text(note).size(DETAIL_TEXT_SIZE).font(theme::SMALL);
+                path = path.push(note.color(theme::TEXT_DIM));
             }
             container(path).clip(true).into()
         })
@@ -666,11 +667,16 @@ impl App {
             };
             let entry = column![
                 one_line(name),
-                one_line(format!("{kind}{length}{used}"))
-                    .style(|_| container::Style {
-                        text_color: Some(theme::TEXT_DIM),
-                        ..container::Style::default()
-                    }),
+                container(
+                    text(format!("{kind}{length}{used}"))
+                        .font(theme::SMALL)
+                        .wrapping(text::Wrapping::None),
+                )
+                .clip(true)
+                .style(|_| container::Style {
+                    text_color: Some(theme::TEXT_DIM),
+                    ..container::Style::default()
+                }),
             ]
             .spacing(2);
             let entry = row![icon(which, ENTRY_ICON_SIZE, theme::TEXT_DIM), entry]
@@ -716,9 +722,9 @@ impl App {
                 let about = column![
                     section(format!("{count} clips selected")),
                     text("Compound makes them one clip, which can be stepped inside.")
-                        .size(DETAIL_TEXT_SIZE)
+                        .size(DETAIL_TEXT_SIZE).font(theme::SMALL)
                         .color(theme::TEXT_DIM),
-                    button("Compound").on_press(Message::CompoundOpened),
+                    button(theme::display("Compound")).on_press(Message::CompoundOpened),
                 ]
                 .spacing(PANEL_PADDING)
                 .padding(PANEL_PADDING);
@@ -755,12 +761,12 @@ impl App {
         }
         if clip.media.project.is_some() {
             let inside = Message::StepInside(clip.id);
-            rows = rows.push(button("Step inside").on_press(inside));
+            rows = rows.push(button(theme::display("Step inside")).on_press(inside));
         }
         let transform = column![
             section("Transform".to_string()),
             text("Scale, position, rotation and opacity come with layered video.")
-                .size(DETAIL_TEXT_SIZE)
+                .size(DETAIL_TEXT_SIZE).font(theme::SMALL)
                 .color(theme::TEXT_DIM),
         ]
         .spacing(8);
@@ -814,7 +820,7 @@ impl App {
             detail("Length", timecode(timeline.duration(), rate)),
             detail("Tracks", timeline.tracks().len().to_string()),
             text("Select a clip to see its details.")
-                .size(DETAIL_TEXT_SIZE)
+                .size(DETAIL_TEXT_SIZE).font(theme::SMALL)
                 .color(theme::TEXT_DIM),
         ]
         .spacing(8)
@@ -858,13 +864,13 @@ impl App {
     fn status_line(&self) -> Element<'_, Message> {
         let notice = self.notice.clone().map(|notice| {
             text(notice)
-                .size(STATUS_TEXT_SIZE)
+                .size(STATUS_TEXT_SIZE).font(theme::SMALL)
                 .color(theme::DANGER)
                 .wrapping(text::Wrapping::None)
         });
         let readout = container(
             text(self.readout())
-                .size(STATUS_TEXT_SIZE)
+                .size(STATUS_TEXT_SIZE).font(theme::SMALL)
                 .color(theme::TEXT_DIM)
                 .wrapping(text::Wrapping::None),
         )
@@ -884,7 +890,7 @@ fn tab_row<'a, const N: usize>(
     tabs: [(&'static str, bool, Message); N],
 ) -> Element<'a, Message> {
     let tabs = tabs.into_iter().map(|(words, chosen, choose)| {
-        button(text(words).size(TAB_TEXT_SIZE))
+        button(text(words).size(TAB_TEXT_SIZE).font(theme::SMALL))
             .padding([6, 8])
             .style(theme::tab(chosen))
             .on_press(choose)
@@ -901,7 +907,7 @@ fn tab_row<'a, const N: usize>(
 
 /// A panel's word on what is not built yet.
 fn coming<'a>(words: &'a str) -> Element<'a, Message> {
-    container(text(words).size(DETAIL_TEXT_SIZE).color(theme::TEXT_DIM))
+    container(text(words).size(DETAIL_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM))
         .padding(PANEL_PADDING)
         .into()
 }
@@ -917,7 +923,7 @@ fn section<'a>(words: String) -> Element<'a, Message> {
 fn detail<'a>(label: &'a str, value: String) -> Element<'a, Message> {
     row![
         text(label)
-            .size(DETAIL_TEXT_SIZE)
+            .size(DETAIL_TEXT_SIZE).font(theme::SMALL)
             .color(theme::TEXT_DIM)
             .width(DETAIL_LABEL_WIDTH),
         one_line(value),
@@ -935,7 +941,7 @@ fn rule<'a>() -> Element<'a, Message> {
 
 /// An icon in `ink` and words beside it, to put on a button.
 pub(crate) fn labelled<'a>(which: Icon, words: &'a str, ink: Color) -> Element<'a, Message> {
-    row![glyph(which, ink), text(words)]
+    row![glyph(which, ink), theme::display(words)]
         .spacing(ICON_GAP)
         .align_y(Center)
         .into()
@@ -987,7 +993,10 @@ fn icon_tab_row<'a, const N: usize>(
         let face: Element<'a, Message> = if named {
             column![
                 icon(which, ICON_TAB_ICON_SIZE, ink),
-                text(words).size(ICON_TAB_TEXT_SIZE).wrapping(text::Wrapping::None),
+                text(words)
+                    .size(ICON_TAB_TEXT_SIZE)
+                    .font(theme::SMALL)
+                    .wrapping(text::Wrapping::None),
             ]
             .spacing(2)
             .align_x(Center)
