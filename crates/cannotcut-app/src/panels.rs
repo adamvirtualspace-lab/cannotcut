@@ -1,14 +1,19 @@
 //! The parts of the window, laid out as in most editors: a bar along the top, the media on the
 //! left, the viewer in the middle, the selected clip's details on the right, and the timeline
-//! along the bottom under its tools. On a narrow window the side panels slide out over the
-//! viewer instead, from buttons in the top bar. The dividers between the panels can be dragged
-//! to give one more room and its neighbour less; double-clicking one puts it back.
+//! along the bottom under its tools. In a wide window the panels are docked (see `dock`): each
+//! can be taken up by its title bar and dropped beside or in place of another, and the gaps
+//! between them dragged to share the room differently. In a narrow window the side panels slide
+//! out over the viewer instead, from buttons in the top bar, and the gap over the timeline can
+//! be dragged; double-clicking it puts it back.
+
+use std::cell::Cell;
 
 use super::*;
+use crate::dock::Part;
 use crate::icons::{ICON_BUTTON_WIDTH, ICON_GAP, ICON_SIZE, Icon, glyph, icon, ink};
 use cannotcut_timeline::{Clip, Item};
-use iced::widget::{Row, column, row, scrollable, stack};
-use iced::{Point, mouse};
+use iced::widget::{Row, column, pane_grid, row, scrollable, stack};
+use iced::{Padding, Point, Rectangle, mouse};
 
 /// The bar along the top of the window.
 const TOP_BAR_HEIGHT: f32 = 44.0;
@@ -17,10 +22,11 @@ const GUTTER: f32 = 4.0;
 /// How wide the side panels start out, and go back to when their divider is double-clicked.
 pub(crate) const MEDIA_WIDTH: f32 = 260.0;
 pub(crate) const DETAILS_WIDTH: f32 = 300.0;
-/// The narrowest a side panel is dragged to.
-const MIN_SIDE_WIDTH: f32 = 200.0;
-/// The narrowest the side panels leave the viewer.
-const MIN_VIEWER_WIDTH: f32 = 320.0;
+/// The least a docked panel is made, across or down.
+const MIN_PANE: f32 = 120.0;
+/// The least of a docked panel's title bar left free beside its tabs, title or tools: where it
+/// is taken up by, to move it.
+const GRAB_ROOM: f32 = 32.0;
 /// The least the timeline leaves the panels above it.
 const MIN_UPPER_HEIGHT: f32 = 120.0;
 /// The shortest the timeline is dragged to: the ruler and two lanes.
@@ -29,7 +35,7 @@ const MIN_TIMELINE_HEIGHT: f32 = RULER_HEIGHT + LANE_GAP + 2.0 * (LANE_HEIGHT + 
 const DIVIDER_REACH: f32 = 4.0;
 /// The line drawn in a divider the pointer is over, or that is being dragged.
 const DIVIDER_LINE: f32 = 2.0;
-/// Narrower than this, the side panels slide out instead of standing beside the viewer.
+/// Narrower than this, the side panels slide out instead of being docked.
 const DOCKED_WIDTH: f32 = 1000.0;
 /// The bar of tools above the tracks.
 const TOOLS_HEIGHT: f32 = 40.0;
@@ -57,14 +63,10 @@ const SECTION_TEXT_SIZE: f32 = 15.0;
 const DRAWER_MARGIN: f32 = 48.0;
 const MENU_LABEL: &str = "Menu";
 
-/// A divider between panels.
+/// A divider between panels in a narrow window; docked panels have the dock's own.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Divider {
-    /// Between the media panel and the viewer.
-    Media,
-    /// Between the viewer and the details panel.
-    Details,
-    /// Between the panels above and the timeline.
+    /// Between the viewer and the timeline.
     Timeline,
 }
 
@@ -143,6 +145,17 @@ fn most_timeline(window_height: f32) -> f32 {
     (window_height - fixed - MIN_UPPER_HEIGHT).max(MIN_TIMELINE_HEIGHT)
 }
 
+/// The panels under the top bar, and where the tools' menu opens.
+struct Middle<'a> {
+    panels: Element<'a, Message>,
+    tools_menu: Vec<(String, Option<Message>)>,
+    /// Puts the tools' menu in place in a layer over the window, from its top or its bottom.
+    tools_menu_place: Padding,
+    tools_menu_from_bottom: bool,
+    /// Layers over the page: the divider of a narrow window.
+    dividers: Vec<Element<'a, Message>>,
+}
+
 /// `element` with its top left corner at `left`, `top` in a layer over the window.
 fn placed<'a>(element: Element<'a, Message>, left: f32, top: f32) -> Element<'a, Message> {
     container(element)
@@ -157,8 +170,8 @@ fn placed<'a>(element: Element<'a, Message>, left: f32, top: f32) -> Element<'a,
 }
 
 impl App {
-    /// The timeline takes the share of the window it was dragged to, or else as its tracks want; either way it
-    /// leaves the panels above it some room.
+    /// In a narrow window, the timeline takes the share of the window it was dragged to, or
+    /// else as its tracks want; either way it leaves the viewer above it some room.
     fn heights(&self, window: Size) -> Heights {
         let wanted = self.timeline_share.map_or_else(
             || self.panel_height(window.height),
@@ -174,40 +187,11 @@ impl App {
         }
     }
 
-    /// How wide the media and details panels stand beside the viewer in `room`: as dragged,
-    /// unless that leaves the viewer too little, when both give way in proportion to what they
-    /// have over their least.
-    fn side_widths(&self, room: f32) -> (f32, f32) {
-        let spare = (room - 2.0 * GUTTER - MIN_VIEWER_WIDTH).max(2.0 * MIN_SIDE_WIDTH);
-        let mut media = self.media_width.max(MIN_SIDE_WIDTH);
-        let mut details = self.details_width.max(MIN_SIDE_WIDTH);
-        let over = media + details - spare;
-        if over > 0.0 {
-            let media_over = media - MIN_SIDE_WIDTH;
-            let details_over = details - MIN_SIDE_WIDTH;
-            let total = media_over + details_over;
-            media -= over * media_over / total;
-            details -= over * details_over / total;
-        }
-        (media, details)
-    }
-
     /// `divider` dragged to `at` in a window of size `window`: the panels either side take
     /// their new sizes, as far as they can.
     pub(super) fn divider_dragged(&mut self, divider: Divider, at: Point, window: Size) {
-        let room = window.width - 2.0 * GUTTER;
-        let (media, details) = self.side_widths(room);
-        let most_side =
-            |other: f32| (room - 2.0 * GUTTER - MIN_VIEWER_WIDTH - other).max(MIN_SIDE_WIDTH);
         // The pointer is in the middle of the gap.
         match divider {
-            Divider::Media => {
-                self.media_width = (at.x - 1.5 * GUTTER).clamp(MIN_SIDE_WIDTH, most_side(details));
-            }
-            Divider::Details => {
-                self.details_width = (window.width - at.x - 1.5 * GUTTER)
-                    .clamp(MIN_SIDE_WIDTH, most_side(media));
-            }
             Divider::Timeline => {
                 let bottom = window.height - STATUS_HEIGHT - GUTTER;
                 let timeline = bottom - (at.y + GUTTER / 2.0) - TOOLS_HEIGHT;
@@ -220,7 +204,6 @@ impl App {
     /// A divider that can be dragged, `width` by `height`: a line shows in it while the
     /// pointer is over it, in the accent colour while it is being dragged.
     fn divider(&self, which: Divider, width: f32, height: f32) -> Element<'_, Message> {
-        let across = which != Divider::Timeline;
         let color = if self.dividing == Some(which) {
             theme::ACCENT
         } else if self.dividing.is_none() && self.divider_hover == Some(which) {
@@ -228,18 +211,10 @@ impl App {
         } else {
             Color::TRANSPARENT
         };
-        let line = if across {
-            space().width(DIVIDER_LINE).height(Fill)
-        } else {
-            space().width(Fill).height(DIVIDER_LINE)
-        };
+        let line = space().width(Fill).height(DIVIDER_LINE);
         let line = container(line).style(move |_| container::background(color));
         mouse_area(center(line).width(width).height(height))
-            .interaction(if across {
-                mouse::Interaction::ResizingHorizontally
-            } else {
-                mouse::Interaction::ResizingVertically
-            })
+            .interaction(mouse::Interaction::ResizingVertically)
             .on_press(Message::DividerPressed(which))
             // Here too, for a tap too quick for the listening that starts with the press.
             .on_release(Message::DividerReleased)
@@ -249,116 +224,54 @@ impl App {
             .into()
     }
 
-    /// The dividers over the gaps between the panels, each a layer of its own; a little wider
-    /// than the gaps, so that they are easier to take hold of.
-    fn dividers(
-        &self,
-        window: Size,
-        upper: f32,
-        sides: Option<(f32, f32)>,
-    ) -> Vec<Element<'_, Message>> {
+    /// The divider over the gap above the timeline of a narrow window, a layer of its own; a
+    /// little wider than the gap, so that it is easier to take hold of.
+    fn dividers(&self, window: Size, upper: f32) -> Vec<Element<'_, Message>> {
         let grip = GUTTER + 2.0 * DIVIDER_REACH;
         let upper_top = TOP_BAR_HEIGHT + GUTTER;
         let mut layers = Vec::new();
-        if let Some((media, details)) = sides {
-            let media_left = GUTTER + media - DIVIDER_REACH;
-            let details_left = window.width - 2.0 * GUTTER - details - DIVIDER_REACH;
-            layers.push(placed(self.divider(Divider::Media, grip, upper), media_left, upper_top));
-            layers.push(placed(
-                self.divider(Divider::Details, grip, upper),
-                details_left,
-                upper_top,
-            ));
-        }
         let across = self.divider(Divider::Timeline, window.width - 2.0 * GUTTER, grip);
         layers.push(placed(across, GUTTER, upper_top + upper - DIVIDER_REACH));
         if self.dividing.is_some() {
             // Over everything while dragging, so the pointer keeps its look wherever it goes
             // and nothing else answers it meanwhile.
-            let look = if self.dividing == Some(Divider::Timeline) {
-                mouse::Interaction::ResizingVertically
-            } else {
-                mouse::Interaction::ResizingHorizontally
-            };
+            let look = mouse::Interaction::ResizingVertically;
             layers.push(mouse_area(space().width(Fill).height(Fill)).interaction(look).into());
         }
         layers
     }
 
-    /// Everything, laid out for a window of this size in logical pixels: the timeline takes the
-    /// height its tracks want up to a share of the window's, the panels above it the rest.
+    /// Everything, laid out for a window of this size in logical pixels.
     pub(super) fn layout(&self, window: Size) -> Element<'_, Message> {
         let docked = window.width >= DOCKED_WIDTH;
-        let heights = self.heights(window);
         let room = window.width - 2.0 * GUTTER;
         let top = self.top_bar(room - 2.0 * BAR_PADDING, docked);
         let top = container(top.row)
             .padding([0.0, BAR_PADDING])
             .height(TOP_BAR_HEIGHT)
             .center_y(TOP_BAR_HEIGHT);
-
-        let sides = docked.then(|| self.side_widths(room));
-        let viewer_room = match sides {
-            Some((media, details)) => room - media - details - 2.0 * GUTTER,
-            None => room,
+        let Middle {
+            panels,
+            tools_menu,
+            tools_menu_place,
+            tools_menu_from_bottom,
+            dividers,
+        } = if docked {
+            self.docked(window)
+        } else {
+            self.stacked(window)
         };
-        let viewer = self.viewer_panel(viewer_room, heights.upper >= TITLE_ROOM);
-        let upper: Element<'_, Message> = match sides {
-            Some((media, details)) => row![
-                self.media_panel(media).width(media),
-                viewer,
-                self.details_panel().width(details),
-            ]
-            .spacing(GUTTER)
-            .into(),
-            None => viewer,
-        };
-
-        let tools = self.tools(room - 2.0 * BAR_PADDING);
-        let tools_bar = container(tools.row)
-            .padding([0.0, BAR_PADDING])
-            .width(Fill)
-            .height(TOOLS_HEIGHT)
-            .center_y(TOOLS_HEIGHT)
-            .style(theme::bar);
-        let timeline = self.history.timeline();
-        let shown = self
-            .preview
-            .as_ref()
-            .map_or(timeline, |preview| &preview.timeline);
-        let panel = timeline_panel(
-            timeline,
-            shown,
-            self.playhead,
-            self.timeline_view,
-            &self.selected,
-            &self.waveforms,
-            Message::Timeline,
-        )
-        .selecting(self.selecting)
-        .height(heights.timeline);
-        let lower = container(column![
-            tools_bar,
-            row![self.track_headers(heights.timeline), panel],
-        ])
-        .style(theme::panel);
-
-        let page = column![
-            top,
-            container(upper).padding([0.0, GUTTER]).height(Fill),
-            container(lower).padding([0.0, GUTTER]),
-            self.status_line(),
-        ]
-        .spacing(GUTTER);
+        let page = column![top, panels, self.status_line()].spacing(GUTTER);
         let page = container(page)
             .width(Fill)
             .height(Fill)
             .style(theme::window);
         let mut layers: Vec<Element<'_, Message>> = vec![page.into()];
-        layers.extend(self.dividers(window, heights.upper, sides));
+        layers.extend(dividers);
 
         // A side panel slid out over the viewer; tapping beside it puts it away.
         if let Some(side) = self.drawer.filter(|_| !docked) {
+            let heights = self.heights(window);
             let most = window.width - DRAWER_MARGIN;
             let (panel, width) = match side {
                 Side::Media => {
@@ -385,30 +298,27 @@ impl App {
             layers.push(placed.into());
         }
 
-        // The main menu opens under its button; the tools' menu just over their bar.
+        // The main menu opens under its button; the tools' menu by their bar.
         let menu = match self.more {
-            Some(Bar::Menu) => Some((self.main_menu(), BAR_PADDING, Bar::Menu)),
-            Some(Bar::Tools) if !tools.menu.is_empty() => {
-                Some((tools.menu, BAR_PADDING + tools.menu_x, Bar::Tools))
+            Some(Bar::Menu) => {
+                let place = Padding {
+                    top: TOP_BAR_HEIGHT - BAR_PADDING + MENU_GAP,
+                    left: GUTTER + BAR_PADDING,
+                    ..Padding::ZERO
+                };
+                Some((self.main_menu(), place, false))
+            }
+            Some(Bar::Tools) if !tools_menu.is_empty() => {
+                Some((tools_menu, tools_menu_place, tools_menu_from_bottom))
             }
             _ => None,
         };
-        if let Some((entries, x, bar)) = menu {
-            let left = GUTTER + x.min(room - MENU_WIDTH).max(0.0);
-            let card = more_menu(entries);
-            let placed = match bar {
-                Bar::Menu => container(card).padding(iced::Padding {
-                    top: TOP_BAR_HEIGHT - BAR_PADDING + MENU_GAP,
-                    left,
-                    ..iced::Padding::ZERO
-                }),
-                Bar::Tools => container(card)
-                    .padding(iced::Padding {
-                        bottom: STATUS_HEIGHT + GUTTER + heights.lower + MENU_GAP,
-                        left,
-                        ..iced::Padding::ZERO
-                    })
-                    .align_bottom(Fill),
+        if let Some((entries, place, from_bottom)) = menu {
+            let placed = container(more_menu(entries)).padding(place);
+            let placed = if from_bottom {
+                placed.align_bottom(Fill)
+            } else {
+                placed
             };
             let away = mouse_area(space().width(Fill).height(Fill)).on_press(Message::MoreClosed);
             layers.push(away.into());
@@ -424,6 +334,8 @@ impl App {
             Some((self.export_dialog(), Some(Message::ExportClosed)))
         } else if self.compound_dialog {
             Some((self.compound_dialog(), Some(Message::CompoundClosed)))
+        } else if let Some(page) = self.about {
+            Some((self.about_dialog(page, window), Some(Message::AboutClosed)))
         } else {
             None
         };
@@ -438,6 +350,116 @@ impl App {
             layers.push(center(opaque(card)).into());
         }
         Stack::with_children(layers).into()
+    }
+
+    /// The panels docked in a wide window, each with its title bar to take it up by.
+    fn docked(&self, window: Size) -> Middle<'_> {
+        let area = Size::new(
+            window.width - 2.0 * GUTTER,
+            window.height - TOP_BAR_HEIGHT - STATUS_HEIGHT - 2.0 * GUTTER,
+        );
+        let regions = self.dock.layout().pane_regions(GUTTER, MIN_PANE, area);
+        let timeline = self
+            .dock
+            .iter()
+            .find(|(_, part)| **part == Part::Timeline)
+            .and_then(|(pane, _)| regions.get(pane))
+            .copied()
+            .unwrap_or_else(|| Rectangle::with_size(area));
+        let tools = self.tools(timeline.width - 2.0 * BAR_PADDING - GRAB_ROOM);
+        // Taken by the timeline's pane, the one place it goes.
+        let tools_row = Cell::new(Some(Element::from(tools.row)));
+        let grid = pane_grid(&self.dock, |pane, part, _| {
+            let size = regions.get(&pane).map_or(area, |region| region.size());
+            let title_room = size.width - GRAB_ROOM;
+            let (title, body) = match part {
+                Part::Media => (self.media_tabs(title_room), self.media_body()),
+                Part::Viewer => (self.viewer_title(title_room), self.viewer_body(size.width)),
+                Part::Details => (self.details_title(), self.details_body()),
+                Part::Timeline => {
+                    let tools = tools_row.take().unwrap_or_else(|| space().into());
+                    let height = (size.height - TOOLS_HEIGHT).max(0.0);
+                    (tools_strip(tools), self.timeline_body(height))
+                }
+            };
+            // The title bar is taken up wherever its content is not.
+            let title = pane_grid::TitleBar::new(title).style(theme::bar);
+            pane_grid::Content::new(body)
+                .title_bar(title)
+                .style(theme::panel)
+        })
+        .spacing(GUTTER)
+        .min_size(MIN_PANE)
+        .on_drag(Message::PaneDragged)
+        .on_resize(DIVIDER_REACH, Message::PaneResized)
+        .style(theme::dock);
+        // Opening down from the tools, over the tracks, wherever the timeline is docked.
+        let menu_x = timeline.x + BAR_PADDING + tools.menu_x;
+        let tools_menu_place = Padding {
+            top: TOP_BAR_HEIGHT + GUTTER + timeline.y + TOOLS_HEIGHT + MENU_GAP,
+            left: GUTTER + menu_x.min(area.width - MENU_WIDTH).max(0.0),
+            ..Padding::ZERO
+        };
+        Middle {
+            panels: container(grid).padding([0.0, GUTTER]).height(Fill).into(),
+            tools_menu: tools.menu,
+            tools_menu_place,
+            tools_menu_from_bottom: false,
+            dividers: Vec::new(),
+        }
+    }
+
+    /// The viewer over the timeline in a narrow window: the timeline takes the share of the
+    /// window it was dragged to, or the height its tracks want, the viewer the rest.
+    fn stacked(&self, window: Size) -> Middle<'_> {
+        let heights = self.heights(window);
+        let room = window.width - 2.0 * GUTTER;
+        let viewer = self.viewer_panel(room, heights.upper >= TITLE_ROOM);
+        let tools = self.tools(room - 2.0 * BAR_PADDING);
+        let menu_x = BAR_PADDING + tools.menu_x;
+        let tools_menu_place = Padding {
+            bottom: STATUS_HEIGHT + GUTTER + heights.lower + MENU_GAP,
+            left: GUTTER + menu_x.min(room - MENU_WIDTH).max(0.0),
+            ..Padding::ZERO
+        };
+        let lower = container(column![
+            across(tools_strip(tools.row.into())),
+            self.timeline_body(heights.timeline),
+        ])
+        .style(theme::panel);
+        let panels = column![
+            container(viewer).padding([0.0, GUTTER]).height(Fill),
+            container(lower).padding([0.0, GUTTER]),
+        ]
+        .spacing(GUTTER);
+        Middle {
+            panels: panels.into(),
+            tools_menu: tools.menu,
+            tools_menu_place,
+            tools_menu_from_bottom: true,
+            dividers: self.dividers(window, heights.upper),
+        }
+    }
+
+    /// The tracks under the ruler, `height` tall, with their buttons beside them.
+    fn timeline_body(&self, height: f32) -> Element<'_, Message> {
+        let timeline = self.history.timeline();
+        let shown = self
+            .preview
+            .as_ref()
+            .map_or(timeline, |preview| &preview.timeline);
+        let panel = timeline_panel(
+            timeline,
+            shown,
+            self.playhead,
+            self.timeline_view,
+            &self.selected,
+            &self.waveforms,
+            Message::Timeline,
+        )
+        .selecting(self.selecting)
+        .height(height);
+        row![self.track_headers(height), panel].into()
     }
 
     /// The bar along the top, fitted to `room`: the menu, where the project is, the side
@@ -493,11 +515,13 @@ impl App {
             ("Open...".to_string(), Some(Message::OpenRequested)),
             ("Save".to_string(), Some(Message::SaveRequested)),
             ("Add clips...".to_string(), Some(Message::AddRequested)),
+            ("Reset panel layout".to_string(), Some(Message::DockReset)),
+            ("About and licences".to_string(), Some(Message::AboutOpened)),
         ]
     }
 
-    /// The picture, under a line on what it is and over the buttons to play it; `room` wide.
-    fn viewer_panel(&self, room: f32, titled: bool) -> Element<'_, Message> {
+    /// The picture, over the buttons to play it; `room` wide.
+    fn viewer_body(&self, room: f32) -> Element<'_, Message> {
         let timeline = self.history.timeline();
         let picture: Element<'_, Message> = match self.shown.as_ref().map(|shown| &shown.picture) {
             Some(Displayed::Yuv(planes)) => shader(planes).width(Fill).height(Fill).into(),
@@ -518,18 +542,26 @@ impl App {
         if self.viewer.is_none() {
             picture = stack![picture, renderer_probe(Message::RendererProbed)].into();
         }
+        column![picture, self.transport(room - 2.0 * BAR_PADDING)].into()
+    }
+
+    /// The line over the picture on what it shows, at most `room` wide.
+    fn viewer_title(&self, room: f32) -> Element<'_, Message> {
+        one_line(self.headline())
+            .padding([0.0, PANEL_PADDING])
+            .max_width(room.max(0.0))
+            .height(VIEWER_TITLE_HEIGHT)
+            .center_y(VIEWER_TITLE_HEIGHT)
+            .into()
+    }
+
+    /// The viewer as a panel of its own, `room` wide, with its title or without.
+    fn viewer_panel(&self, room: f32, titled: bool) -> Element<'_, Message> {
         let mut panel = column![];
         if titled {
-            let title = one_line(self.headline())
-                .padding([0.0, PANEL_PADDING])
-                .width(Fill)
-                .height(VIEWER_TITLE_HEIGHT)
-                .center_y(VIEWER_TITLE_HEIGHT)
-                .style(theme::bar);
-            panel = panel.push(title);
+            panel = panel.push(across(self.viewer_title(room)));
         }
-        panel = panel.push(picture).push(self.transport(room - 2.0 * BAR_PADDING));
-        container(panel)
+        container(panel.push(self.viewer_body(room)))
             .width(Fill)
             .height(Fill)
             .style(theme::panel)
@@ -601,21 +633,31 @@ impl App {
     /// and effects to add.
     /// `width` wide: the tabs' names go when there is no room for them.
     fn media_panel(&self, width: f32) -> container::Container<'_, Message> {
-        let tabs = icon_tab_row(
+        container(column![across(self.media_tabs(width)), self.media_body()])
+            .height(Fill)
+            .style(theme::panel)
+    }
+
+    /// The media panel's tabs, `width` wide.
+    fn media_tabs(&self, width: f32) -> Element<'_, Message> {
+        icon_tab_row(
             MediaTab::ALL.map(|tab| {
                 (tab.icon(), tab.name(), tab == self.media_tab, Message::MediaTabChosen(tab))
             }),
             width,
-        );
-        let body: Element<'_, Message> = match self.media_tab {
+        )
+    }
+
+    /// What the media panel's chosen tab shows.
+    fn media_body(&self) -> Element<'_, Message> {
+        match self.media_tab {
             MediaTab::Media => self.media_list(),
             MediaTab::Text => coming("Titles and text over the picture come in a later step."),
             MediaTab::Transitions => {
                 coming("Cross-fades and wipes between clips come in a later step.")
             }
             MediaTab::Effects => coming("Colour and filters come in a later step."),
-        };
-        container(column![tabs, body]).height(Fill).style(theme::panel)
+        }
     }
 
     /// The media files and projects the project uses, each once; pressing one selects the
@@ -701,22 +743,42 @@ impl App {
 
     /// The panel right of the viewer: the selected clip, the selected clips, or the project.
     fn details_panel(&self) -> container::Container<'_, Message> {
+        container(column![across(self.details_title()), self.details_body()])
+            .height(Fill)
+            .style(theme::panel)
+    }
+
+    /// Across the top of the details panel: the selected clip's tabs, or its name.
+    fn details_title(&self) -> Element<'_, Message> {
+        let timeline = self.history.timeline();
+        let one_clip = self.selected.len() == 1
+            && self.selected_clip().and_then(|id| timeline.clip(id)).is_some();
+        if one_clip {
+            tab_row(DetailsTab::ALL.map(|tab| {
+                (tab.name(), tab == self.details_tab, Message::DetailsTabChosen(tab))
+            }))
+        } else {
+            let name = text("Details").size(TAB_TEXT_SIZE).font(theme::SMALL);
+            container(name.color(theme::TEXT_DIM))
+                .padding([0.0, PANEL_PADDING])
+                .height(TAB_HEIGHT)
+                .center_y(TAB_HEIGHT)
+                .into()
+        }
+    }
+
+    /// What the details panel shows under its title.
+    fn details_body(&self) -> Element<'_, Message> {
         let timeline = self.history.timeline();
         let selected = self.selected_clip().and_then(|id| timeline.clip(id));
-        let body: Element<'_, Message> = match (self.selected.len(), selected) {
-            (1, Some((track, clip, start))) => {
-                let tabs = tab_row(DetailsTab::ALL.map(|tab| {
-                    (tab.name(), tab == self.details_tab, Message::DetailsTabChosen(tab))
-                }));
-                let body = match self.details_tab {
-                    DetailsTab::Video => self.clip_details(clip, start),
-                    DetailsTab::Audio => self.clip_sound(track),
-                    DetailsTab::Speed => {
-                        coming("Faster, slower and reversed clips come in a later step.")
-                    }
-                };
-                column![tabs, body].into()
-            }
+        match (self.selected.len(), selected) {
+            (1, Some((track, clip, start))) => match self.details_tab {
+                DetailsTab::Video => self.clip_details(clip, start),
+                DetailsTab::Audio => self.clip_sound(track),
+                DetailsTab::Speed => {
+                    coming("Faster, slower and reversed clips come in a later step.")
+                }
+            },
             (0, _) => self.project_details(),
             (count, _) => {
                 let about = column![
@@ -730,8 +792,7 @@ impl App {
                 .padding(PANEL_PADDING);
                 about.into()
             }
-        };
-        container(body).height(Fill).style(theme::panel)
+        }
     }
 
     /// What the selected clip is.
@@ -885,6 +946,20 @@ impl App {
     }
 }
 
+/// The `tools` above the tracks, as tall as their bar.
+fn tools_strip(tools: Element<'_, Message>) -> Element<'_, Message> {
+    container(tools)
+        .padding([0.0, BAR_PADDING])
+        .height(TOOLS_HEIGHT)
+        .center_y(TOOLS_HEIGHT)
+        .into()
+}
+
+/// `content` on a bar across the top of a panel.
+fn across(content: Element<'_, Message>) -> Element<'_, Message> {
+    container(content).width(Fill).style(theme::bar).into()
+}
+
 /// A row of tabs across the top of a panel: words, whether chosen, what choosing does.
 fn tab_row<'a, const N: usize>(
     tabs: [(&'static str, bool, Message); N],
@@ -898,10 +973,8 @@ fn tab_row<'a, const N: usize>(
     });
     container(Row::with_children(tabs).spacing(2).align_y(Center))
         .padding([0.0, 4.0])
-        .width(Fill)
         .height(TAB_HEIGHT)
         .center_y(TAB_HEIGHT)
-        .style(theme::bar)
         .into()
 }
 
@@ -1012,10 +1085,8 @@ fn icon_tab_row<'a, const N: usize>(
     });
     container(Row::with_children(tabs).spacing(ICON_TAB_SPACING).align_y(Center))
         .padding([0.0, 4.0])
-        .width(Fill)
         .height(ICON_TAB_HEIGHT)
         .center_y(ICON_TAB_HEIGHT)
         .clip(true)
-        .style(theme::bar)
         .into()
 }

@@ -15,7 +15,7 @@ use iced::gradient::Linear;
 use iced::theme::Palette;
 use iced::widget::button::{self, Button};
 use iced::widget::text::{IntoFragment, Text};
-use iced::widget::{container, text};
+use iced::widget::{container, pane_grid, text};
 use iced::{Background, Border, Color, Element, Font, Shadow, Theme};
 
 /// Behind everything.
@@ -240,6 +240,29 @@ pub fn tab(chosen: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
             }
         }
         style
+    }
+}
+
+/// Docked panels: where a panel being moved would go, in the accent colour, and the gaps
+/// between panels as the dividers of a narrow window show them.
+pub fn dock(_: &Theme) -> pane_grid::Style {
+    pane_grid::Style {
+        hovered_region: pane_grid::Highlight {
+            background: Background::Color(Color { a: 0.25, ..ACCENT }),
+            border: Border {
+                color: ACCENT,
+                width: 2.0,
+                radius: 0.0.into(),
+            },
+        },
+        picked_split: pane_grid::Line {
+            color: ACCENT,
+            width: 2.0,
+        },
+        hovered_split: pane_grid::Line {
+            color: DIVIDER_HOVER,
+            width: 2.0,
+        },
     }
 }
 

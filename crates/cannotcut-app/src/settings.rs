@@ -15,15 +15,18 @@ const LAYOUT: &str = "layout";
 const MEDIA_WIDTH: &str = "media_width";
 const DETAILS_WIDTH: &str = "details_width";
 const TIMELINE_SHARE: &str = "timeline_share";
+const DOCK: &str = "dock";
 
-/// How the panels were sized; none where they were left as they start.
-#[derive(Clone, Copy, Default)]
+/// How the panels were sized and arranged; none where they were left as they start.
+#[derive(Clone, Default)]
 pub struct Layout {
-    /// In logical pixels.
+    /// How wide the side panels slide out in a narrow window, in logical pixels.
     pub media_width: Option<f32>,
     pub details_width: Option<f32>,
-    /// The share of the window's height the timeline takes, from 0 to 1.
+    /// The share of a narrow window's height the timeline takes, from 0 to 1.
     pub timeline_share: Option<f32>,
+    /// How the panels are docked in a wide window, as `dock::to_value` keeps it.
+    pub dock: Option<Value>,
 }
 
 #[derive(Default)]
@@ -68,6 +71,7 @@ impl Settings {
                 media_width: size(MEDIA_WIDTH),
                 details_width: size(DETAILS_WIDTH),
                 timeline_share: size(TIMELINE_SHARE).filter(|share| *share < 1.0),
+                dock: layout.get(DOCK).cloned(),
             };
         }
         settings
@@ -99,6 +103,9 @@ impl Settings {
         if let Some(share) = self.layout.timeline_share {
             let share = (f64::from(share) * 1000.0).round() / 1000.0;
             layout.insert(TIMELINE_SHARE.to_string(), json!(share));
+        }
+        if let Some(dock) = &self.layout.dock {
+            layout.insert(DOCK.to_string(), dock.clone());
         }
         save(LAYOUT, Value::Object(layout));
     }

@@ -1,6 +1,8 @@
 //! cannotcut: a timeline of clips that can be rearranged, trimmed, cut and played with their
 //! sound, a viewer showing the frame under the playhead, and live latency and memory readouts.
 
+mod about;
+mod dock;
 mod fit;
 mod icons;
 mod panels;
@@ -28,7 +30,7 @@ use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
 use iced::futures::channel::oneshot;
 use iced::widget::{
-    Column, Stack, center, column, container, image, mouse_area, opaque, pick_list,
+    Column, Stack, center, column, container, image, mouse_area, opaque, pane_grid, pick_list,
     progress_bar, responsive, row, sensor, shader, slider, space, text, tooltip,
 };
 use iced::{
@@ -36,6 +38,8 @@ use iced::{
 };
 use iced::widget::button::{self};
 use iced_runtime::image::{Allocation, allocate};
+use about::{ABOUT_SCROLL, AboutPage};
+use dock::Part;
 use fit::{Control, Fitted, button_width, fit, text_width};
 use icons::{ICON_BUTTON_WIDTH, Icon};
 use panels::{DETAILS_WIDTH, DetailsTab, Divider, MEDIA_WIDTH, MediaTab, Side, icon_button,
@@ -174,6 +178,11 @@ enum Message {
     /// Show the export choices.
     ExportOpened,
     ExportClosed,
+    /// The About card opened from the menu.
+    AboutOpened,
+    /// A page of the About card.
+    AboutShown(AboutPage),
+    AboutClosed,
     ExportResolution(Resolution),
     ExportQuality(Quality),
     /// The choices are made: ask where the film goes.
@@ -277,6 +286,14 @@ enum Message {
     DividerReset(Divider),
     /// The divider the pointer is over, if any.
     DividerHovered(Option<Divider>),
+    /// A docked panel taken up by its title bar, and dropped.
+    PaneDragged(pane_grid::DragEvent),
+    /// The gap between docked panels dragged.
+    PaneResized(pane_grid::ResizeEvent),
+    /// The gap between docked panels let go of.
+    DockSettled,
+    /// The docked panels put back as they start.
+    DockReset,
     Key(keyboard::Event),
     MemoryTick,
 }
@@ -613,6 +630,8 @@ struct App {
     exporting: Option<Exporting>,
     /// The export choices are on show.
     export_dialog: bool,
+    /// The About card, while it is open.
+    about: Option<AboutPage>,
     /// The choice of how to keep a compound clip is on show.
     compound_dialog: bool,
     /// The clips a linked compound clip is being made of, while its file is chosen.
@@ -631,8 +650,12 @@ struct App {
     drawer: Option<Side>,
     media_tab: MediaTab,
     details_tab: DetailsTab,
-    /// How wide the side panels were dragged to, and the share of the window's height the
-    /// timeline was; with no share it is as tall as its tracks want.
+    /// How the panels are docked in a wide window.
+    dock: pane_grid::State<Part>,
+    /// A gap between docked panels is being dragged.
+    dock_resizing: bool,
+    /// How wide the side panels slide out in a narrow window, and the share of its height the
+    /// timeline was dragged to; with no share it is as tall as its tracks want.
     media_width: f32,
     details_width: f32,
     timeline_share: Option<f32>,
@@ -774,6 +797,7 @@ impl App {
             volume_drag: None,
             exporting: None,
             export_dialog: false,
+            about: None,
             compound_dialog: false,
             compounding: Vec::new(),
             compound_file: None,
@@ -784,6 +808,8 @@ impl App {
             drawer: None,
             media_tab: MediaTab::default(),
             details_tab: DetailsTab::default(),
+            dock: dock::starting(),
+            dock_resizing: false,
             media_width: MEDIA_WIDTH,
             details_width: DETAILS_WIDTH,
             timeline_share: None,
@@ -822,7 +848,10 @@ impl App {
             }
         }
         app.playhead = playhead;
-        let layout = app.settings.layout;
+        let layout = app.settings.layout.clone();
+        if let Some(kept) = layout.dock.as_ref().and_then(dock::from_value) {
+            app.dock = kept;
+        }
         app.media_width = layout.media_width.unwrap_or(MEDIA_WIDTH);
         app.details_width = layout.details_width.unwrap_or(DETAILS_WIDTH);
         app.timeline_share = layout.timeline_share;
@@ -1687,13 +1716,30 @@ impl App {
             Message::DividerReset(divider) => {
                 self.dividing = None;
                 match divider {
-                    Divider::Media => self.media_width = MEDIA_WIDTH,
-                    Divider::Details => self.details_width = DETAILS_WIDTH,
                     Divider::Timeline => self.timeline_share = None,
                 }
                 self.keep_layout();
             }
             Message::DividerHovered(divider) => self.divider_hover = divider,
+            Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
+                self.dock.drop(pane, target);
+                self.keep_layout();
+            }
+            Message::PaneDragged(_) => {}
+            Message::PaneResized(resized) => {
+                self.dock.resize(resized.split, resized.ratio);
+                self.dock_resizing = true;
+            }
+            Message::DockSettled => {
+                if std::mem::take(&mut self.dock_resizing) {
+                    self.keep_layout();
+                }
+            }
+            Message::DockReset => {
+                self.more = None;
+                self.dock = dock::starting();
+                self.keep_layout();
+            }
             Message::ProjectChosen(Some(path)) => {
                 return Task::perform(load_project(path), Message::ProjectLoaded);
             }
@@ -1709,6 +1755,18 @@ impl App {
                 }
             }
             Message::ExportClosed => self.export_dialog = false,
+            Message::AboutOpened => {
+                self.more = None;
+                self.about = Some(AboutPage::List);
+            }
+            Message::AboutShown(page) => {
+                self.about = Some(page);
+                return iced_runtime::widget::operation::snap_to(
+                    ABOUT_SCROLL,
+                    iced_runtime::widget::operation::RelativeOffset::START,
+                );
+            }
+            Message::AboutClosed => self.about = None,
             Message::ExportResolution(resolution) => self.settings.export.resolution = resolution,
             Message::ExportQuality(quality) => self.settings.export.quality = quality,
             Message::PictureSized(target, size) => {
@@ -1993,6 +2051,7 @@ impl App {
                         Some(Message::DrawerClosed)
                     }
                     Some(key::Named::Escape) if self.export_dialog => Some(Message::ExportClosed),
+                    Some(key::Named::Escape) if self.about.is_some() => Some(Message::AboutClosed),
                     Some(key::Named::Escape) if self.compound_dialog => {
                         Some(Message::CompoundClosed)
                     }
@@ -2532,6 +2591,19 @@ impl App {
                 }
             }));
         }
+        if self.dock_resizing {
+            // Kept once the gap is let go of, not at every step of the drag.
+            subscriptions.push(iced::event::listen_with(|event, _status, _window| {
+                use iced::{Event, mouse, touch};
+                match event {
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                    | Event::Touch(
+                        touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. },
+                    ) => Some(Message::DockSettled),
+                    _ => None,
+                }
+            }));
+        }
         if self.playback.is_some() {
             // One tick for every frame the display shows.
             subscriptions.push(window::frames().map(|_| Message::PlayTick));
@@ -2543,12 +2615,13 @@ impl App {
         responsive(move |window| self.layout(window)).into()
     }
 
-    /// Remembers how the panels were sized, for next time.
+    /// Remembers how the panels were sized and arranged, for next time.
     fn keep_layout(&mut self) {
         self.settings.layout = settings::Layout {
             media_width: Some(self.media_width),
             details_width: Some(self.details_width),
             timeline_share: self.timeline_share,
+            dock: Some(dock::to_value(&self.dock)),
         };
         self.settings.save_layout();
     }
