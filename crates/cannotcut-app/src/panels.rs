@@ -27,6 +27,10 @@ const MIN_PANE: f32 = 120.0;
 /// The least of a docked panel's title bar left free beside its tabs, title or tools: where it
 /// is taken up by, to move it.
 const GRAB_ROOM: f32 = 32.0;
+/// The button on a docked panel's title bar that takes it into a window of its own.
+const POP_OUT_ICON_SIZE: f32 = 16.0;
+const POP_OUT_PADDING: f32 = 4.0;
+const POP_OUT_WIDTH: f32 = POP_OUT_ICON_SIZE + 2.0 * POP_OUT_PADDING + 2.0 * BAR_PADDING;
 /// The least the timeline leaves the panels above it.
 const MIN_UPPER_HEIGHT: f32 = 120.0;
 /// The shortest the timeline is dragged to: the ruler and two lanes.
@@ -75,6 +79,15 @@ pub(crate) enum Divider {
 pub(crate) enum Side {
     Media,
     Details,
+}
+
+impl Side {
+    fn part(self) -> Part {
+        match self {
+            Self::Media => Part::Media,
+            Self::Details => Part::Details,
+        }
+    }
 }
 
 /// What the media panel shows.
@@ -270,7 +283,7 @@ impl App {
         layers.extend(dividers);
 
         // A side panel slid out over the viewer; tapping beside it puts it away.
-        if let Some(side) = self.drawer.filter(|_| !docked) {
+        if let Some(side) = self.drawer.filter(|side| !docked && !self.is_away(side.part())) {
             let heights = self.heights(window);
             let most = window.width - DRAWER_MARGIN;
             let (panel, width) = match side {
@@ -369,12 +382,17 @@ impl App {
         let tools = self.tools(timeline.width - 2.0 * BAR_PADDING - GRAB_ROOM);
         // Taken by the timeline's pane, the one place it goes.
         let tools_row = Cell::new(Some(Element::from(tools.row)));
+        let can_leave = self.dock.len() > 1;
         let grid = pane_grid(&self.dock, |pane, part, _| {
             let size = regions.get(&pane).map_or(area, |region| region.size());
-            let title_room = size.width - GRAB_ROOM;
+            let leaves = can_leave && *part != Part::Timeline;
+            let title_room = size.width - GRAB_ROOM - if leaves { POP_OUT_WIDTH } else { 0.0 };
             let (title, body) = match part {
                 Part::Media => (self.media_tabs(title_room), self.media_body()),
-                Part::Viewer => (self.viewer_title(title_room), self.viewer_body(size.width)),
+                Part::Viewer => (
+                    self.viewer_title(title_room),
+                    self.viewer_body(size.width, None),
+                ),
                 Part::Details => (self.details_title(), self.details_body()),
                 Part::Timeline => {
                     let tools = tools_row.take().unwrap_or_else(|| space().into());
@@ -383,7 +401,17 @@ impl App {
                 }
             };
             // The title bar is taken up wherever its content is not.
-            let title = pane_grid::TitleBar::new(title).style(theme::bar);
+            let mut title = pane_grid::TitleBar::new(title).style(theme::bar);
+            if leaves {
+                let height = match part {
+                    Part::Media => ICON_TAB_HEIGHT,
+                    Part::Viewer => VIEWER_TITLE_HEIGHT,
+                    _ => TAB_HEIGHT,
+                };
+                title = title
+                    .controls(pane_grid::Controls::new(pop_out(*part, height)))
+                    .always_show_controls();
+            }
             pane_grid::Content::new(body)
                 .title_bar(title)
                 .style(theme::panel)
@@ -412,10 +440,34 @@ impl App {
     /// The viewer over the timeline in a narrow window: the timeline takes the share of the
     /// window it was dragged to, or the height its tracks want, the viewer the rest.
     fn stacked(&self, window: Size) -> Middle<'_> {
-        let heights = self.heights(window);
         let room = window.width - 2.0 * GUTTER;
-        let viewer = self.viewer_panel(room, heights.upper >= TITLE_ROOM);
         let tools = self.tools(room - 2.0 * BAR_PADDING);
+        if self.is_away(Part::Viewer) {
+            // The timeline has the window to itself.
+            let height = (window.height - TOP_BAR_HEIGHT - STATUS_HEIGHT - 2.0 * GUTTER
+                - TOOLS_HEIGHT)
+                .max(0.0);
+            let menu_x = BAR_PADDING + tools.menu_x;
+            let tools_menu_place = Padding {
+                bottom: STATUS_HEIGHT + GUTTER + TOOLS_HEIGHT + height + MENU_GAP,
+                left: GUTTER + menu_x.min(room - MENU_WIDTH).max(0.0),
+                ..Padding::ZERO
+            };
+            let lower = container(column![
+                across(tools_strip(tools.row.into())),
+                self.timeline_body(height),
+            ])
+            .style(theme::panel);
+            return Middle {
+                panels: container(lower).padding([0.0, GUTTER]).height(Fill).into(),
+                tools_menu: tools.menu,
+                tools_menu_place,
+                tools_menu_from_bottom: true,
+                dividers: Vec::new(),
+            };
+        }
+        let heights = self.heights(window);
+        let viewer = self.viewer_panel(room, heights.upper >= TITLE_ROOM);
         let menu_x = BAR_PADDING + tools.menu_x;
         let tools_menu_place = Padding {
             bottom: STATUS_HEIGHT + GUTTER + heights.lower + MENU_GAP,
@@ -496,6 +548,9 @@ impl App {
                 (Side::Media, Icon::Media, "Media"),
                 (Side::Details, Icon::Details, "Details"),
             ] {
+                if self.is_away(side.part()) {
+                    continue;
+                }
                 let open = self.drawer == Some(side);
                 let ink = if open { theme::ON_ACCENT } else { theme::TEXT };
                 let toggle = icon_button(which, ink)
@@ -520,8 +575,9 @@ impl App {
         ]
     }
 
-    /// The picture, over the buttons to play it; `room` wide.
-    fn viewer_body(&self, room: f32) -> Element<'_, Message> {
+    /// The picture, over the buttons to play it; `room` wide. `double_click` is what
+    /// double-clicking the picture does, if anything.
+    fn viewer_body(&self, room: f32, double_click: Option<Message>) -> Element<'_, Message> {
         let timeline = self.history.timeline();
         let picture: Element<'_, Message> = match self.shown.as_ref().map(|shown| &shown.picture) {
             Some(Displayed::Yuv(planes)) => shader(planes).width(Fill).height(Fill).into(),
@@ -542,7 +598,75 @@ impl App {
         if self.viewer.is_none() {
             picture = stack![picture, renderer_probe(Message::RendererProbed)].into();
         }
+        if let Some(double_click) = double_click {
+            picture = mouse_area(picture).on_double_click(double_click).into();
+        }
         column![picture, self.transport(room - 2.0 * BAR_PADDING)].into()
+    }
+
+    /// A panel in a window of its own, `size` big: its title bar with the buttons to fill the
+    /// screen and to put it back, over the panel. The viewer over the whole screen is the
+    /// picture and its buttons alone.
+    pub(super) fn panel_window(
+        &self,
+        part: Part,
+        window: iced::window::Id,
+        full_screen: bool,
+        size: Size,
+    ) -> Element<'_, Message> {
+        let screen = Message::FullScreenToggled(window);
+        let body = match part {
+            Part::Viewer => self.viewer_body(size.width, Some(screen.clone())),
+            Part::Media => self.media_body(),
+            Part::Details => self.details_body(),
+            // Never away: the main window keeps it.
+            Part::Timeline => space().into(),
+        };
+        if full_screen && part == Part::Viewer {
+            return container(body)
+                .width(Fill)
+                .height(Fill)
+                .style(theme::panel)
+                .into();
+        }
+        let room = size.width - 2.0 * ICON_BUTTON_WIDTH - 2.0 * BAR_PADDING - ROW_SPACING;
+        let title = match part {
+            Part::Viewer => self.viewer_title(room),
+            Part::Media => self.media_tabs(room),
+            Part::Details => self.details_title(),
+            Part::Timeline => space().into(),
+        };
+        let (which, words) = match (full_screen, part) {
+            (true, Part::Viewer) => (Icon::LeaveFullScreen, "Leave full screen (F11 or Esc)"),
+            (true, _) => (Icon::LeaveFullScreen, "Leave full screen (Esc)"),
+            (false, Part::Viewer) => (Icon::FullScreen, "Full screen (F11, or double-click)"),
+            (false, _) => (Icon::FullScreen, "Full screen"),
+        };
+        let buttons = row![
+            hint_below(
+                icon_button(which, theme::TEXT).style(theme::quiet).on_press(screen),
+                words,
+            ),
+            hint_below(
+                icon_button(Icon::PutBack, theme::TEXT)
+                    .style(theme::quiet)
+                    .on_press(Message::PutBack(window)),
+                "Put back in the main window",
+            ),
+        ]
+        .spacing(4)
+        .align_y(Center);
+        let bar = row![title, space().width(Fill), buttons]
+            .align_y(Center)
+            .padding(Padding {
+                right: BAR_PADDING,
+                ..Padding::ZERO
+            });
+        container(column![across(bar.into()), body])
+            .width(Fill)
+            .height(Fill)
+            .style(theme::panel)
+            .into()
     }
 
     /// The line over the picture on what it shows, at most `room` wide.
@@ -561,7 +685,7 @@ impl App {
         if titled {
             panel = panel.push(across(self.viewer_title(room)));
         }
-        container(panel.push(self.viewer_body(room)))
+        container(panel.push(self.viewer_body(room, None)))
             .width(Fill)
             .height(Fill)
             .style(theme::panel)
@@ -952,6 +1076,19 @@ fn tools_strip(tools: Element<'_, Message>) -> Element<'_, Message> {
         .padding([0.0, BAR_PADDING])
         .height(TOOLS_HEIGHT)
         .center_y(TOOLS_HEIGHT)
+        .into()
+}
+
+/// The button on a docked panel's title bar, `height` tall, that takes `part` into a window
+/// of its own.
+fn pop_out<'a>(part: Part, height: f32) -> Element<'a, Message> {
+    let open = button(icon(Icon::PopOut, POP_OUT_ICON_SIZE, theme::TEXT_DIM))
+        .padding(POP_OUT_PADDING)
+        .style(theme::quiet)
+        .on_press(Message::PopOut(part));
+    container(hint_below(open, "Open in a window of its own, to move to another screen"))
+        .padding([0.0, BAR_PADDING])
+        .center_y(height)
         .into()
 }
 

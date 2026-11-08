@@ -75,6 +75,9 @@ const PROJECT_EXTENSION: &str = "otio";
 const FILM_EXTENSION: &str = "mp4";
 const EXPORT_BAR_WIDTH: f32 = 160.0;
 const DIALOG_WIDTH: f32 = 380.0;
+/// A panel's own window, as it opens, and the least it is made.
+const PANEL_WINDOW_SIZE: Size = Size::new(960.0, 540.0);
+const PANEL_WINDOW_LEAST: Size = Size::new(320.0, 240.0);
 const DIALOG_LABEL_WIDTH: f32 = 90.0;
 const DIALOG_TITLE_SIZE: f32 = 20.0;
 const BYTES_PER_MEGABYTE: f64 = 1_000_000.0;
@@ -142,26 +145,49 @@ const HEADER_WIDTH: f32 = 48.0;
 const EMPTY_PROJECT_RATE: Rate = Rate::new(30, 1);
 
 fn main() -> iced::Result {
+    // Windows of its own: the main one, opened at the start, and one for each panel taken out
+    // of it.
     let app = theme::FONTS
         .into_iter()
-        .fold(iced::application(App::boot, App::update, App::view), |app, font| {
-            app.font(font)
-        });
+        .fold(iced::daemon(App::boot, App::update, App::view), |app, font| app.font(font));
     app.default_font(theme::BODY)
         .title(App::title)
         .subscription(App::subscription)
-        .theme(|_: &App| theme::theme())
-        // Maximized, as an editor wants every pixel; the size is what "restore" goes back to,
-        // and fits a laptop screen.
-        .window(window::Settings {
-            size: Size::new(1280.0, 720.0),
-            maximized: true,
-            min_size: Some(Size::new(640.0, 480.0)),
-            // Closing asks first while there are unsaved changes.
-            exit_on_close_request: false,
-            ..window::Settings::default()
-        })
+        .theme(|_: &App, _| theme::theme())
         .run()
+}
+
+/// The main window: maximized, as an editor wants every pixel; the size is what "restore" goes
+/// back to, and fits a laptop screen.
+fn main_window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(1280.0, 720.0),
+        maximized: true,
+        min_size: Some(Size::new(640.0, 480.0)),
+        // Closing asks first while there are unsaved changes.
+        exit_on_close_request: false,
+        ..window::Settings::default()
+    }
+}
+
+/// A window for a panel taken out of the main one, to put on another screen.
+fn panel_window_settings() -> window::Settings {
+    window::Settings {
+        size: PANEL_WINDOW_SIZE,
+        min_size: Some(PANEL_WINDOW_LEAST),
+        // Closing puts the panel back.
+        exit_on_close_request: false,
+        ..window::Settings::default()
+    }
+}
+
+/// A panel in a window of its own.
+struct Away {
+    window: window::Id,
+    part: Part,
+    /// Where it goes back to in the main window.
+    back: dock::Back,
+    full_screen: bool,
 }
 
 #[derive(Clone)]
@@ -209,7 +235,8 @@ enum Message {
     /// The viewer's area was laid out at this size, in logical pixels.
     ViewerResized(Size),
     /// Physical pixels per logical pixel in the window.
-    Rescaled(f32),
+    /// A window's scale factor, as it opened or when it changed screens.
+    Rescaled(window::Id, f32),
     ResizeTick,
     /// An event from the decode thread of the source with this generation.
     Media(u64, Media),
@@ -252,7 +279,7 @@ enum Message {
     /// belongs to.
     SteppedOut(u64, Result<(Arc<Projects>, Vec<String>), String>),
     /// The window's close button, or the like.
-    CloseRequested,
+    CloseRequested(window::Id),
     /// Asked about unsaved changes: save them, then go on.
     LeaveSave,
     /// Where a project never saved goes, before going on.
@@ -294,6 +321,12 @@ enum Message {
     DockSettled,
     /// The docked panels put back as they start.
     DockReset,
+    /// A panel taken out of the main window into one of its own.
+    PopOut(Part),
+    /// A panel's own window closed, the panel back in the main window.
+    PutBack(window::Id),
+    /// A panel's own window over the whole of its screen, or back.
+    FullScreenToggled(window::Id),
     Key(keyboard::Event),
     MemoryTick,
 }
@@ -650,6 +683,10 @@ struct App {
     drawer: Option<Side>,
     media_tab: MediaTab,
     details_tab: DetailsTab,
+    /// The window opened at the start, with every panel not taken out of it.
+    main_window: window::Id,
+    /// Panels in windows of their own.
+    away: Vec<Away>,
     /// How the panels are docked in a wide window.
     dock: pane_grid::State<Part>,
     /// A gap between docked panels is being dragged.
@@ -808,6 +845,9 @@ impl App {
             drawer: None,
             media_tab: MediaTab::default(),
             details_tab: DetailsTab::default(),
+            // Until the window is opened, at the end of the start.
+            main_window: window::Id::unique(),
+            away: Vec::new(),
             dock: dock::starting(),
             dock_resizing: false,
             media_width: MEDIA_WIDTH,
@@ -855,7 +895,9 @@ impl App {
         app.media_width = layout.media_width.unwrap_or(MEDIA_WIDTH);
         app.details_width = layout.details_width.unwrap_or(DETAILS_WIDTH);
         app.timeline_share = layout.timeline_share;
-        let mut task = Task::batch([app.add_next(), title_bar::dress()]);
+        let (main_window, opened) = window::open(main_window_settings());
+        app.main_window = main_window;
+        let mut task = Task::batch([opened.then(title_bar::dress), app.add_next()]);
         if let Some(film) = export {
             task = Task::batch([task, app.export(film)]);
         }
@@ -898,7 +940,11 @@ impl App {
         let (level, timeline) = self.file_level();
         let Some(path) = chosen.or_else(|| self.level_path(level).map(Path::to_path_buf)) else {
             let name = timeline.name.clone();
-            return ask(move |dialog| pick_save_path(dialog, name), Message::SaveChosen);
+            return ask(
+                self.main_window,
+                move |dialog| pick_save_path(dialog, name),
+                Message::SaveChosen,
+            );
         };
         let step = self.nest_step;
         // Tracks are shared, so the copy handed to the background is cheap.
@@ -1000,6 +1046,7 @@ impl App {
                     None => {
                         let name = timeline.name.clone();
                         return ask(
+                            self.main_window,
                             move |dialog| pick_save_path(dialog, name),
                             Message::LeaveSaveChosen,
                         );
@@ -1037,7 +1084,7 @@ impl App {
                 self.timeline_view = None;
                 task
             }
-            Some(Leave::Open) => ask(pick_project, Message::ProjectChosen),
+            Some(Leave::Open) => ask(self.main_window, pick_project, Message::ProjectChosen),
             Some(Leave::Close) => iced::exit(),
             None => Task::none(),
         }
@@ -1057,14 +1104,18 @@ impl App {
         Task::none()
     }
 
-    /// The window's title: the project's file, marked while it has changes not saved.
-    fn title(&self) -> String {
+    /// A window's title: the project's file, marked while it has changes not saved; for a
+    /// panel's own window, the panel's name first.
+    fn title(&self, window: window::Id) -> String {
         let outermost = match self.parents.first() {
             Some(parent) => project_name(parent.path.as_deref(), parent.history.timeline()),
             None => project_name(self.project_path.as_deref(), self.history.timeline()),
         };
         let mark = if self.unsaved().is_empty() { "" } else { "*" };
-        format!("{mark}{outermost} - cannotcut")
+        match self.away.iter().find(|away| away.window == window) {
+            Some(away) => format!("{} - {mark}{outermost} - cannotcut", away.part.name()),
+            None => format!("{mark}{outermost} - cannotcut"),
+        }
     }
 
     /// Starts on the next file waiting to go on the timeline. Its length has to be known first,
@@ -1605,7 +1656,7 @@ impl App {
 
     fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::AddRequested => return ask(pick_clips, Message::FilesChosen),
+            Message::AddRequested => return ask(self.main_window, pick_clips, Message::FilesChosen),
             Message::FilesChosen(paths) => {
                 self.adding.extend(paths);
                 return self.add_next();
@@ -1623,15 +1674,18 @@ impl App {
             Message::ViewerResized(area) => {
                 self.viewer_area = Some(area);
                 if self.scale_factor.is_none() {
-                    return window::latest()
-                        .and_then(window::scale_factor)
-                        .map(Message::Rescaled);
+                    let window = self.viewer_window();
+                    return window::scale_factor(window)
+                        .map(move |scale_factor| Message::Rescaled(window, scale_factor));
                 }
                 return self.viewer_changed();
             }
-            Message::Rescaled(scale_factor) => {
-                self.scale_factor = Some(scale_factor);
-                return self.viewer_changed();
+            Message::Rescaled(window, scale_factor) => {
+                // The picture is made for the screen the viewer is on.
+                if window == self.viewer_window() {
+                    self.scale_factor = Some(scale_factor);
+                    return self.viewer_changed();
+                }
             }
             Message::ResizeTick => {
                 if self
@@ -1656,7 +1710,10 @@ impl App {
             },
             Message::NewRequested => return self.ask_to_leave(Leave::New),
             Message::OpenRequested => return self.ask_to_leave(Leave::Open),
-            Message::CloseRequested => return self.ask_to_leave(Leave::Close),
+            Message::CloseRequested(window) if window == self.main_window => {
+                return self.ask_to_leave(Leave::Close);
+            }
+            Message::CloseRequested(window) => return self.put_back(window),
             Message::LeaveSave => return self.save_and_leave(None),
             Message::LeaveSaveChosen(Some(path)) => return self.save_and_leave(Some(path)),
             Message::LeaveSaveChosen(None) => {}
@@ -1694,9 +1751,7 @@ impl App {
             Message::DividerPressed(divider) => {
                 self.dividing = Some(divider);
                 self.dividing_window = None;
-                return window::latest()
-                    .and_then(window::size)
-                    .map(Message::WindowSized);
+                return window::size(self.main_window).map(Message::WindowSized);
             }
             Message::WindowSized(size) => {
                 if self.dividing.is_some() {
@@ -1737,8 +1792,45 @@ impl App {
             }
             Message::DockReset => {
                 self.more = None;
+                let closing: Vec<Task<Message>> =
+                    self.away.drain(..).map(|away| window::close(away.window)).collect();
+                self.scale_factor = None;
                 self.dock = dock::starting();
                 self.keep_layout();
+                return Task::batch(closing);
+            }
+            Message::PopOut(part) => {
+                if self.is_away(part) {
+                    return Task::none();
+                }
+                // Not the last panel: the main window keeps one.
+                let Some(back) = dock::take_out(&mut self.dock, part) else {
+                    return Task::none();
+                };
+                let (window, opened) = window::open(panel_window_settings());
+                self.away.push(Away {
+                    window,
+                    part,
+                    back,
+                    full_screen: false,
+                });
+                if part == Part::Viewer {
+                    self.scale_factor = None;
+                }
+                self.keep_layout();
+                return opened.then(title_bar::dress);
+            }
+            Message::PutBack(window) => return self.put_back(window),
+            Message::FullScreenToggled(window) => {
+                if let Some(away) = self.away.iter_mut().find(|away| away.window == window) {
+                    away.full_screen = !away.full_screen;
+                    let mode = if away.full_screen {
+                        window::Mode::Fullscreen
+                    } else {
+                        window::Mode::Windowed
+                    };
+                    return window::set_mode(window, mode);
+                }
             }
             Message::ProjectChosen(Some(path)) => {
                 return Task::perform(load_project(path), Message::ProjectLoaded);
@@ -1777,7 +1869,11 @@ impl App {
             }
             Message::ExportRequested => {
                 let name = self.history.timeline().name.clone();
-                return ask(move |dialog| pick_film_path(dialog, name), Message::ExportChosen);
+                return ask(
+                    self.main_window,
+                    move |dialog| pick_film_path(dialog, name),
+                    Message::ExportChosen,
+                );
             }
             Message::ExportChosen(Some(path)) => {
                 self.export_dialog = false;
@@ -1964,6 +2060,7 @@ impl App {
                         }
                         let folder = self.own_file().and_then(Path::parent).map(Path::to_path_buf);
                         return ask(
+                            self.main_window,
                             move |dialog| pick_compound_path(dialog, name, folder),
                             Message::CompoundPathChosen,
                         );
@@ -2043,6 +2140,17 @@ impl App {
                     }
                     Some(key::Named::Delete | key::Named::Backspace) => Some(Message::Delete),
                     Some(key::Named::Space) => Some(Message::PlayToggled),
+                    Some(key::Named::F11) => self
+                        .away
+                        .iter()
+                        .find(|away| away.part == Part::Viewer)
+                        .map(|away| Message::FullScreenToggled(away.window)),
+                    Some(key::Named::Escape) if self.away.iter().any(|away| away.full_screen) => {
+                        self.away
+                            .iter()
+                            .find(|away| away.full_screen)
+                            .map(|away| Message::FullScreenToggled(away.window))
+                    }
                     Some(key::Named::Escape) if self.leaving.is_some() && !self.leave_saving => {
                         Some(Message::LeaveCancel)
                     }
@@ -2562,11 +2670,11 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let mut subscriptions = vec![
             keyboard::listen().map(Message::Key),
-            window::close_requests().map(|_| Message::CloseRequested),
+            window::close_requests().map(Message::CloseRequested),
             time::every(MEMORY_REFRESH).map(|_| Message::MemoryTick),
-            iced::event::listen_with(|event, _status, _window| match event {
+            iced::event::listen_with(|event, _status, window| match event {
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
-                    Some(Message::Rescaled(scale_factor))
+                    Some(Message::Rescaled(window, scale_factor))
                 }
                 _ => None,
             }),
@@ -2611,8 +2719,41 @@ impl App {
         Subscription::batch(subscriptions)
     }
 
-    fn view(&self) -> Element<'_, Message> {
-        responsive(move |window| self.layout(window)).into()
+    fn view(&self, window: window::Id) -> Element<'_, Message> {
+        match self.away.iter().find(|away| away.window == window) {
+            Some(away) => {
+                let (part, full_screen) = (away.part, away.full_screen);
+                responsive(move |size| self.panel_window(part, window, full_screen, size)).into()
+            }
+            None => responsive(move |size| self.layout(size)).into(),
+        }
+    }
+
+    /// Whether `part` is in a window of its own.
+    fn is_away(&self, part: Part) -> bool {
+        self.away.iter().any(|away| away.part == part)
+    }
+
+    /// The window the viewer is in.
+    fn viewer_window(&self) -> window::Id {
+        self.away
+            .iter()
+            .find(|away| away.part == Part::Viewer)
+            .map_or(self.main_window, |away| away.window)
+    }
+
+    /// Closes a panel's own window, and puts the panel back where it was in the main one.
+    fn put_back(&mut self, window: window::Id) -> Task<Message> {
+        let Some(index) = self.away.iter().position(|away| away.window == window) else {
+            return Task::none();
+        };
+        let away = self.away.remove(index);
+        dock::put_back(&mut self.dock, away.part, &away.back);
+        if away.part == Part::Viewer {
+            self.scale_factor = None;
+        }
+        self.keep_layout();
+        window::close(window)
     }
 
     /// Remembers how the panels were sized and arranged, for next time.
@@ -2621,7 +2762,10 @@ impl App {
             media_width: Some(self.media_width),
             details_width: Some(self.details_width),
             timeline_share: self.timeline_share,
-            dock: Some(dock::to_value(&self.dock)),
+            dock: Some(dock::to_value(
+                &self.dock,
+                self.away.iter().map(|away| (away.part, &away.back)),
+            )),
         };
         self.settings.save_layout();
     }
@@ -3188,6 +3332,7 @@ fn one_line<'a>(content: String) -> container::Container<'a, Message> {
 /// the screen the window is on (without an owner it comes up where the last one was), and
 /// hands what it chose to `done`.
 fn ask<T, F>(
+    window: window::Id,
     pick: impl FnOnce(rfd::AsyncFileDialog) -> F + Send + 'static,
     done: fn(T) -> Message,
 ) -> Task<Message>
@@ -3196,8 +3341,7 @@ where
     T: Send + 'static,
 {
     let mut pick = Some(pick);
-    window::latest()
-        .and_then(|id| window::run(id, |window| rfd::AsyncFileDialog::new().set_parent(window)))
+    window::run(window, |window| rfd::AsyncFileDialog::new().set_parent(window))
         .then(move |dialog| match pick.take() {
             Some(pick) => Task::perform(pick(dialog), done),
             None => Task::none(),

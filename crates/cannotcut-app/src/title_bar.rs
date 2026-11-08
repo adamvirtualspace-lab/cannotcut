@@ -4,19 +4,17 @@
 //! On Windows 11 the bar takes the window's own colour; Windows 10 cannot colour it, but does
 //! draw it dark.
 
-use iced::Task;
+use iced::{Task, window};
 
-/// Colours the title bar of the app's window.
-pub fn dress<Message: Send + 'static>() -> Task<Message> {
+/// Colours the title bar of the window `id`.
+pub fn dress<Message: Send + 'static>(id: window::Id) -> Task<Message> {
     #[cfg(windows)]
     {
-        use iced::window;
-        window::latest()
-            .and_then(|id| window::run(id, windows::dress))
-            .discard()
+        window::run(id, windows::dress).discard()
     }
     #[cfg(not(windows))]
     {
+        let _ = id;
         Task::none()
     }
 }
