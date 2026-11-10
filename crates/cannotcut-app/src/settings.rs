@@ -10,6 +10,7 @@ use serde_json::{Map, Value, json};
 
 const FILE: &str = "settings.json";
 const SOUND_DELAYS: &str = "sound_delay_ms";
+const SOUND_OUTPUT: &str = "sound_output";
 const EXPORT: &str = "export";
 const LAYOUT: &str = "layout";
 const MEDIA_WIDTH: &str = "media_width";
@@ -35,6 +36,8 @@ pub struct Settings {
     /// heard, by its name. Some outputs process sound on the way (laptop speakers with
     /// "enhancements", Bluetooth), which the card does not report; the pictures wait as long.
     pub sound_delays: HashMap<String, u64>,
+    /// The sound output picked by name; none for the system's default.
+    pub sound_output: Option<String>,
     /// What the last film was exported as.
     pub export: ExportOptions,
     pub layout: Layout,
@@ -53,6 +56,10 @@ impl Settings {
                 .filter_map(|(device, delay)| Some((device.clone(), delay.as_u64()?)))
                 .collect();
         }
+        settings.sound_output = saved
+            .get(SOUND_OUTPUT)
+            .and_then(Value::as_str)
+            .map(str::to_string);
         if let Some(export) = saved.get(EXPORT) {
             let key = |name: &str| export.get(name).and_then(Value::as_str);
             if let Some(resolution) = key("resolution").and_then(Resolution::from_key) {
@@ -75,6 +82,11 @@ impl Settings {
             };
         }
         settings
+    }
+
+    /// Keeps the sound output picked in the file.
+    pub fn save_sound_output(&self) {
+        save(SOUND_OUTPUT, json!(self.sound_output));
     }
 
     /// Keeps the export choices in the file.

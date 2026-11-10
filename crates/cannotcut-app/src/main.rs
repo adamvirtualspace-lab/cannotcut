@@ -8,6 +8,7 @@ mod icons;
 mod panels;
 mod title_bar;
 mod settings;
+mod sound_output;
 mod theme;
 mod timeline_panel;
 mod viewer;
@@ -45,6 +46,7 @@ use icons::{ICON_BUTTON_WIDTH, Icon};
 use panels::{DETAILS_WIDTH, DetailsTab, Divider, MEDIA_WIDTH, MediaTab, Side, icon_button,
     labelled, labelled_width, tool_control};
 use settings::Settings;
+use sound_output::Outputs;
 use theme::button;
 use timeline_panel::{
     Action, LANE_GAP, LANE_HEIGHT, MAIN_TRACK, PANEL_HEIGHT, RULER_HEIGHT, View, Waveforms,
@@ -209,6 +211,13 @@ enum Message {
     /// A page of the About card.
     AboutShown(AboutPage),
     AboutClosed,
+    /// The card to pick the sound output, from the menu.
+    SoundOutputOpened,
+    /// The sound outputs the system offers, listed for the card.
+    SoundOutputsListed(Outputs),
+    /// An output picked by name, or the system's default.
+    SoundOutputChosen(Option<String>),
+    SoundOutputClosed,
     ExportResolution(Resolution),
     ExportQuality(Quality),
     /// The choices are made: ask where the film goes.
@@ -626,6 +635,11 @@ struct App {
     /// The sound delay asked for on the command line, in milliseconds, instead of the one in
     /// the settings.
     sound_delay: Option<u64>,
+    /// How many times the sound output had been opened when playing last started or went on:
+    /// when it moves on during playback, the output changed and the sound is started again.
+    sound_opened: u64,
+    /// The card to pick the sound output, while it is open: the outputs, once listed.
+    sound_outputs: Option<Option<Outputs>>,
     settings: Settings,
     playback: Option<Playback>,
     play_stats: Option<PlayStats>,
@@ -791,6 +805,7 @@ struct Latency {
 
 impl App {
     fn boot() -> (Self, Task<Message>) {
+        let settings = Settings::load();
         let mut app = Self {
             history: History::new(Timeline::new("Untitled", EMPTY_PROJECT_RATE)),
             project_path: None,
@@ -808,10 +823,12 @@ impl App {
             nest_step: 0,
             active: None,
             warming: None,
-            sound: Player::start(),
+            sound: Player::start(settings.sound_output.clone()),
             silent: false,
             sound_delay: None,
-            settings: Settings::load(),
+            sound_opened: 0,
+            sound_outputs: None,
+            settings,
             playback: None,
             play_stats: None,
             pending: None,
@@ -1517,6 +1534,7 @@ impl App {
     /// for it goes on screen if it has arrived, and the frame a little further on is asked for.
     /// A decoder that cannot keep up leaves frames out; it does not slow the film down.
     fn play_tick(&mut self) -> Task<Message> {
+        self.follow_sound_output();
         let rate = self.history.timeline().rate().as_f64();
         let last_frame = self.last_frame();
         let Some(playback) = &mut self.playback else {
@@ -1859,6 +1877,25 @@ impl App {
                 );
             }
             Message::AboutClosed => self.about = None,
+            Message::SoundOutputOpened => {
+                self.more = None;
+                self.sound_outputs = Some(None);
+                return Task::perform(sound_output::list_outputs(), Message::SoundOutputsListed);
+            }
+            Message::SoundOutputsListed(outputs) => {
+                if self.sound_outputs.is_some() {
+                    self.sound_outputs = Some(Some(outputs));
+                }
+            }
+            Message::SoundOutputChosen(device) => {
+                if device != self.settings.sound_output {
+                    self.settings.sound_output = device.clone();
+                    self.settings.save_sound_output();
+                    // Playing goes on through the new output once it is open (`play_tick`).
+                    self.sound.choose(device);
+                }
+            }
+            Message::SoundOutputClosed => self.sound_outputs = None,
             Message::ExportResolution(resolution) => self.settings.export.resolution = resolution,
             Message::ExportQuality(quality) => self.settings.export.quality = quality,
             Message::PictureSized(target, size) => {
@@ -1939,6 +1976,7 @@ impl App {
                         self.playhead = 0;
                     }
                     self.preview = None;
+                    self.sound_opened = self.sound.opened();
                     let clock = match self.sound.status() {
                         SoundStatus::Ready { .. } if !self.silent => {
                             let delay = self.output_delay().unwrap_or(0);
@@ -2160,6 +2198,9 @@ impl App {
                     }
                     Some(key::Named::Escape) if self.export_dialog => Some(Message::ExportClosed),
                     Some(key::Named::Escape) if self.about.is_some() => Some(Message::AboutClosed),
+                    Some(key::Named::Escape) if self.sound_outputs.is_some() => {
+                        Some(Message::SoundOutputClosed)
+                    }
                     Some(key::Named::Escape) if self.compound_dialog => {
                         Some(Message::CompoundClosed)
                     }
@@ -2490,6 +2531,41 @@ impl App {
                 .sound_delay
                 .or_else(|| self.settings.sound_delays.get(&device).copied()),
             _ => None,
+        }
+    }
+
+    /// While playing to the sound card, it went away or another was picked, and the output was
+    /// opened again: the sound starts again from the playhead, through the new output, and the
+    /// pictures wait for it; with no output, the system clock takes over.
+    fn follow_sound_output(&mut self) {
+        let opened = self.sound.opened();
+        if opened == self.sound_opened {
+            return;
+        }
+        self.sound_opened = opened;
+        let Some(playback) = &self.playback else {
+            return;
+        };
+        if !matches!(playback.clock, Clock::Sound { .. }) {
+            return;
+        }
+        let now = Instant::now();
+        let clock = match self.sound.status() {
+            SoundStatus::Ready { .. } if !self.silent => {
+                let delay = self.output_delay().unwrap_or(0);
+                self.sound.set_delay(Duration::from_millis(delay));
+                let timeline = self.history.timeline().clone();
+                let folder = self.project_folder.clone();
+                self.sound.play(timeline, self.playhead, folder);
+                Clock::Sound { asked_at: now }
+            }
+            _ => Clock::Wall {
+                started: now,
+                from: self.playhead,
+            },
+        };
+        if let Some(playback) = &mut self.playback {
+            playback.clock = clock;
         }
     }
 
@@ -3200,14 +3276,15 @@ impl App {
             ));
         }
         parts.push(match self.sound.status() {
-            SoundStatus::Ready { rate, .. } => {
+            SoundStatus::Ready { device, rate, .. } => {
                 let delay = match self.output_delay() {
                     Some(delay) => format!(", {delay} ms late"),
                     None => String::new(),
                 };
+                let output = format!("sound {device} {} kHz{delay}", rate / 1000);
                 match self.sound.problem() {
-                    Some(problem) => format!("sound {} kHz{delay}: {problem}", rate / 1000),
-                    None => format!("sound {} kHz{delay}", rate / 1000),
+                    Some(problem) => format!("{output}: {problem}"),
+                    None => output,
                 }
             }
             SoundStatus::Starting => "sound starting".to_string(),

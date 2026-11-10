@@ -349,6 +349,9 @@ impl App {
             Some((self.compound_dialog(), Some(Message::CompoundClosed)))
         } else if let Some(page) = self.about {
             Some((self.about_dialog(page, window), Some(Message::AboutClosed)))
+        } else if let Some(outputs) = &self.sound_outputs {
+            let card = self.sound_output_dialog(outputs.as_ref());
+            Some((card, Some(Message::SoundOutputClosed)))
         } else {
             None
         };
@@ -571,6 +574,7 @@ impl App {
             ("Save".to_string(), Some(Message::SaveRequested)),
             ("Add clips...".to_string(), Some(Message::AddRequested)),
             ("Reset panel layout".to_string(), Some(Message::DockReset)),
+            ("Sound output...".to_string(), Some(Message::SoundOutputOpened)),
             ("About and licences".to_string(), Some(Message::AboutOpened)),
         ]
     }

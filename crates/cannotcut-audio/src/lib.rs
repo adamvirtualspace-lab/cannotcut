@@ -3,12 +3,17 @@
 //! The sound card also keeps time for playback. It plays samples at its own steady rate, so
 //! the playhead goes wherever the sound being heard is, and pictures follow it; sound and
 //! pictures cannot drift apart.
+//!
+//! The sound goes to the system's default output, or to one chosen by name. When that output
+//! goes away, or the default changes, the output is opened again by itself (see
+//! [`Player::opened`]).
 
 mod mixer;
 
 pub use mixer::{Mixer, frame_to_sample};
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,6 +39,56 @@ const HANDOFFS: usize = 8;
 /// When what is playing is swapped, how long the new mix takes from being handed over to
 /// reaching the sound card, on top of the card's own delay: about half a callback's wait.
 const HANDOVER: Duration = Duration::from_millis(5);
+/// How long to wait before trying again when no output could be opened, as while the system
+/// is still switching from one to another.
+const RETRY: Duration = Duration::from_secs(1);
+
+/// A sound output the system offers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputDevice {
+    pub name: String,
+    /// What sort it is, in words: "Speakers", "Headphones"; empty when not known.
+    pub kind: String,
+}
+
+/// The sound outputs the system offers now, in its order.
+pub fn output_devices() -> Vec<OutputDevice> {
+    let Ok(devices) = cpal::default_host().output_devices() else {
+        return Vec::new();
+    };
+    devices
+        .filter_map(|device| {
+            let description = device.description().ok()?;
+            let kind = match description.device_type() {
+                cpal::DeviceType::Speaker => "Speakers",
+                cpal::DeviceType::Headphones => "Headphones",
+                cpal::DeviceType::Headset => "Headset",
+                cpal::DeviceType::Earpiece | cpal::DeviceType::Handset => "Earpiece",
+                cpal::DeviceType::HearingAid => "Hearing aid",
+                cpal::DeviceType::Dock => "Dock",
+                cpal::DeviceType::Virtual => "Virtual",
+                _ => "",
+            };
+            Some(OutputDevice {
+                name: description.name().to_string(),
+                kind: kind.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The name of the system's default sound output now, if there is one.
+pub fn default_output_name() -> Option<String> {
+    let device = cpal::default_host().default_output_device()?;
+    Some(device_name(&device))
+}
+
+fn device_name(device: &cpal::Device) -> String {
+    device
+        .description()
+        .map(|description| description.name().to_string())
+        .unwrap_or_else(|_| "sound output".to_string())
+}
 
 /// The state of the sound output.
 #[derive(Clone, Debug)]
@@ -44,6 +99,8 @@ pub enum Status {
         device: String,
         /// Samples a second.
         rate: u32,
+        /// The output chosen by name could not be found, and this is the default instead.
+        fell_back: bool,
     },
     /// No sound can be played, and why.
     Unavailable(String),
@@ -60,6 +117,10 @@ enum Command {
         follows: Option<(u64, Duration)>,
     },
     Stop,
+    /// Plays through the output of this name from now on, or the default with none.
+    Use(Option<String>),
+    /// The output stopped working, or the default output changed: open it again.
+    Reopen,
 }
 
 /// Where on the timeline a play begins.
@@ -140,6 +201,11 @@ struct Shared {
     status: Mutex<Option<Status>>,
     anchors: Mutex<Anchors>,
     problem: Mutex<Option<String>>,
+    /// How many times an output has been opened.
+    opened: AtomicU64,
+    /// A reopening was asked for and has not happened yet, so that a stream reporting the
+    /// same trouble many times asks once.
+    reopen_asked: AtomicBool,
 }
 
 /// Plays the sound of a timeline, and tells where in the timeline the sound being heard is.
@@ -158,14 +224,15 @@ pub struct Player {
 }
 
 impl Player {
-    /// Opens the default sound output on a thread of its own and returns at once;
-    /// [`status`](Self::status) says how it went.
-    pub fn start() -> Self {
+    /// Opens the sound output named `device`, or the default one, on a thread of its own and
+    /// returns at once; [`status`](Self::status) says how it went.
+    pub fn start(device: Option<String>) -> Self {
         let (commands, received) = mpsc::channel();
         let shared = Arc::new(Shared::default());
         let started = thread::Builder::new().name("cannotcut-sound".to_string()).spawn({
             let shared = shared.clone();
-            move || run(received, shared)
+            let commands = commands.clone();
+            move || run(received, commands, shared, device)
         });
         if let Err(error) = started {
             *lock(&shared.status) = Some(Status::Unavailable(error.to_string()));
@@ -187,6 +254,20 @@ impl Player {
 
     pub fn status(&self) -> Status {
         lock(&self.shared.status).clone().unwrap_or(Status::Starting)
+    }
+
+    /// Plays through the output named `device` from now on, or the default one. What was
+    /// playing stops; play it again once [`opened`](Self::opened) has moved on.
+    pub fn choose(&mut self, device: Option<String>) {
+        self.playing = None;
+        self.replaced = None;
+        let _ = self.commands.send(Command::Use(device));
+    }
+
+    /// How many times an output has been opened. When it moves on, the output changed (chosen,
+    /// gone, or a new default) and anything that was playing stopped: play it again.
+    pub fn opened(&self) -> u64 {
+        self.shared.opened.load(Ordering::Acquire)
     }
 
     /// Starts playing `timeline` from frame `from`, instead of whatever was playing.
@@ -287,15 +368,27 @@ struct Output {
 }
 
 impl Output {
-    fn open(shared: &Arc<Shared>) -> Result<(Self, String), String> {
+    /// Opens the output named `wanted`, or the default one when there is no such output or none
+    /// is named; whether it fell back to the default.
+    fn open(
+        wanted: Option<&str>,
+        commands: &mpsc::Sender<Command>,
+        shared: &Arc<Shared>,
+    ) -> Result<(Self, String, bool), String> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| "no sound output".to_string())?;
-        let name = device
-            .description()
-            .map(|description| description.name().to_string())
-            .unwrap_or_else(|_| "sound output".to_string());
+        let named = wanted.and_then(|wanted| {
+            host.output_devices()
+                .ok()?
+                .find(|device| device_name(device) == wanted)
+        });
+        let fell_back = wanted.is_some() && named.is_none();
+        let device = match named {
+            Some(device) => device,
+            None => host
+                .default_output_device()
+                .ok_or_else(|| "no sound output".to_string())?,
+        };
+        let name = device_name(&device);
         let supported = device
             .default_output_config()
             .map_err(|error| error.to_string())?;
@@ -303,11 +396,11 @@ impl Output {
         let config: StreamConfig = supported.into();
         let (handoffs, received) = rtrb::RingBuffer::new(HANDOFFS);
         let stream = match format {
-            SampleFormat::F32 => build::<f32>(&device, &config, received, shared),
-            SampleFormat::I16 => build::<i16>(&device, &config, received, shared),
-            SampleFormat::I32 => build::<i32>(&device, &config, received, shared),
-            SampleFormat::U16 => build::<u16>(&device, &config, received, shared),
-            SampleFormat::F64 => build::<f64>(&device, &config, received, shared),
+            SampleFormat::F32 => build::<f32>(&device, &config, received, commands, shared),
+            SampleFormat::I16 => build::<i16>(&device, &config, received, commands, shared),
+            SampleFormat::I32 => build::<i32>(&device, &config, received, commands, shared),
+            SampleFormat::U16 => build::<u16>(&device, &config, received, commands, shared),
+            SampleFormat::F64 => build::<f64>(&device, &config, received, commands, shared),
             other => return Err(format!("{name} wants {other} samples, which are not supported")),
         }
         .map_err(|error| error.to_string())?;
@@ -321,6 +414,7 @@ impl Output {
                 rate,
             },
             name,
+            fell_back,
         ))
     }
 
@@ -337,6 +431,7 @@ fn build<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     mut handoffs: rtrb::Consumer<Handoff>,
+    commands: &mpsc::Sender<Command>,
     shared: &Arc<Shared>,
 ) -> Result<cpal::Stream, cpal::Error>
 where
@@ -353,6 +448,7 @@ where
     let mut playing: Option<Playing> = None;
     let callback_shared = shared.clone();
     let error_shared = shared.clone();
+    let reopen = commands.clone();
     device.build_output_stream::<T, _, _>(
         config.clone(),
         move |data: &mut [T], info: &OutputCallbackInfo| {
@@ -420,36 +516,70 @@ where
             }
             play.handed += count as u64;
         },
-        move |error: cpal::Error| {
+        move |error: cpal::Error| match error.kind() {
             // A moment the card ran dry is over by the time it is reported; the sound goes on.
-            if error.kind() != cpal::ErrorKind::Xrun {
-                *lock(&error_shared.problem) = Some(format!("sound output: {error}"));
+            // A stream that followed the default to a new output goes on too.
+            cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged => {}
+            // Gone, or the default changed and this stream did not follow: open it again.
+            cpal::ErrorKind::StreamInvalidated | cpal::ErrorKind::DeviceNotAvailable => {
+                if !error_shared.reopen_asked.swap(true, Ordering::AcqRel) {
+                    let _ = reopen.send(Command::Reopen);
+                }
             }
+            _ => *lock(&error_shared.problem) = Some(format!("sound output: {error}")),
         },
         None,
     )
 }
 
-/// The sound thread: opens the sound card, then mixes whatever is playing ahead of it.
-fn run(commands: mpsc::Receiver<Command>, shared: Arc<Shared>) {
-    let mut output = match Output::open(&shared) {
-        Ok((output, device)) => {
-            *lock(&shared.status) = Some(Status::Ready {
+/// Opens the output named `wanted` or the default one, noting how it went.
+fn open_output(
+    wanted: Option<&str>,
+    commands: &mpsc::Sender<Command>,
+    shared: &Arc<Shared>,
+) -> Option<Output> {
+    shared.reopen_asked.store(false, Ordering::Release);
+    let opened = Output::open(wanted, commands, shared);
+    let (status, output) = match opened {
+        Ok((output, device, fell_back)) => (
+            Status::Ready {
                 device,
                 rate: output.rate,
-            });
-            output
-        }
-        Err(error) => {
-            *lock(&shared.status) = Some(Status::Unavailable(error));
-            return;
-        }
+                fell_back,
+            },
+            Some(output),
+        ),
+        Err(error) => (Status::Unavailable(error), None),
     };
-    let capacity = (BUFFER_SECONDS * f64::from(output.rate)) as usize * CHANNELS;
-    let prefill = (PREFILL_SECONDS * f64::from(output.rate)) as usize * CHANNELS;
+    *lock(&shared.status) = Some(status);
+    *lock(&shared.anchors) = Anchors::default();
+    shared.opened.fetch_add(1, Ordering::AcqRel);
+    output
+}
+
+/// The sound thread: opens the sound card, then mixes whatever is playing ahead of it.
+fn run(
+    commands: mpsc::Receiver<Command>,
+    sender: mpsc::Sender<Command>,
+    shared: Arc<Shared>,
+    mut wanted: Option<String>,
+) {
+    let mut output = open_output(wanted.as_deref(), &sender, &shared);
     let mut chunk = vec![0.0; CHUNK * CHANNELS];
     let mut mixing: Option<(Mixer, rtrb::Producer<f32>)> = None;
     loop {
+        let Some(out) = &mut output else {
+            // No output: try again now and then, as the system may be between two.
+            match commands.recv_timeout(RETRY) {
+                Ok(Command::Use(device)) => wanted = device,
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            output = open_output(wanted.as_deref(), &sender, &shared);
+            continue;
+        };
+        let capacity = (BUFFER_SECONDS * f64::from(out.rate)) as usize * CHANNELS;
+        let prefill = (PREFILL_SECONDS * f64::from(out.rate)) as usize * CHANNELS;
         let command = match &mixing {
             // There is room for more sound: look for news without waiting.
             Some((mixer, samples)) if !mixer.finished() && samples.slots() >= chunk.len() => {
@@ -472,6 +602,15 @@ fn run(commands: mpsc::Receiver<Command>, shared: Arc<Shared>) {
             },
         };
         match command {
+            Some(command @ (Command::Use(_) | Command::Reopen)) => {
+                if let Command::Use(device) = command {
+                    wanted = device;
+                }
+                // What was playing stops; the player is told by `opened` moving on.
+                mixing = None;
+                drop(output.take());
+                output = open_output(wanted.as_deref(), &sender, &shared);
+            }
             Some(Command::Play {
                 id,
                 timeline,
@@ -482,10 +621,8 @@ fn run(commands: mpsc::Receiver<Command>, shared: Arc<Shared>) {
                 // What went wrong in an earlier play is old news.
                 *lock(&shared.problem) = None;
                 let mut mixer = match from {
-                    Start::Frame(frame) => Mixer::new(timeline, frame, output.rate, folder),
-                    Start::Sample(sample) => {
-                        Mixer::from_sample(timeline, sample, output.rate, folder)
-                    }
+                    Start::Frame(frame) => Mixer::new(timeline, frame, out.rate, folder),
+                    Start::Sample(sample) => Mixer::from_sample(timeline, sample, out.rate, folder),
                 };
                 let mut start = mixer.position();
                 let (mut samples, mut consumer) = rtrb::RingBuffer::new(capacity);
@@ -511,8 +648,8 @@ fn run(commands: mpsc::Receiver<Command>, shared: Arc<Shared>) {
                         anchor.and_then(|anchor| Some((anchor, anchor.position(now, delay)?)))
                     {
                         let lead = (anchor.lead(delay) + HANDOVER).as_secs_f64();
-                        let wanted = ((position + lead) * f64::from(output.rate)).round() as i64;
-                        let behind = (wanted - start).max(0) as usize * CHANNELS;
+                        let due = ((position + lead) * f64::from(out.rate)).round() as i64;
+                        let behind = (due - start).max(0) as usize * CHANNELS;
                         fill(&mut mixer, &mut samples, behind + prefill);
                         let dropped = behind.min(consumer.slots());
                         if let Ok(early) = consumer.read_chunk(dropped) {
@@ -522,20 +659,20 @@ fn run(commands: mpsc::Receiver<Command>, shared: Arc<Shared>) {
                     }
                 }
                 note_problem(&shared, &mut mixer);
-                output.hand(Handoff::Play {
+                out.hand(Handoff::Play {
                     id,
                     start,
                     samples: consumer,
                 });
-                if let Err(error) = output.stream.play() {
+                if let Err(error) = out.stream.play() {
                     *lock(&shared.problem) = Some(format!("sound output: {error}"));
                 }
                 mixing = Some((mixer, samples));
             }
             Some(Command::Stop) => {
                 mixing = None;
-                output.hand(Handoff::Stop);
-                let _ = output.stream.pause();
+                out.hand(Handoff::Stop);
+                let _ = out.stream.pause();
             }
             None => {
                 if let Some((mixer, samples)) = &mut mixing

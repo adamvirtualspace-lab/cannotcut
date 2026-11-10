@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timeline = Timeline::load(&project)?;
 
     let opening = Instant::now();
-    let mut player = Player::start();
+    let mut player = Player::start(None);
     while matches!(player.status(), Status::Starting) {
         thread::sleep(POLL);
     }
