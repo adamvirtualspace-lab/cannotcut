@@ -23,7 +23,7 @@ pub(crate) enum Part {
 impl Part {
     const ALL: [Part; 4] = [Self::Media, Self::Viewer, Self::Details, Self::Timeline];
 
-    fn key(self) -> &'static str {
+    pub(crate) fn key(self) -> &'static str {
         match self {
             Self::Media => "media",
             Self::Viewer => "viewer",
@@ -32,7 +32,7 @@ impl Part {
         }
     }
 
-    fn from_key(key: &str) -> Option<Self> {
+    pub(crate) fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|part| part.key() == key)
     }
 

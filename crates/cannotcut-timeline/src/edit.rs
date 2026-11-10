@@ -71,6 +71,12 @@ pub enum Edit {
         track: usize,
         muted: bool,
     },
+    /// Makes a track's clips keep together, or go where they are put (see
+    /// [`Track::magnetic`]). The clips already on it stay where they are.
+    SetMagnetic {
+        track: usize,
+        magnetic: bool,
+    },
     /// Turns clips into one that plays them: a compound clip. `media` is the project made of
     /// them by [`Timeline::compound`], kept inside this one or saved as a file of its own. The
     /// clips are taken off and the compound clip covers the time from the first one's start
@@ -105,6 +111,8 @@ impl Edit {
             Self::SetVolume { .. } => "Volume",
             Self::SetMuted { muted: true, .. } => "Mute",
             Self::SetMuted { muted: false, .. } => "Unmute",
+            Self::SetMagnetic { magnetic: true, .. } => "Magnetic track",
+            Self::SetMagnetic { magnetic: false, .. } => "Free track",
             Self::Compound { .. } => "Compound clip",
             Self::SetMedia { .. } => "Edit inside",
             Self::Many { label, .. } => label,
@@ -316,6 +324,14 @@ impl Timeline {
                 Arc::make_mut(track).muted = *muted;
                 Ok(None)
             }
+            Edit::SetMagnetic { track, magnetic } => {
+                let track = self
+                    .tracks
+                    .get_mut(*track)
+                    .ok_or(EditError::NoSuchTrack(*track))?;
+                Arc::make_mut(track).magnetic = *magnetic;
+                Ok(None)
+            }
             Edit::Compound { clips, media } => {
                 let (track, start, duration) = self.compound_place(clips)?;
                 let mut taken = Vec::new();
@@ -404,6 +420,7 @@ impl Timeline {
             let mut copy = Track::new(track.kind, track.name.clone());
             copy.enabled = track.enabled;
             copy.muted = track.muted;
+            copy.magnetic = track.magnetic;
             let mut end = 0;
             for (at, clip) in chosen {
                 let at = at - start;

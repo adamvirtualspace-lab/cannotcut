@@ -43,7 +43,8 @@ impl Timeline {
         metadata.insert(OWN_METADATA.to_string(), json!({ "rate": rate_json(self.rate) }));
         let tracks: Vec<Value> = self
             .tracks()
-            .map(|track| write_track(track, self.rate))
+            .enumerate()
+            .map(|(index, track)| write_track(track, index, self.rate))
             .collect();
         let timeline = json!({
             "OTIO_SCHEMA": "Timeline.1",
@@ -105,19 +106,22 @@ impl Timeline {
             stack: extras(stack),
             next_id: 0,
         };
-        for child in children(stack) {
+        for (index, child) in children(stack).enumerate() {
             let child = object(child, "a track")?;
             if schema_name(child) != "Track" {
                 return Err(unsupported(schema(child), "in place of a track"));
             }
-            let track = read_track(child, rate, &mut timeline.next_id)?;
+            let track = read_track(child, index, rate, &mut timeline.next_id)?;
             timeline.tracks.push(Arc::new(track));
         }
         Ok(timeline)
     }
 }
 
-fn write_track(track: &Track, rate: Rate) -> Value {
+/// The track at `index` of its stack, for the file. Whether it is magnetic is written down
+/// only where it differs from what a file without it means: the main track (the first)
+/// magnetic, the others not.
+fn write_track(track: &Track, index: usize, rate: Rate) -> Value {
     let children: Vec<Value> = track
         .items()
         .iter()
@@ -141,8 +145,15 @@ fn write_track(track: &Track, rate: Rate) -> Value {
         })
         .collect();
     let mut metadata = track.extras.metadata.clone();
+    let mut own = serde_json::Map::new();
     if track.muted {
-        metadata.insert(OWN_METADATA.to_string(), json!({ "muted": true }));
+        own.insert("muted".to_string(), json!(true));
+    }
+    if track.magnetic != (index == 0) {
+        own.insert("magnetic".to_string(), json!(track.magnetic));
+    }
+    if !own.is_empty() {
+        metadata.insert(OWN_METADATA.to_string(), Value::Object(own));
     }
     json!({
         "OTIO_SCHEMA": "Track.1",
@@ -217,7 +228,8 @@ fn write_inside(clip: &Clip, inner: &Timeline, rate: Rate) -> Value {
     metadata.insert(OWN_METADATA.to_string(), own);
     let tracks: Vec<Value> = inner
         .tracks()
-        .map(|track| write_track(track, inner.rate))
+        .enumerate()
+        .map(|(index, track)| write_track(track, index, inner.rate))
         .collect();
     json!({
         "OTIO_SCHEMA": "Stack.1",
@@ -238,7 +250,12 @@ fn media_start(media: &Media, rate: Rate) -> i64 {
         .map_or(0, |available| media.rate.rescale_nearest(available.start, rate))
 }
 
-fn read_track(track: &Object, rate: Rate, next_id: &mut u64) -> Result<Track, Error> {
+fn read_track(
+    track: &Object,
+    index: usize,
+    rate: Rate,
+    next_id: &mut u64,
+) -> Result<Track, Error> {
     refuse_source_range(track, "a track")?;
     let kind = match text_of(track, "kind").as_str() {
         "Video" | "" => TrackKind::Video,
@@ -267,8 +284,13 @@ fn read_track(track: &Object, rate: Rate, next_id: &mut u64) -> Result<Track, Er
         kind,
         enabled: flag(track, "enabled"),
         muted: own
+            .as_ref()
             .and_then(|own| own.get("muted")?.as_bool())
             .unwrap_or(false),
+        magnetic: own
+            .as_ref()
+            .and_then(|own| own.get("magnetic")?.as_bool())
+            .unwrap_or(index == 0),
         extras,
         items,
     };
@@ -360,12 +382,12 @@ fn read_inside(stack: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Er
         stack: Extras::default(),
         next_id: 0,
     };
-    for child in children(stack) {
+    for (index, child) in children(stack).enumerate() {
         let child = object(child, "a track")?;
         if schema_name(child) != "Track" {
             return Err(unsupported(schema(child), "in place of a track"));
         }
-        let track = read_track(child, inner_rate, &mut inner.next_id)?;
+        let track = read_track(child, index, inner_rate, &mut inner.next_id)?;
         inner.tracks.push(Arc::new(track));
     }
     let media = Media::inside(inner);
@@ -725,6 +747,31 @@ mod tests {
         assert_eq!(Timeline::from_otio(&text).unwrap(), timeline);
         // Other tools read whole numbers at the timeline's rate.
         assert!(text.contains("\"rate\": 29.97002997002997"), "{text}");
+    }
+
+    #[test]
+    fn which_tracks_are_magnetic_is_kept() {
+        // A file that does not say: the main track is, the others are not.
+        let foreign = Timeline::from_otio(FOREIGN).unwrap();
+        let magnetic: Vec<bool> = foreign.tracks().map(|track| track.magnetic).collect();
+        assert!(magnetic[0] && magnetic[1..].iter().all(|magnetic| !magnetic));
+
+        let mut timeline = Timeline::new("magnets", Rate::new(30, 1));
+        let overlay = Edit::AddTrack {
+            index: 1,
+            kind: TrackKind::Video,
+            name: "Overlay".to_string(),
+        };
+        timeline.apply(&overlay).unwrap();
+        let text = timeline.to_otio();
+        // As files without it would be read: nothing written.
+        assert!(!text.contains("magnetic"), "{text}");
+        for (track, magnetic) in [(0, false), (1, true)] {
+            timeline.apply(&Edit::SetMagnetic { track, magnetic }).unwrap();
+        }
+        let back = Timeline::from_otio(&timeline.to_otio()).unwrap();
+        assert_eq!(back, timeline);
+        assert!(!back.track(0).unwrap().magnetic && back.track(1).unwrap().magnetic);
     }
 
     #[test]

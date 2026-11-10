@@ -304,6 +304,10 @@ pub struct Track {
     pub enabled: bool,
     /// Its sound is not heard; its pictures still are.
     pub muted: bool,
+    /// Its clips keep together: one put in goes in between two, pushing the rest along, and
+    /// one taken out or shortened closes the gap. Otherwise clips go where they are put, with
+    /// gaps between them. The main track starts so.
+    pub magnetic: bool,
     pub extras: Extras,
     pub(crate) items: Vec<Item>,
 }
@@ -315,6 +319,7 @@ impl Track {
             kind,
             enabled: true,
             muted: false,
+            magnetic: false,
             extras: Extras::default(),
             items: Vec::new(),
         }
@@ -455,7 +460,10 @@ impl Timeline {
             metadata: Map::new(),
             rate,
             start: 0,
-            tracks: vec![Arc::new(Track::new(TrackKind::Video, "Main"))],
+            tracks: vec![Arc::new(Track {
+                magnetic: true,
+                ..Track::new(TrackKind::Video, "Main")
+            })],
             stack: Extras::default(),
             next_id: 0,
         }

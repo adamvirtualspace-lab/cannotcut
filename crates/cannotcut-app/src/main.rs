@@ -1,11 +1,15 @@
 //! cannotcut: a timeline of clips that can be rearranged, trimmed, cut and played with their
 //! sound, a viewer showing the frame under the playhead, and live latency and memory readouts.
 
+// A release opens as a window alone; a development build keeps its console for what it prints.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod about;
 mod dock;
 mod fit;
 mod icons;
 mod panels;
+mod placement;
 mod title_bar;
 mod settings;
 mod sound_output;
@@ -46,10 +50,10 @@ use icons::{ICON_BUTTON_WIDTH, Icon};
 use panels::{DETAILS_WIDTH, DetailsTab, Divider, MEDIA_WIDTH, MediaTab, Side, icon_button,
     labelled, labelled_width, tool_control};
 use settings::Settings;
-use sound_output::Outputs;
+use sound_output::{Outputs, SyncTest};
 use theme::button;
 use timeline_panel::{
-    Action, LANE_GAP, LANE_HEIGHT, MAIN_TRACK, PANEL_HEIGHT, RULER_HEIGHT, View, Waveforms,
+    Action, LANE_GAP, LANE_HEIGHT, PANEL_HEIGHT, RULER_HEIGHT, View, Waveforms,
     timecode_base, timeline_panel,
 };
 use viewer::{YuvPicture, renderer_probe};
@@ -142,7 +146,9 @@ const MAX_VOLUME: f32 = 2.0;
 const VOLUME_LABEL_WIDTH: f32 = 44.0;
 const VOLUME_SPACING: f32 = 8.0;
 /// The column of track buttons left of the timeline panel.
-const HEADER_WIDTH: f32 = 48.0;
+const HEADER_WIDTH: f32 = 2.0 * ICON_BUTTON_WIDTH + HEADER_SPACING + 12.0;
+/// Between the buttons beside a lane.
+const HEADER_SPACING: f32 = 4.0;
 /// The rate of a project until its first clip sets it.
 const EMPTY_PROJECT_RATE: Rate = Rate::new(30, 1);
 
@@ -190,6 +196,8 @@ struct Away {
     /// Where it goes back to in the main window.
     back: dock::Back,
     full_screen: bool,
+    /// Where its window is on the screens, as last seen.
+    placement: Option<placement::Placement>,
 }
 
 #[derive(Clone)]
@@ -218,6 +226,14 @@ enum Message {
     /// An output picked by name, or the system's default.
     SoundOutputChosen(Option<String>),
     SoundOutputClosed,
+    /// The sync test started or stopped: a beep and a flash each second.
+    SyncTestToggled,
+    /// How much later the output in use is heard than the sound card says, in milliseconds.
+    SyncDelayChanged(u32),
+    /// The microphone to measure that with.
+    SyncMeasure,
+    /// A frame of the display while the sync test runs.
+    SyncTick,
     ExportResolution(Resolution),
     ExportQuality(Quality),
     /// The choices are made: ask where the film goes.
@@ -271,6 +287,8 @@ enum Message {
     AddTrack,
     /// Silence a track, or let it be heard again.
     ToggleMute(usize),
+    /// A track's clips made to keep together, or to go where they are put.
+    ToggleMagnetic(usize),
     /// The volume slider of the selected clip is being dragged.
     VolumeChanged(f32),
     /// The volume slider was let go: the volume it shows is set.
@@ -336,6 +354,10 @@ enum Message {
     PutBack(window::Id),
     /// A panel's own window over the whole of its screen, or back.
     FullScreenToggled(window::Id),
+    /// A window moved or changed size.
+    WindowMoved(window::Id),
+    /// Where a panel's own window is now.
+    PlacementRead(window::Id, Option<placement::Placement>),
     Key(keyboard::Event),
     MemoryTick,
 }
@@ -640,6 +662,8 @@ struct App {
     sound_opened: u64,
     /// The card to pick the sound output, while it is open: the outputs, once listed.
     sound_outputs: Option<Option<Outputs>>,
+    /// The sync test, while it runs.
+    sync_test: Option<SyncTest>,
     settings: Settings,
     playback: Option<Playback>,
     play_stats: Option<PlayStats>,
@@ -705,6 +729,8 @@ struct App {
     dock: pane_grid::State<Part>,
     /// A gap between docked panels is being dragged.
     dock_resizing: bool,
+    /// The panels' windows moved since the layout was last kept; kept within a second.
+    layout_moved: bool,
     /// How wide the side panels slide out in a narrow window, and the share of its height the
     /// timeline was dragged to; with no share it is as tall as its tracks want.
     media_width: f32,
@@ -828,6 +854,7 @@ impl App {
             sound_delay: None,
             sound_opened: 0,
             sound_outputs: None,
+            sync_test: None,
             settings,
             playback: None,
             play_stats: None,
@@ -867,6 +894,7 @@ impl App {
             away: Vec::new(),
             dock: dock::starting(),
             dock_resizing: false,
+            layout_moved: false,
             media_width: MEDIA_WIDTH,
             details_width: DETAILS_WIDTH,
             timeline_share: None,
@@ -914,7 +942,8 @@ impl App {
         app.timeline_share = layout.timeline_share;
         let (main_window, opened) = window::open(main_window_settings());
         app.main_window = main_window;
-        let mut task = Task::batch([opened.then(title_bar::dress), app.add_next()]);
+        let away = app.reopen_away(layout.away.as_ref());
+        let mut task = Task::batch([opened.then(title_bar::dress), away, app.add_next()]);
         if let Some(film) = export {
             task = Task::batch([task, app.export(film)]);
         }
@@ -1102,7 +1131,13 @@ impl App {
                 task
             }
             Some(Leave::Open) => ask(self.main_window, pick_project, Message::ProjectChosen),
-            Some(Leave::Close) => iced::exit(),
+            Some(Leave::Close) => {
+                if std::mem::take(&mut self.layout_moved) {
+                    self.keep_layout();
+                }
+                settings::finish_writing();
+                iced::exit()
+            }
             None => Task::none(),
         }
     }
@@ -1831,6 +1866,7 @@ impl App {
                     part,
                     back,
                     full_screen: false,
+                    placement: None,
                 });
                 if part == Part::Viewer {
                     self.scale_factor = None;
@@ -1842,6 +1878,7 @@ impl App {
             Message::FullScreenToggled(window) => {
                 if let Some(away) = self.away.iter_mut().find(|away| away.window == window) {
                     away.full_screen = !away.full_screen;
+                    self.layout_moved = true;
                     let mode = if away.full_screen {
                         window::Mode::Fullscreen
                     } else {
@@ -1895,7 +1932,46 @@ impl App {
                     self.sound.choose(device);
                 }
             }
-            Message::SoundOutputClosed => self.sound_outputs = None,
+            Message::SoundOutputClosed => {
+                self.sound_outputs = None;
+                if self.sync_test.take().is_some() {
+                    self.sound.stop();
+                }
+            }
+            Message::SyncTestToggled => {
+                if self.sync_test.take().is_some() {
+                    self.sound.stop();
+                } else {
+                    self.start_sync_test();
+                }
+            }
+            Message::SyncDelayChanged(delay) => {
+                if let SoundStatus::Ready { device, .. } = self.sound.status() {
+                    self.settings.sound_delays.insert(device, u64::from(delay));
+                    self.settings.save_sound_delays();
+                    self.sound.set_delay(Duration::from_millis(u64::from(delay)));
+                }
+            }
+            Message::SyncMeasure => {
+                if self.sync_test.is_none() {
+                    self.start_sync_test();
+                }
+                if let Some(test) = &mut self.sync_test {
+                    test.listen();
+                }
+            }
+            Message::SyncTick => {
+                let measured = self.sync_test.as_mut().and_then(|test| {
+                    test.finished(|frame| self.sound.reported_heard_at(frame))
+                });
+                if let Some(lag) = measured {
+                    let delay = sound_output::delay_for(lag);
+                    if let Some(test) = &mut self.sync_test {
+                        test.note_result(lag, delay);
+                    }
+                    return self.update(Message::SyncDelayChanged(delay));
+                }
+            }
             Message::ExportResolution(resolution) => self.settings.export.resolution = resolution,
             Message::ExportQuality(quality) => self.settings.export.quality = quality,
             Message::PictureSized(target, size) => {
@@ -1968,6 +2044,9 @@ impl App {
                 return self.move_playhead(self.playhead.saturating_add(frames));
             }
             Message::PlayToggled => {
+                if self.sync_test.take().is_some() {
+                    self.sound.stop();
+                }
                 let was_playing = self.playback.is_some();
                 self.stop_playing();
                 if !was_playing && self.history.timeline().duration() > 0 {
@@ -2038,6 +2117,12 @@ impl App {
                     kind: TrackKind::Video,
                     name: format!("Video {}", tracks + 1),
                 });
+            }
+            Message::ToggleMagnetic(track) => {
+                let magnetic = self.history.timeline().track(track).map(|track| !track.magnetic);
+                if let Some(magnetic) = magnetic {
+                    return self.edit(&Edit::SetMagnetic { track, magnetic });
+                }
             }
             Message::ToggleMute(track) => {
                 let muted = self.history.timeline().track(track).map(|track| !track.muted);
@@ -2222,9 +2307,32 @@ impl App {
                 }
             }
             Message::Key(_) => {}
+            Message::WindowMoved(window) => {
+                // Over the whole screen it is where it was before; that is what is kept.
+                let moving = self
+                    .away
+                    .iter()
+                    .any(|away| away.window == window && !away.full_screen);
+                if moving {
+                    return placement::read(window)
+                        .map(move |placement| Message::PlacementRead(window, placement));
+                }
+            }
+            Message::PlacementRead(window, Some(placement)) => {
+                if let Some(away) = self.away.iter_mut().find(|away| away.window == window)
+                    && away.placement != Some(placement)
+                {
+                    away.placement = Some(placement);
+                    self.layout_moved = true;
+                }
+            }
+            Message::PlacementRead(_, None) => {}
             Message::MemoryTick => {
                 self.memory_mb =
                     memory_stats::memory_stats().map(|usage| usage.physical_mem / BYTES_PER_MB);
+                if std::mem::take(&mut self.layout_moved) {
+                    self.keep_layout();
+                }
             }
         }
         Task::none()
@@ -2499,7 +2607,7 @@ impl App {
         })
     }
 
-    /// Taking the selected clips away. On the main track the clips after them close up.
+    /// Taking the selected clips away. On a magnetic track the clips after them close up.
     fn delete_edit(&self) -> Option<Edit> {
         let timeline = self.history.timeline();
         let mut edits: Vec<Edit> = self
@@ -2507,9 +2615,10 @@ impl App {
             .iter()
             .filter_map(|id| {
                 let (track, clip, _) = timeline.clip(*id)?;
+                let ripple = timeline.track(track).is_some_and(|track| track.magnetic);
                 Some(Edit::Remove {
                     clip: clip.id,
-                    ripple: track == MAIN_TRACK,
+                    ripple,
                 })
             })
             .collect();
@@ -2567,6 +2676,20 @@ impl App {
         if let Some(playback) = &mut self.playback {
             playback.clock = clock;
         }
+    }
+
+    /// Starts the sync test: playing stops, and the beeps start, at the delay set for the
+    /// output in use.
+    fn start_sync_test(&mut self) {
+        self.stop_playing();
+        let delay = self.output_delay().unwrap_or(0);
+        self.sound.set_delay(Duration::from_millis(delay));
+        self.sound.play_tone();
+        let rate = match self.sound.status() {
+            SoundStatus::Ready { rate, .. } => rate,
+            _ => 48_000,
+        };
+        self.sync_test = Some(SyncTest::new(rate));
     }
 
     /// Ends playback, sound and all.
@@ -2752,6 +2875,9 @@ impl App {
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
                     Some(Message::Rescaled(window, scale_factor))
                 }
+                iced::Event::Window(window::Event::Moved(_) | window::Event::Resized(_)) => {
+                    Some(Message::WindowMoved(window))
+                }
                 _ => None,
             }),
         ];
@@ -2788,6 +2914,9 @@ impl App {
                 }
             }));
         }
+        if self.sync_test.is_some() {
+            subscriptions.push(window::frames().map(|_| Message::SyncTick));
+        }
         if self.playback.is_some() {
             // One tick for every frame the display shows.
             subscriptions.push(window::frames().map(|_| Message::PlayTick));
@@ -2818,6 +2947,61 @@ impl App {
             .map_or(self.main_window, |away| away.window)
     }
 
+    /// Opens the panels' own windows that were open when the app last closed, `kept` as
+    /// `keep_layout` wrote them: each where it was, maximized or over the whole screen as it
+    /// was.
+    fn reopen_away(&mut self, kept: Option<&serde_json::Value>) -> Task<Message> {
+        let Some(kept) = kept.and_then(serde_json::Value::as_array) else {
+            return Task::none();
+        };
+        let mut tasks = Vec::new();
+        for entry in kept {
+            let Some(part) = entry.get("part").and_then(|part| part.as_str()) else {
+                continue;
+            };
+            let Some(part) = Part::from_key(part) else {
+                continue;
+            };
+            if part == Part::Timeline || self.is_away(part) {
+                continue;
+            }
+            let Some(back) = dock::take_out(&mut self.dock, part) else {
+                continue;
+            };
+            let placement = entry
+                .get("placement")
+                .and_then(placement::Placement::from_value);
+            let full_screen = entry.get("full_screen").and_then(|on| on.as_bool()) == Some(true);
+            // Shown once in place, so that it does not jump there in sight.
+            let (window, opened) = window::open(window::Settings {
+                visible: false,
+                ..panel_window_settings()
+            });
+            self.away.push(Away {
+                window,
+                part,
+                back,
+                full_screen,
+                placement,
+            });
+            let mode = if full_screen {
+                window::Mode::Fullscreen
+            } else {
+                window::Mode::Windowed
+            };
+            tasks.push(opened.then(move |window| {
+                let placed = match placement {
+                    Some(placement) => placement::apply(window, placement),
+                    None => Task::none(),
+                };
+                title_bar::dress(window)
+                    .chain(placed)
+                    .chain(window::set_mode(window, mode))
+            }));
+        }
+        Task::batch(tasks)
+    }
+
     /// Closes a panel's own window, and puts the panel back where it was in the main one.
     fn put_back(&mut self, window: window::Id) -> Task<Message> {
         let Some(index) = self.away.iter().position(|away| away.window == window) else {
@@ -2841,6 +3025,18 @@ impl App {
             dock: Some(dock::to_value(
                 &self.dock,
                 self.away.iter().map(|away| (away.part, &away.back)),
+            )),
+            away: Some(serde_json::Value::Array(
+                self.away
+                    .iter()
+                    .map(|away| {
+                        serde_json::json!({
+                            "part": away.part.key(),
+                            "placement": away.placement.map(|placement| placement.value()),
+                            "full_screen": away.full_screen,
+                        })
+                    })
+                    .collect(),
             )),
         };
         self.settings.save_layout();
@@ -3162,11 +3358,32 @@ impl App {
         )
     }
 
-    /// A button beside each lane of the timeline panel to mute its track, lined up with it.
+    /// Buttons beside each lane of the timeline panel, lined up with it: whether its clips
+    /// keep together, and whether its sound is heard.
     fn track_headers(&self, height: f32) -> Element<'_, Message> {
         let tracks = self.history.timeline().tracks();
         // The top of the stack is the top lane.
         let buttons = tracks.enumerate().rev().map(|(index, track)| {
+            let (magnet_style, magnet_ink, magnet_about): (
+                fn(&Theme, button::Status) -> button::Style,
+                _,
+                _,
+            ) = if track.magnetic {
+                (
+                    theme::on,
+                    theme::ON_ACCENT,
+                    "Magnetic: clips keep together, gaps close. Tap to place clips freely",
+                )
+            } else {
+                (
+                    theme::quiet,
+                    theme::TEXT_DIM,
+                    "Free: clips go where they are put. Tap to make the track magnetic",
+                )
+            };
+            let magnet = icon_button(Icon::Magnetic, magnet_ink)
+                .on_press(Message::ToggleMagnetic(index))
+                .style(magnet_style);
             let (which, about, style): (_, _, fn(&Theme, button::Status) -> button::Style) =
                 if track.muted {
                     (Icon::Muted, "Muted: tap to hear the track", theme::danger)
@@ -3177,11 +3394,14 @@ impl App {
             let toggle = icon_button(which, ink)
                 .on_press(Message::ToggleMute(index))
                 .style(style);
-            container(hint(toggle, about))
-                .width(Fill)
-                .height(LANE_HEIGHT)
-                .center(LANE_HEIGHT)
-                .into()
+            container(
+                row![hint(magnet, magnet_about), hint(toggle, about)]
+                    .spacing(HEADER_SPACING)
+                    .align_y(Center),
+            )
+            .center_x(Fill)
+            .center_y(LANE_HEIGHT)
+            .into()
         });
         let column = Column::with_children(buttons)
             .spacing(LANE_GAP)

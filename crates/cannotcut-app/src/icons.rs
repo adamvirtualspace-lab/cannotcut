@@ -54,6 +54,7 @@ icons! {
     FullScreen = "maximize",
     Import = "plus",
     LeaveFullScreen = "minimize",
+    Magnetic = "magnet",
     Media = "layout-sidebar",
     MediaFile = "movie",
     Menu = "menu-2",

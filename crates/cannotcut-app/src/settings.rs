@@ -17,6 +17,7 @@ const MEDIA_WIDTH: &str = "media_width";
 const DETAILS_WIDTH: &str = "details_width";
 const TIMELINE_SHARE: &str = "timeline_share";
 const DOCK: &str = "dock";
+const AWAY: &str = "away";
 
 /// How the panels were sized and arranged; none where they were left as they start.
 #[derive(Clone, Default)]
@@ -28,6 +29,9 @@ pub struct Layout {
     pub timeline_share: Option<f32>,
     /// How the panels are docked in a wide window, as `dock::to_value` keeps it.
     pub dock: Option<Value>,
+    /// The panels in windows of their own, and where those windows were: a list of
+    /// `{"part", "placement", "full_screen"}`.
+    pub away: Option<Value>,
 }
 
 #[derive(Default)]
@@ -79,9 +83,15 @@ impl Settings {
                 details_width: size(DETAILS_WIDTH),
                 timeline_share: size(TIMELINE_SHARE).filter(|share| *share < 1.0),
                 dock: layout.get(DOCK).cloned(),
+                away: layout.get(AWAY).cloned(),
             };
         }
         settings
+    }
+
+    /// Keeps how late each output is heard in the file.
+    pub fn save_sound_delays(&self) {
+        save(SOUND_DELAYS, json!(self.sound_delays));
     }
 
     /// Keeps the sound output picked in the file.
@@ -119,6 +129,9 @@ impl Settings {
         if let Some(dock) = &self.layout.dock {
             layout.insert(DOCK.to_string(), dock.clone());
         }
+        if let Some(away) = &self.layout.away {
+            layout.insert(AWAY.to_string(), away.clone());
+        }
         save(LAYOUT, Value::Object(layout));
     }
 }
@@ -127,7 +140,7 @@ impl Settings {
 /// once; the file is written on a thread of its own.
 fn save(key: &'static str, value: Value) {
     static WRITING: Mutex<()> = Mutex::new(());
-    let written = std::thread::Builder::new()
+    let writer = std::thread::Builder::new()
         .name("cannotcut-settings".to_string())
         .spawn(move || {
             let Some(path) = path() else {
@@ -146,7 +159,22 @@ fn save(key: &'static str, value: Value) {
             let _ = std::fs::write(path, text);
         });
     // Not remembering a choice for next time is no reason to stop anything now.
-    drop(written);
+    if let Ok(writer) = writer {
+        lock_writers().push(writer);
+    }
+}
+
+fn lock_writers() -> std::sync::MutexGuard<'static, Vec<std::thread::JoinHandle<()>>> {
+    static WRITERS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+    WRITERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Waits for what is being written to the file, before the app ends.
+pub fn finish_writing() {
+    let writers = std::mem::take(&mut *lock_writers());
+    for writer in writers {
+        let _ = writer.join();
+    }
 }
 
 fn read() -> Option<Map<String, Value>> {

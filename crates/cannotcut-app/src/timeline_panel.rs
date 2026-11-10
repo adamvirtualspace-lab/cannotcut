@@ -22,9 +22,9 @@ use iced::{
     border, mouse, touch, window,
 };
 
-/// The track whose clips always sit back to back: taking one out closes the hole, and clips
-/// dropped on it go in between the others.
-pub const MAIN_TRACK: usize = 0;
+/// The track a new project's clips go on, magnetic to begin with.
+#[cfg(test)]
+const MAIN_TRACK: usize = 0;
 /// The panel's least height, room for three tracks. It grows with the window to show more
 /// tracks, but never with what it shows: the viewer above it must not be squeezed by that.
 pub const PANEL_HEIGHT: f32 = 176.0;
@@ -275,6 +275,11 @@ impl<Message> TimelinePanel<'_, Message> {
             .then(|| tracks - 1 - lane as usize)
     }
 
+    /// Whether the track's clips keep together (see `Track::magnetic`).
+    fn magnetic(&self, track: usize) -> bool {
+        self.timeline.track(track).is_some_and(|track| track.magnetic)
+    }
+
     fn hit(&self, view: View, point: Point) -> Hit {
         if point.y < RULER_HEIGHT {
             return Hit::Ruler;
@@ -372,7 +377,7 @@ impl<Message> TimelinePanel<'_, Message> {
         let Some((track, clip, start)) = self.timeline.clip(id) else {
             return (None, None);
         };
-        let ripple = track == MAIN_TRACK;
+        let ripple = self.magnetic(track);
         let Some(range) = self.timeline.trim_range(id, edge, ripple) else {
             return (None, None);
         };
@@ -421,9 +426,9 @@ impl<Message> TimelinePanel<'_, Message> {
         let lane = ((point.y - RULER_HEIGHT - LANE_GAP / 2.0) / (LANE_HEIGHT + LANE_GAP)).floor();
         let to = tracks - 1 - (lane.max(0.0) as usize).min(tracks - 1);
         let mut wanted = (view.frame(point.x) - grab).round() as i64;
-        let ripple = from == MAIN_TRACK;
+        let ripple = self.magnetic(from);
 
-        // Where it can go is judged without it: on the main track the others have closed up.
+        // Where it can go is judged without it: on a magnetic track the others have closed up.
         let mut rest = self.timeline.clone();
         if rest.apply(&Edit::Remove { clip: id, ripple }).is_err() {
             return (None, None);
@@ -431,7 +436,7 @@ impl<Message> TimelinePanel<'_, Message> {
         let Some(target) = rest.track(to) else {
             return (None, None);
         };
-        let (at, mode, snapped) = if to == MAIN_TRACK {
+        let (at, mode, snapped) = if self.magnetic(to) {
             // In between the clips, wherever that is nearest.
             let at = target
                 .borders()
@@ -443,8 +448,8 @@ impl<Message> TimelinePanel<'_, Message> {
                 let clips = track.into_iter().flat_map(Track::clips);
                 clips.filter(|(start, _)| *start < frame).count()
             };
-            let before = clips_before(self.timeline.track(MAIN_TRACK), start);
-            if from == MAIN_TRACK && clips_before(Some(target), at) == before {
+            let before = clips_before(self.timeline.track(from), start);
+            if from == to && clips_before(Some(target), at) == before {
                 return (None, None);
             }
             (at, Placement::Insert, None)

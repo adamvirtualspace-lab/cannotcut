@@ -9,8 +9,11 @@
 //! [`Player::opened`]).
 
 mod mixer;
+mod sync;
 
 pub use mixer::{Mixer, frame_to_sample};
+pub use sync::{Listener, measure};
+use sync::Tone;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -117,6 +120,8 @@ enum Command {
         follows: Option<(u64, Duration)>,
     },
     Stop,
+    /// Beeps at the start of every second, to line sound up with pictures by.
+    Tone { id: u64 },
     /// Plays through the output of this name from now on, or the default with none.
     Use(Option<String>),
     /// The output stopped working, or the default output changed: open it again.
@@ -254,6 +259,32 @@ impl Player {
 
     pub fn status(&self) -> Status {
         lock(&self.shared.status).clone().unwrap_or(Status::Starting)
+    }
+
+    /// Beeps at the start of every second instead of whatever was playing, to line sound up
+    /// with pictures by: [`position`](Self::position) says where in the seconds the sound
+    /// heard is, with the delay set, and [`reported_heard_at`](Self::reported_heard_at) when
+    /// the sound card says a beep is heard, without it.
+    pub fn play_tone(&mut self) {
+        self.replaced = None;
+        self.plays += 1;
+        self.playing = Some(self.plays);
+        let _ = self.commands.send(Command::Tone { id: self.plays });
+    }
+
+    /// When the sound card says the sound `frame` frames into what is playing is heard, with
+    /// no delay of the output's own added. None before any of it was handed over.
+    pub fn reported_heard_at(&self, frame: i64) -> Option<Instant> {
+        let anchor = lock(&self.shared.anchors)
+            .latest
+            .filter(|anchor| Some(anchor.play) == self.playing)?;
+        let from = anchor.before as f64;
+        let seconds = (frame as f64 - from) / f64::from(anchor.rate);
+        if seconds >= 0.0 {
+            Some(anchor.heard_at + Duration::from_secs_f64(seconds))
+        } else {
+            anchor.heard_at.checked_sub(Duration::from_secs_f64(-seconds))
+        }
     }
 
     /// Plays through the output named `device` from now on, or the default one. What was
@@ -557,6 +588,28 @@ fn open_output(
     output
 }
 
+/// What the sound thread mixes ahead of the sound card.
+enum Source {
+    Mix(Mixer),
+    Tone(Tone),
+}
+
+impl Source {
+    fn finished(&self) -> bool {
+        match self {
+            Source::Mix(mixer) => mixer.finished(),
+            Source::Tone(_) => false,
+        }
+    }
+
+    fn mix(&mut self, out: &mut [f32]) -> usize {
+        match self {
+            Source::Mix(mixer) => mixer.mix(out),
+            Source::Tone(tone) => tone.mix(out),
+        }
+    }
+}
+
 /// The sound thread: opens the sound card, then mixes whatever is playing ahead of it.
 fn run(
     commands: mpsc::Receiver<Command>,
@@ -566,7 +619,7 @@ fn run(
 ) {
     let mut output = open_output(wanted.as_deref(), &sender, &shared);
     let mut chunk = vec![0.0; CHUNK * CHANNELS];
-    let mut mixing: Option<(Mixer, rtrb::Producer<f32>)> = None;
+    let mut mixing: Option<(Source, rtrb::Producer<f32>)> = None;
     loop {
         let Some(out) = &mut output else {
             // No output: try again now and then, as the system may be between two.
@@ -667,7 +720,24 @@ fn run(
                 if let Err(error) = out.stream.play() {
                     *lock(&shared.problem) = Some(format!("sound output: {error}"));
                 }
-                mixing = Some((mixer, samples));
+                mixing = Some((Source::Mix(mixer), samples));
+            }
+            Some(Command::Tone { id }) => {
+                let mut tone = Tone::new(out.rate);
+                let (mut samples, consumer) = rtrb::RingBuffer::new(capacity);
+                while consumer_len(&samples, capacity) < prefill {
+                    let count = tone.mix(&mut chunk);
+                    let _ = samples.push_entire_slice(&chunk[..count * CHANNELS]);
+                }
+                out.hand(Handoff::Play {
+                    id,
+                    start: 0,
+                    samples: consumer,
+                });
+                if let Err(error) = out.stream.play() {
+                    *lock(&shared.problem) = Some(format!("sound output: {error}"));
+                }
+                mixing = Some((Source::Tone(tone), samples));
             }
             Some(Command::Stop) => {
                 mixing = None;
@@ -675,12 +745,14 @@ fn run(
                 let _ = out.stream.pause();
             }
             None => {
-                if let Some((mixer, samples)) = &mut mixing
+                if let Some((source, samples)) = &mut mixing
                     && samples.slots() >= chunk.len()
                 {
-                    let count = mixer.mix(&mut chunk);
+                    let count = source.mix(&mut chunk);
                     let _ = samples.push_entire_slice(&chunk[..count * CHANNELS]);
-                    note_problem(&shared, mixer);
+                    if let Source::Mix(mixer) = source {
+                        note_problem(&shared, mixer);
+                    }
                 }
             }
         }
