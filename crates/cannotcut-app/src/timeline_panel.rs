@@ -210,6 +210,9 @@ struct State {
     followed: Option<i64>,
     /// The clip last pressed on, and when: a second press soon after is a double-click.
     last_press: Option<(ClipId, Instant)>,
+    /// While a rectangle is drawn to select clips: what was selected before it, which it
+    /// adds to (nothing unless adding).
+    marquee_base: Vec<ClipId>,
 }
 
 /// What a press that is still held down is doing.
@@ -231,13 +234,18 @@ enum Gesture {
         edge: Edge,
         press_x: f32,
     },
+    /// On empty track: a rectangle from where it was pressed to where it is now, selecting the
+    /// clips it touches.
+    Marquee { from: Point, to: Point },
 }
 
 /// What is under a point of the panel.
 #[derive(Clone, Copy, PartialEq)]
 enum Hit {
-    /// The ruler, or a lane where no clip is.
-    Empty { lane: bool },
+    /// The ruler: the one place that moves the playhead.
+    Ruler,
+    /// Track where no clip is, or below the tracks.
+    Empty,
     Body { id: ClipId, start: i64 },
     Grip { id: ClipId, edge: Edge },
 }
@@ -268,8 +276,11 @@ impl<Message> TimelinePanel<'_, Message> {
     }
 
     fn hit(&self, view: View, point: Point) -> Hit {
+        if point.y < RULER_HEIGHT {
+            return Hit::Ruler;
+        }
         let Some(track) = self.track_at(point.y) else {
-            return Hit::Empty { lane: false };
+            return Hit::Empty;
         };
         let clips = self.timeline.track(track).into_iter().flat_map(|track| track.clips());
         for (start, clip) in clips {
@@ -292,7 +303,30 @@ impl<Message> TimelinePanel<'_, Message> {
                 };
             }
         }
-        Hit::Empty { lane: true }
+        Hit::Empty
+    }
+
+    /// The clips a rectangle with corners `a` and `b` touches.
+    fn clips_in(&self, view: View, a: Point, b: Point) -> Vec<ClipId> {
+        let (left, right) = (a.x.min(b.x), a.x.max(b.x));
+        let (top, bottom) = (a.y.min(b.y), a.y.max(b.y));
+        let tracks = self.timeline.tracks().len();
+        let mut inside = Vec::new();
+        for (index, track) in self.timeline.tracks().enumerate() {
+            // The top of the stack is the top lane.
+            let lane = (tracks - 1 - index) as f32;
+            let lane_top = RULER_HEIGHT + LANE_GAP + lane * (LANE_HEIGHT + LANE_GAP);
+            if lane_top > bottom || lane_top + LANE_HEIGHT < top {
+                continue;
+            }
+            for (start, clip) in track.clips() {
+                let (x0, x1) = (view.x(start as f32), view.x((start + clip.duration) as f32));
+                if x0 <= right && x1 >= left {
+                    inside.push(clip.id);
+                }
+            }
+        }
+        inside
     }
 
     /// Moves the playhead to the frame `x` pixels from the panel's left edge.
@@ -461,6 +495,20 @@ impl<Message> TimelinePanel<'_, Message> {
                 self.relocate(view, *id, *grab, point)
             }
             Gesture::Trim { id, edge, press_x } => self.trim(view, *id, *edge, point.x - *press_x),
+            Gesture::Marquee { from, to } => {
+                *to = point;
+                let mut picked = state.marquee_base.clone();
+                for id in self.clips_in(view, *from, point) {
+                    if !picked.contains(&id) {
+                        picked.push(id);
+                    }
+                }
+                if picked != self.selected {
+                    self.publish(Action::Select(picked), shell);
+                }
+                shell.request_redraw();
+                return;
+            }
         };
         state.snapped = snapped;
         if edit != state.pending {
@@ -471,6 +519,11 @@ impl<Message> TimelinePanel<'_, Message> {
     }
 
     fn press(&self, state: &mut State, point: Point, width: f32, shell: &mut Shell<'_, Message>) {
+        // A drag that never saw its release leaves no preview behind.
+        if state.pending.take().is_some() {
+            self.publish(Action::Cancel, shell);
+        }
+        state.snapped = None;
         let view = self.view(width);
         let hit = self.hit(view, point);
         let adding = self.selecting || state.modifiers.command() || state.modifiers.shift();
@@ -490,12 +543,13 @@ impl<Message> TimelinePanel<'_, Message> {
         let picked = match hit {
             Hit::Body { id, .. } | Hit::Grip { id, .. } => vec![id],
             // A press on the ruler leaves the selection alone; one on empty track clears it,
-            // but not while picking several, where a stray tap would lose them all.
-            Hit::Empty { lane } if !lane || self.selecting => self.selected.to_vec(),
-            Hit::Empty { .. } => Vec::new(),
+            // unless adding (or picking several, where a stray tap would lose them all).
+            Hit::Ruler => self.selected.to_vec(),
+            Hit::Empty if adding => self.selected.to_vec(),
+            Hit::Empty => Vec::new(),
         };
         if picked != self.selected {
-            self.publish(Action::Select(picked), shell);
+            self.publish(Action::Select(picked.clone()), shell);
         }
         if let Hit::Body { id, .. } = hit {
             let now = Instant::now();
@@ -516,9 +570,16 @@ impl<Message> TimelinePanel<'_, Message> {
             }
         }
         state.gesture = match hit {
-            Hit::Empty { .. } => {
+            Hit::Ruler => {
                 self.scrub(point.x, width, shell);
                 Gesture::Scrub
+            }
+            Hit::Empty => {
+                state.marquee_base = picked;
+                Gesture::Marquee {
+                    from: point,
+                    to: point,
+                }
             }
             Hit::Body { id, start } => Gesture::Clip {
                 id,
@@ -535,15 +596,14 @@ impl<Message> TimelinePanel<'_, Message> {
         shell.capture_event();
     }
 
-    fn release(&self, state: &mut State, width: f32, shell: &mut Shell<'_, Message>) {
+    fn release(&self, state: &mut State, shell: &mut Shell<'_, Message>) {
         match std::mem::take(&mut state.gesture) {
-            Gesture::None | Gesture::Scrub => {}
-            // A click on a clip also puts the playhead there.
-            Gesture::Clip {
-                press,
-                moving: false,
-                ..
-            } => self.scrub(press.x, width, shell),
+            // A click on a clip selects it, and that is all: only the ruler moves the playhead.
+            Gesture::None | Gesture::Scrub | Gesture::Clip { moving: false, .. } => {}
+            Gesture::Marquee { .. } => {
+                state.marquee_base.clear();
+                shell.request_redraw();
+            }
             Gesture::Clip { .. } | Gesture::Trim { .. } => {
                 let ended = state.pending.take().map_or(Action::Cancel, Action::Commit);
                 self.publish(ended, shell);
@@ -664,7 +724,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(
                 touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. },
-            ) => self.release(state, bounds.width, shell),
+            ) => self.release(state, shell),
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 if let Some(position) = cursor.position_over(bounds) {
                     let zoom = state.modifiers.command();
@@ -902,6 +962,30 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
 
         // In a layer of its own, or the clips' names would be drawn over it.
         renderer.with_layer(bounds, |renderer| {
+            // The rectangle being drawn to select clips.
+            if let Gesture::Marquee { from, to } = state.gesture {
+                let (left, right) = (from.x.min(to.x), from.x.max(to.x));
+                let (top, bottom) = (from.y.min(to.y), from.y.max(to.y));
+                let area = Rectangle::new(
+                    Point::new(bounds.x + left, bounds.y + top),
+                    Size::new(right - left, bottom - top),
+                );
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: area,
+                        border: Border {
+                            color: crate::theme::ACCENT,
+                            width: 1.0,
+                            radius: 0.0.into(),
+                        },
+                        ..renderer::Quad::default()
+                    },
+                    Color {
+                        a: 0.15,
+                        ..crate::theme::ACCENT
+                    },
+                );
+            }
             let mut bar = |frame: i64, width: f32, height: f32, color: Color| {
                 let x = (bounds.x + view.x(frame as f32)).round() - (width - PLAYHEAD_WIDTH) / 2.0;
                 renderer.fill_quad(
@@ -935,6 +1019,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
             Gesture::Trim { .. } => return mouse::Interaction::ResizingHorizontally,
             Gesture::Clip { moving: true, .. } => return mouse::Interaction::Grabbing,
             Gesture::Scrub | Gesture::Clip { .. } => return mouse::Interaction::Pointer,
+            Gesture::Marquee { .. } => return mouse::Interaction::Crosshair,
             Gesture::None => {}
         }
         let Some(position) = cursor.position_over(bounds) else {
@@ -944,7 +1029,8 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
         match self.hit(self.view(bounds.width), point) {
             Hit::Grip { .. } => mouse::Interaction::ResizingHorizontally,
             Hit::Body { .. } => mouse::Interaction::Grab,
-            Hit::Empty { .. } => mouse::Interaction::Pointer,
+            Hit::Ruler => mouse::Interaction::Pointer,
+            Hit::Empty => mouse::Interaction::Idle,
         }
     }
 }
@@ -1142,9 +1228,27 @@ mod tests {
         assert!(at(98.0, main) == Hit::Grip { id: first, edge: Edge::End });
         assert!(at(101.0, main) == Hit::Grip { id: second, edge: Edge::Start });
         assert!(at(420.0, upper) == Hit::Body { id: overlay, start: 400 });
-        assert!(at(200.0, upper) == Hit::Empty { lane: true });
-        assert!(at(200.0, RULER_HEIGHT / 2.0) == Hit::Empty { lane: false });
-        assert!(at(200.0, PANEL_HEIGHT - 2.0) == Hit::Empty { lane: false });
+        assert!(at(200.0, upper) == Hit::Empty);
+        assert!(at(200.0, RULER_HEIGHT / 2.0) == Hit::Ruler);
+        assert!(at(200.0, PANEL_HEIGHT - 2.0) == Hit::Empty);
+    }
+
+    #[test]
+    fn a_rectangle_selects_the_clips_it_touches() {
+        let (timeline, [first, second, _, overlay]) = project();
+        let panel = panel(&timeline, 0);
+        let (main, upper) = (lane_y(&timeline, MAIN_TRACK), lane_y(&timeline, 1));
+        let rectangle = |x0, y0, x1, y1| {
+            panel.clips_in(PLAIN, Point::new(x0, y0), Point::new(x1, y1))
+        };
+        // Across the main track only, drawn either way.
+        assert_eq!(rectangle(50.0, main, 150.0, main), vec![first, second]);
+        assert_eq!(rectangle(150.0, main, 50.0, main), vec![first, second]);
+        // Down over both tracks.
+        let both = rectangle(410.0, upper, 430.0, main);
+        assert!(both.contains(&overlay) && both.len() == 2);
+        // Over nothing: below the tracks.
+        assert!(rectangle(10.0, PANEL_HEIGHT - 4.0, 900.0, PANEL_HEIGHT - 2.0).is_empty());
     }
 
     #[test]
