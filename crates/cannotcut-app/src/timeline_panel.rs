@@ -30,6 +30,10 @@ const MAIN_TRACK: usize = 0;
 pub const PANEL_HEIGHT: f32 = 176.0;
 pub const RULER_HEIGHT: f32 = 24.0;
 pub const LANE_HEIGHT: f32 = 40.0;
+/// The mark of a keyframe on a clip.
+const KEYFRAME_MARK: f32 = 7.0;
+/// The band over a clip's start where it comes in by a transition.
+const TRANSITION_BAND: f32 = 6.0;
 pub const LANE_GAP: f32 = 4.0;
 /// The part of a lane, from its bottom, that a clip's waveform takes up.
 const WAVEFORM_HEIGHT: f32 = 16.0;
@@ -40,6 +44,8 @@ const WAVEFORM_STEP: f32 = 2.0;
 /// The colour of a clip that plays another project's file: unlike the theme's grey, it does not
 /// look switched off, and unlike its blue and green, it is no video or sound track's colour.
 const NESTED_CLIP: Color = Color::from_rgb8(0x17, 0x80, 0x7f);
+/// The colour of a text clip.
+const TEXT_CLIP: Color = Color::from_rgb8(0xe8, 0xa8, 0x3a);
 /// The colour of a compound clip kept inside the project, told apart from a linked one.
 const INSIDE_CLIP: Color = Color::from_rgb8(0x7a, 0x52, 0xb3);
 /// Two presses on the same clip this close together are a double-click.
@@ -854,6 +860,9 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                     // be loaded is marked as a problem.
                     let nested = clip.media.is_project();
                     let pair = match (nested, &clip.media.project) {
+                        (false, _) if clip.media.title.is_some() => {
+                            Pair::new(TEXT_CLIP, Color::BLACK)
+                        }
                         (false, _) => pair,
                         (true, Some(_)) if clip.media.is_inside() => {
                             Pair::new(INSIDE_CLIP, Color::WHITE)
@@ -891,7 +900,8 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                         let base = y + LANE_HEIGHT - 2.0;
                         let seconds = |x: f32| {
                             let frame = view.frame(x - bounds.x) - start as f32;
-                            (clip.source_start as f64 + f64::from(frame)) / rate.as_f64()
+                            let source = f64::from(frame) * clip.speed;
+                            (clip.source_start as f64 + source) / rate.as_f64()
                         };
                         let mut x = visible.x;
                         while x < visible.x + visible.width - 1.0 {
@@ -945,12 +955,63 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                             }
                             position.x += NEST_BADGE.width + NEST_BADGE_SHIFT + 5.0;
                         }
-                        let mut name = clip.name.clone();
+                        // A text clip goes by its words, as they are now.
+                        let mut name = clip
+                            .media
+                            .title
+                            .as_ref()
+                            .map_or_else(|| clip.name.clone(), |title| title.label());
                         if clip.volume != 1.0 {
                             name.push_str(&format!("  {:.0}%", clip.volume * 100.0));
                         }
+                        if clip.speed != 1.0 {
+                            name.push_str(&format!("  {}x", clip.speed));
+                        }
                         let shaping = text::Shaping::Advanced;
                         fill_label(renderer, name, position, color, visible, shaping);
+                    }
+                    // Its way in, as a light band over the frames it takes.
+                    if let Some(way) = clip.transition_in {
+                        let end = view.x((start + way.duration.min(clip.duration)) as f32);
+                        let band = Rectangle::new(
+                            Point::new(bounds.x + left, y),
+                            Size::new((end - left).max(2.0), TRANSITION_BAND),
+                        );
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: band,
+                                ..renderer::Quad::default()
+                            },
+                            Color {
+                                a: 0.55,
+                                ..Color::WHITE
+                            },
+                        );
+                    }
+                    // Its keyframes, as small marks along its bottom.
+                    for keyframe in &clip.keyframes {
+                        let frame = start + clip.offset_of(keyframe.at);
+                        if !(start..start + clip.duration).contains(&frame) {
+                            continue;
+                        }
+                        let x = bounds.x + view.x(frame as f32);
+                        let top = y + LANE_HEIGHT - KEYFRAME_MARK - 3.0;
+                        let mark = Rectangle::new(
+                            Point::new(x - KEYFRAME_MARK / 2.0, top),
+                            Size::new(KEYFRAME_MARK, KEYFRAME_MARK),
+                        );
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: mark,
+                                border: Border {
+                                    color: Color::BLACK,
+                                    width: 1.0,
+                                    radius: 1.0.into(),
+                                },
+                                ..renderer::Quad::default()
+                            },
+                            Color::WHITE,
+                        );
                     }
                 }
             }

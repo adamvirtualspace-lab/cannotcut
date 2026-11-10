@@ -487,6 +487,7 @@ dependencies = [
 name = "cannotcut-export"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "cannotcut-audio",
  "cannotcut-media",
  "cannotcut-timeline",

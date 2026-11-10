@@ -31,6 +31,10 @@ struct Voice {
     /// The timeline sample after the clip's last.
     end: i64,
     reader: AudioReader,
+    /// For a sound played faster or slower: media samples read but not yet passed, and how
+    /// far past the first of them the next one heard falls.
+    held: Vec<f32>,
+    phase: f64,
 }
 
 impl Mixer {
@@ -91,13 +95,16 @@ impl Mixer {
                 None => {
                     // A sound is joined where it is first heard: at its start, or wherever
                     // the mix began if that was part-way into it.
-                    let media_sample = sound.media_sample + (first - sound.begins);
+                    let skipped = ((first - sound.begins) as f64 * sound.speed).round() as i64;
+                    let media_sample = sound.media_sample + skipped;
                     match self.open(sound, media_sample) {
                         Ok(Some(reader)) => {
                             self.voices.push(Voice {
                                 sound: sound.key.clone(),
                                 end: sound.ends,
                                 reader,
+                                held: Vec::new(),
+                                phase: 0.0,
                             });
                             self.voices.len() - 1
                         }
@@ -113,6 +120,20 @@ impl Mixer {
                     }
                 }
             };
+            let offset = (first - from) as usize * CHANNELS;
+            let gain = sound.gain;
+            if sound.speed != 1.0 {
+                let heard = (last - first) as usize;
+                let playing = &mut self.voices[voice];
+                if let Err(problem) = resampled(playing, sound.speed, heard, |at, value| {
+                    out[offset + at] += value * gain;
+                }) {
+                    self.problem = Some(format!("{}: {problem}", sound.name));
+                    self.silent.push(sound.key.clone());
+                    self.voices.remove(voice);
+                }
+                continue;
+            }
             let samples = (last - first) as usize * CHANNELS;
             self.scratch.resize(samples, 0.0);
             if let Err(problem) = self.voices[voice].reader.read(&mut self.scratch) {
@@ -121,8 +142,6 @@ impl Mixer {
                 self.voices.remove(voice);
                 continue;
             }
-            let offset = (first - from) as usize * CHANNELS;
-            let gain = sound.gain;
             for (mixed, sample) in out[offset..offset + samples].iter_mut().zip(&self.scratch) {
                 *mixed += sample * gain;
             }
@@ -145,6 +164,40 @@ impl Mixer {
         reader.seek(media_sample).map_err(|error| error.to_string())?;
         Ok(Some(reader))
     }
+}
+
+/// Plays `count` samples of a voice's media at `speed`, each value (by its place among the
+/// interleaved values) to `put`: between two media samples, the line joining them. The pitch
+/// goes up or down with the speed.
+fn resampled(
+    voice: &mut Voice,
+    speed: f64,
+    count: usize,
+    mut put: impl FnMut(usize, f32),
+) -> Result<(), cannotcut_media::Error> {
+    // The media samples needed: up to the one after the last heard.
+    let needed = (voice.phase + count as f64 * speed).floor() as usize + 2;
+    let held = voice.held.len() / CHANNELS;
+    if needed > held {
+        let start = voice.held.len();
+        voice.held.resize(needed * CHANNELS, 0.0);
+        voice.reader.read(&mut voice.held[start..])?;
+    }
+    for sample in 0..count {
+        let at = voice.phase + sample as f64 * speed;
+        let base = at.floor() as usize;
+        let fraction = (at - base as f64) as f32;
+        for channel in 0..CHANNELS {
+            let before = voice.held[base * CHANNELS + channel];
+            let after = voice.held[(base + 1) * CHANNELS + channel];
+            put(sample * CHANNELS + channel, before + (after - before) * fraction);
+        }
+    }
+    voice.phase += count as f64 * speed;
+    let passed = (voice.phase.floor() as usize).min(voice.held.len() / CHANNELS);
+    voice.held.drain(..passed * CHANNELS);
+    voice.phase -= passed as f64;
+    Ok(())
 }
 
 #[cfg(test)]

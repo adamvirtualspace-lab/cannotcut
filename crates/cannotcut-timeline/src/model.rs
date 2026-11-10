@@ -4,6 +4,9 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::nest::Nested;
+use crate::title::Title;
+use crate::transform::{Keyframe, Transform, transform_at};
+use crate::transition::{Reveal, Transition, progress};
 
 /// No timeline is longer than this many frames; keeps frame arithmetic far from overflowing.
 pub(crate) const MAX_FRAMES: i64 = 1 << 40;
@@ -111,6 +114,9 @@ pub struct Media {
     /// with the project using it; it is loaded again from `target`. One kept inside is saved
     /// in the using project's file.
     pub project: Option<Arc<Nested>>,
+    /// When the media is words the editor draws, a text clip's: what they are and how they
+    /// look. Such media has no file and no end.
+    pub title: Option<Title>,
 }
 
 impl Media {
@@ -126,6 +132,28 @@ impl Media {
             name: String::new(),
             metadata: Map::new(),
             project: None,
+            title: None,
+        }
+    }
+
+    /// Words the editor draws, as media for a text clip on a timeline at `rate`.
+    pub fn from_title(title: Title, rate: Rate) -> Self {
+        Self {
+            target: None,
+            rate,
+            available: None,
+            name: String::new(),
+            metadata: Map::new(),
+            project: None,
+            title: Some(title),
+        }
+    }
+
+    /// The same media showing other words: what a text clip edited plays.
+    pub fn with_title(&self, title: Title) -> Self {
+        Self {
+            title: Some(title),
+            ..self.clone()
         }
     }
 
@@ -226,22 +254,64 @@ pub struct Clip {
     pub enabled: bool,
     /// How loud its sound plays: 1 as recorded, 0 silent, 2 twice as strong.
     pub volume: f32,
+    /// Where its picture sits in the frame, over the tracks below, while it has no keyframes.
+    pub transform: Transform,
+    /// Where its picture sits at chosen frames of its media, in order; in between it goes from
+    /// one to the next.
+    pub keyframes: Vec<Keyframe>,
+    /// How it comes in over the clip before it on its track, instead of cutting to it.
+    pub transition_in: Option<Transition>,
+    /// How fast its media plays: 1 as recorded, 2 twice as fast, 0.5 half as fast. Its sound
+    /// plays as fast, and goes up or down in pitch with it.
+    pub speed: f64,
     pub extras: Extras,
 }
 
+/// The slowest and fastest a clip plays.
+pub const SPEEDS: std::ops::RangeInclusive<f64> = 0.1..=10.0;
+
 impl Clip {
+    /// Where the clip's picture sits `offset` timeline frames into the clip.
+    pub fn transform_at(&self, offset: i64) -> Transform {
+        transform_at(self.transform, &self.keyframes, self.source_at(offset))
+    }
+
+    /// Where in the media the clip is `offset` timeline frames in, as `source_start` counts:
+    /// timeline frames of the media as recorded. Its keyframes are placed in the same count.
+    pub fn source_at(&self, offset: i64) -> i64 {
+        self.source_start + (offset as f64 * self.speed).round() as i64
+    }
+
+    /// How many timeline frames into the clip the media gets to `source` (as `source_at`
+    /// counts), rounded down; before the clip's start it is negative.
+    pub fn offset_of(&self, source: i64) -> i64 {
+        ((source - self.source_start) as f64 / self.speed).floor() as i64
+    }
+
+    /// The first frame into the clip at which the media has got to `source`.
+    pub(crate) fn offset_reaching(&self, source: i64) -> i64 {
+        ((source - self.source_start) as f64 / self.speed).ceil() as i64
+    }
+
     /// The frame of the media file, counted from its first, that shows `offset` timeline
     /// frames into the clip.
     pub fn media_frame(&self, offset: i64, timeline_rate: Rate) -> i64 {
-        timeline_rate.rescale(self.source_start + offset, self.media.rate)
+        timeline_rate.rescale(self.source_at(offset), self.media.rate)
+    }
+
+    /// How long, in timeline frames, the clip can be at `speed` before its media runs out;
+    /// None when the media's length is unknown.
+    pub(crate) fn longest_at(&self, speed: f64, timeline_rate: Rate) -> Option<i64> {
+        let available = self.media.available?;
+        let length = self.media.rate.rescale(available.duration, timeline_rate);
+        Some((((length - self.source_start) as f64 / speed).floor() as i64).max(1))
     }
 
     /// How far, in timeline frames, the clip's end can still move later before the media runs
     /// out; None when the media's length is unknown.
     pub(crate) fn media_left(&self, timeline_rate: Rate) -> Option<i64> {
-        let available = self.media.available?;
-        let length = self.media.rate.rescale(available.duration, timeline_rate);
-        Some((length - self.source_start - self.duration).max(0))
+        let longest = self.longest_at(self.speed, timeline_rate)?;
+        Some((longest - self.duration).max(0))
     }
 }
 
@@ -271,10 +341,12 @@ impl Item {
                 Self::Gap(rest)
             }
             Self::Clip(clip) => {
+                // The second part follows straight on: the first keeps the way in.
                 let rest = Clip {
                     id: new_id(next_id),
-                    source_start: clip.source_start + at,
+                    source_start: clip.source_at(at),
                     duration: clip.duration - at,
+                    transition_in: None,
                     ..clip.clone()
                 };
                 clip.duration = at;
@@ -378,6 +450,47 @@ impl Track {
     }
 
     /// The clip playing at `frame`, with how far into it that is.
+    /// The pictures of this track at `frame`, bottom first: the clip there, and while it comes
+    /// in by a transition, the clip before it carrying on beneath it; each with how far into
+    /// it the frame is and how much of it is seen.
+    pub(crate) fn pictures_at(&self, frame: i64) -> Vec<(&Clip, i64, Reveal)> {
+        let mut before: Option<(i64, &Clip)> = None;
+        for (start, item) in self.placed() {
+            if start > frame {
+                break;
+            }
+            let clip = match item {
+                Item::Clip(clip) => clip,
+                Item::Gap(_) => {
+                    before = None;
+                    continue;
+                }
+            };
+            if !(start..start + clip.duration).contains(&frame) {
+                before = Some((start, clip));
+                continue;
+            }
+            if !clip.enabled {
+                return Vec::new();
+            }
+            let offset = frame - start;
+            let Some(transition) = clip.transition_in.filter(|way| offset < way.duration) else {
+                return vec![(clip, offset, Reveal::FULL)];
+            };
+            let coming = transition.kind.reveal(progress(&transition, offset));
+            let mut pictures = Vec::new();
+            if let Some((before_start, before)) = before
+                .filter(|(before_start, before)| before_start + before.duration == start)
+                .filter(|(_, before)| before.enabled)
+            {
+                pictures.push((before, frame - before_start, Reveal::FULL));
+            }
+            pictures.push((clip, offset, coming));
+            return pictures;
+        }
+        Vec::new()
+    }
+
     pub fn clip_at(&self, frame: i64) -> Option<(&Clip, i64)> {
         self.clips()
             .find(|(start, clip)| (*start..*start + clip.duration).contains(&frame))
@@ -524,11 +637,22 @@ impl Timeline {
 }
 
 impl Timeline {
-    /// The first frame after `frame` on which the picture comes from another clip than it does
-    /// on `frame`, or from none: the next cut as the viewer sees it. None when the picture stays
-    /// as it is to the end.
+    /// The clips seen at `frame`, bottom track first, with how far into each the frame is and
+    /// how much of each is seen.
+    pub(crate) fn pictures_at(&self, frame: i64) -> Vec<(&Clip, i64, Reveal)> {
+        self.tracks()
+            .filter(|track| track.enabled && track.kind == TrackKind::Video)
+            .flat_map(|track| track.pictures_at(frame))
+            .collect()
+    }
+
+    /// The first frame after `frame` on which the pictures come from other clips than they do
+    /// on `frame`: the next cut as the viewer sees it. None when they stay as they are to the
+    /// end.
     pub fn next_picture_change(&self, frame: i64) -> Option<i64> {
-        let shown = |frame: i64| self.shot_at(frame).map(|shot| shot.key);
+        let shown = |frame: i64| -> Vec<Vec<ClipId>> {
+            self.shots_at(frame).into_iter().map(|shot| shot.key).collect()
+        };
         let now = shown(frame);
         // The picture can only change where a clip begins or ends, here or in a nested project.
         let mut edges = self.picture_edges();

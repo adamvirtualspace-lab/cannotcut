@@ -1,18 +1,20 @@
 //! The viewer's GPU path: a picture's YUV planes go to the GPU as the decoder produced them and a
-//! fragment shader turns them into RGB, so no pixel is converted on the CPU.
+//! fragment shader turns them into RGB, so no pixel is converted on the CPU. The pictures at the
+//! playhead are drawn one over another, each placed in the frame by its clip's transform.
 
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cannotcut_media::{Colors, Matrix};
+use cannotcut_timeline::{Framing, Reveal};
 use iced::advanced::widget::Tree;
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
 use iced::widget::shader::{self, Viewport};
 use iced::{Element, Event, Length, Rectangle, Size, mouse, wgpu};
 
-/// A 4x4 matrix and four more floats; see `Uniforms` in the shader.
-const UNIFORM_FLOATS: usize = 20;
+/// A 4x4 matrix and four vectors of four; see `Uniforms` in the shader.
+const UNIFORM_FLOATS: usize = 32;
 const UNIFORM_BYTES: usize = UNIFORM_FLOATS * size_of::<f32>();
 /// The value 8-bit chroma samples take for "no colour", as sampled from a texture.
 const NEUTRAL_CHROMA: f32 = 128.0 / 255.0;
@@ -30,11 +32,25 @@ struct Planes {
     luma: Vec<u8>,
     /// A (Cb, Cr) pair per sample, half as wide and high as `luma`.
     chroma: Vec<u8>,
+    /// How much of each pixel is seen, as big as `luma`; None when all of it is.
+    alpha: Option<Vec<u8>>,
     colors: Colors,
 }
 
 impl YuvPicture {
     pub fn new(width: u32, height: u32, luma: Vec<u8>, chroma: Vec<u8>, colors: Colors) -> Self {
+        Self::with_alpha(width, height, luma, chroma, None, colors)
+    }
+
+    /// A picture parts of which are see-through, by how much in `alpha`: a byte per pixel.
+    pub fn with_alpha(
+        width: u32,
+        height: u32,
+        luma: Vec<u8>,
+        chroma: Vec<u8>,
+        alpha: Option<Vec<u8>>,
+        colors: Colors,
+    ) -> Self {
         static NEXT_SERIAL: AtomicU64 = AtomicU64::new(0);
         Self(Arc::new(Planes {
             serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
@@ -42,8 +58,14 @@ impl YuvPicture {
             height,
             luma,
             chroma,
+            alpha,
             colors,
         }))
+    }
+
+    /// Its size in pixels.
+    pub fn size(&self) -> (u32, u32) {
+        (self.0.width, self.0.height)
     }
 }
 
@@ -58,7 +80,15 @@ impl fmt::Debug for YuvPicture {
     }
 }
 
-impl<Message> shader::Program<Message> for YuvPicture {
+/// The pictures at the playhead, the bottom one first, each with where it sits in a frame of
+/// `frame` pixels' shape. Cheap to clone.
+#[derive(Clone, Debug)]
+pub struct Composite {
+    pub frame: (u32, u32),
+    pub layers: Vec<(YuvPicture, Framing, Reveal)>,
+}
+
+impl<Message> shader::Program<Message> for Composite {
     type State = ();
     type Primitive = Self;
 
@@ -67,7 +97,7 @@ impl<Message> shader::Program<Message> for YuvPicture {
     }
 }
 
-impl shader::Primitive for YuvPicture {
+impl shader::Primitive for Composite {
     type Pipeline = Pipeline;
 
     fn prepare(
@@ -76,20 +106,63 @@ impl shader::Primitive for YuvPicture {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         bounds: &Rectangle,
-        _viewport: &Viewport,
+        viewport: &Viewport,
     ) {
-        pipeline.load(device, queue, &self.0, bounds.size());
+        let frame_share = covered(self.frame, bounds.size());
+        for (slot, (picture, framing, reveal)) in self.layers.iter().enumerate() {
+            let corners = framing.corners(self.frame, (picture.0.width, picture.0.height)).0;
+            let placed = Placed {
+                frame_share,
+                corners,
+                opacity: framing.opacity() * reveal.fade,
+                // Without a wipe, every point of the frame passes.
+                wipe: reveal.wipe.map_or([0.0, 0.0, 1.0], |wipe| {
+                    [wipe.direction[0], wipe.direction[1], wipe.threshold]
+                }),
+            };
+            pipeline.load(device, queue, slot, &picture.0, placed);
+        }
+        pipeline.drawn = self.layers.len();
+        // Pictures moved out of the frame are cut off at its edges, as they are in a film.
+        let scale = viewport.scale_factor() as f32;
+        let (width, height) = (
+            bounds.width * frame_share[0] * scale,
+            bounds.height * frame_share[1] * scale,
+        );
+        let left = bounds.x * scale + (bounds.width * scale - width) / 2.0;
+        let top = bounds.y * scale + (bounds.height * scale - height) / 2.0;
+        let target = viewport.physical_size();
+        let x = left.max(0.0).floor() as u32;
+        let y = top.max(0.0).floor() as u32;
+        let right = ((left + width).ceil() as u32).min(target.width);
+        let bottom = ((top + height).ceil() as u32).min(target.height);
+        pipeline.frame_area = (x < right && y < bottom).then_some((x, y, right - x, bottom - y));
     }
 
     fn draw(&self, pipeline: &Pipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
-        let Some(textures) = &pipeline.textures else {
-            return false;
+        let Some((x, y, width, height)) = pipeline.frame_area else {
+            return true;
         };
+        render_pass.set_scissor_rect(x, y, width, height);
         render_pass.set_pipeline(&pipeline.render);
-        render_pass.set_bind_group(0, &textures.bind_group, &[]);
-        render_pass.draw(0..4, 0..1);
+        for slot in pipeline.slots.iter().take(pipeline.drawn) {
+            render_pass.set_bind_group(0, &slot.bind_group, &[]);
+            render_pass.draw(0..4, 0..1);
+        }
         true
     }
+}
+
+/// Where a layer goes, worked out on the CPU for the shader.
+struct Placed {
+    /// The share of the viewer the frame covers once fitted inside it.
+    frame_share: [f32; 2],
+    /// Where the picture's corners go: a 2x2 matrix, column by column, and an offset, taking a
+    /// corner from -1 to 1 across the picture to -1 to 1 across the frame (y up).
+    corners: [f32; 6],
+    opacity: f32,
+    /// A wipe's direction and threshold (see `Wipe`).
+    wipe: [f32; 3],
 }
 
 /// GPU state of the viewer. iced keeps one for all pictures, which is right while there is a
@@ -98,18 +171,26 @@ pub struct Pipeline {
     render: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    uniforms: wgpu::Buffer,
     /// The window's surface stores linear light, so the gamma that video RGB carries has to come
     /// off before writing to it.
     linear_target: bool,
-    /// Created for the first picture, and again when the picture size changes.
-    textures: Option<Textures>,
+    /// One for each layer drawn so far: made for the first picture in its place, and again
+    /// when the picture size there changes.
+    slots: Vec<Slot>,
+    /// How many layers the latest composite has.
+    drawn: usize,
+    /// The frame's area on the target, in physical pixels: x, y, width, height.
+    frame_area: Option<(u32, u32, u32, u32)>,
 }
 
-struct Textures {
+struct Slot {
     size: (u32, u32),
     luma: wgpu::Texture,
     chroma: wgpu::Texture,
+    /// The picture's size when it has see-through parts, else a single texel, always white.
+    alpha: wgpu::Texture,
+    see_through: bool,
+    uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     /// Serial of the picture the textures hold.
     holds: Option<u64>,
@@ -142,6 +223,7 @@ impl shader::Pipeline for Pipeline {
                 },
                 texture(1),
                 texture(2),
+                texture(4),
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -180,7 +262,8 @@ impl shader::Pipeline for Pipeline {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: None,
+                    // A layer seen through shows what is under it.
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -193,31 +276,46 @@ impl shader::Pipeline for Pipeline {
             min_filter: wgpu::FilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cannotcut viewer"),
-            size: UNIFORM_BYTES as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         Self {
             render,
             layout,
             sampler,
-            uniforms,
             linear_target: format.is_srgb(),
-            textures: None,
+            slots: Vec::new(),
+            drawn: 0,
+            frame_area: None,
         }
     }
 }
 
 impl Pipeline {
-    /// Gets `picture` onto the GPU, unless it is there already, and fits it inside `bounds`.
-    fn load(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, picture: &Planes, bounds: Size) {
+    /// Gets `picture` onto the GPU in layer `slot`, unless it is there already, and places it.
+    fn load(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: usize,
+        picture: &Planes,
+        placed: Placed,
+    ) {
         let size = (picture.width, picture.height);
         let chroma_size = (size.0 / 2, size.1 / 2);
-        if self.textures.as_ref().is_none_or(|held| held.size != size) {
+        let see_through = picture.alpha.is_some();
+        let fits = |held: &Slot| held.size == size && held.see_through == see_through;
+        if self.slots.get(slot).is_none_or(|held| !fits(held)) {
             let luma = plane_texture(device, wgpu::TextureFormat::R8Unorm, size);
             let chroma = plane_texture(device, wgpu::TextureFormat::Rg8Unorm, chroma_size);
+            let alpha_size = if see_through { size } else { (1, 1) };
+            let alpha = plane_texture(device, wgpu::TextureFormat::R8Unorm, alpha_size);
+            if !see_through {
+                upload(queue, &alpha, &[u8::MAX], 1, (1, 1));
+            }
+            let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cannotcut viewer"),
+                size: UNIFORM_BYTES as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
             let view = |texture: &wgpu::Texture| {
                 texture.create_view(&wgpu::TextureViewDescriptor::default())
             };
@@ -227,7 +325,7 @@ impl Pipeline {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: self.uniforms.as_entire_binding(),
+                        resource: uniforms.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -241,36 +339,51 @@ impl Pipeline {
                         binding: 3,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&view(&alpha)),
+                    },
                 ],
             });
-            self.textures = Some(Textures {
+            let made = Slot {
                 size,
                 luma,
                 chroma,
+                alpha,
+                see_through,
+                uniforms,
                 bind_group,
                 holds: None,
-            });
+            };
+            if slot < self.slots.len() {
+                self.slots[slot] = made;
+            } else {
+                self.slots.push(made);
+            }
         }
-        let textures = self
-            .textures
-            .as_mut()
-            .expect("textures were just created");
-        if textures.holds != Some(picture.serial) {
-            upload(queue, &textures.luma, &picture.luma, size.0, size);
+        let held = &mut self.slots[slot];
+        if held.holds != Some(picture.serial) {
+            upload(queue, &held.luma, &picture.luma, size.0, size);
             // Two bytes per chroma sample, so a row is as long as a luma row.
-            upload(queue, &textures.chroma, &picture.chroma, size.0, chroma_size);
-            textures.holds = Some(picture.serial);
+            upload(queue, &held.chroma, &picture.chroma, size.0, chroma_size);
+            if let Some(alpha) = &picture.alpha {
+                upload(queue, &held.alpha, alpha, size.0, size);
+            }
+            held.holds = Some(picture.serial);
         }
 
         let mut uniforms = [0.0; UNIFORM_FLOATS];
         uniforms[..16].copy_from_slice(&to_rgb(picture.colors));
-        uniforms[16..18].copy_from_slice(&covered(size, bounds));
-        uniforms[18] = f32::from(u8::from(self.linear_target));
+        uniforms[16..22].copy_from_slice(&placed.corners);
+        uniforms[22..24].copy_from_slice(&placed.frame_share);
+        uniforms[24] = placed.opacity;
+        uniforms[25] = f32::from(u8::from(self.linear_target));
+        uniforms[28..31].copy_from_slice(&placed.wipe);
         let mut bytes = [0; UNIFORM_BYTES];
         for (chunk, value) in bytes.chunks_exact_mut(size_of::<f32>()).zip(uniforms) {
             chunk.copy_from_slice(&value.to_ne_bytes());
         }
-        queue.write_buffer(&self.uniforms, 0, &bytes);
+        queue.write_buffer(&held.uniforms, 0, &bytes);
     }
 }
 

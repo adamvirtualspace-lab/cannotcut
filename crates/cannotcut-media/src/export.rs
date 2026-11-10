@@ -64,19 +64,180 @@ pub struct FilmFormat {
 /// A picture of the film, in the form its encoder takes.
 pub struct FilmPicture {
     frame: frame::Video,
+    /// How much of each pixel is seen when laid over another picture, 0 to 255, row by row
+    /// with no padding; None when all of it is.
+    alpha: Option<Vec<u8>>,
 }
 
 impl FilmPicture {
     fn new(format: Pixel, width: u32, height: u32) -> Self {
         let mut picture = Self {
             frame: frame::Video::new(format, width, height),
+            alpha: None,
         };
         picture.clear();
         picture
     }
 
-    /// Makes it all black.
+    /// Fills the picture with packed 4:2:0 planes of its own size: `luma`, a (Cb, Cr) pair per
+    /// two by two pixels in `chroma`, and how much of each pixel is seen in `alpha`, all in
+    /// the film's colours.
+    pub fn fill(&mut self, luma: &[u8], chroma: &[u8], alpha: Vec<u8>) {
+        let width = self.frame.width() as usize;
+        let height = self.frame.height() as usize;
+        let (chroma_width, chroma_height) = (width / 2, height / 2);
+        let nv12 = self.frame.format() == Pixel::NV12;
+        let stride = self.frame.stride(0);
+        let data = self.frame.data_mut(0);
+        for row in 0..height {
+            data[row * stride..][..width].copy_from_slice(&luma[row * width..][..width]);
+        }
+        if nv12 {
+            let stride = self.frame.stride(1);
+            let data = self.frame.data_mut(1);
+            for row in 0..chroma_height {
+                let packed = &chroma[row * chroma_width * 2..][..chroma_width * 2];
+                data[row * stride..][..chroma_width * 2].copy_from_slice(packed);
+            }
+        } else {
+            for (plane, value) in [(1, 0), (2, 1)] {
+                let stride = self.frame.stride(plane);
+                let data = self.frame.data_mut(plane);
+                for row in 0..chroma_height {
+                    for column in 0..chroma_width {
+                        data[row * stride + column] =
+                            chroma[(row * chroma_width + column) * 2 + value];
+                    }
+                }
+            }
+        }
+        self.alpha = Some(alpha);
+    }
+
+    /// Lays a layer over this picture: the part `area` of `layer` (left, top, width, height in
+    /// pixels: where a [`ClipReader`] drew its picture, fitted inside the frame), placed by
+    /// `corners` (a 2x2 matrix column by column and an offset, from -1 to 1 across the picture
+    /// to -1 to 1 across the frame, y up; see `Transform::corners`), and seen as much as
+    /// `opacity` says, 0 to 1; with `wipe` (a direction and a threshold), only where a point of
+    /// the frame (-1 to 1 across it, y up) has `direction · point <= threshold`. Both pictures
+    /// are the film's size and format.
+    pub fn lay_over(
+        &mut self,
+        layer: &FilmPicture,
+        area: [u32; 4],
+        corners: [f32; 6],
+        opacity: f32,
+        wipe: Option<([f32; 2], f32)>,
+    ) {
+        let [column_x0, column_x1, column_y0, column_y1, offset_x, offset_y] = corners;
+        let determinant = column_x0 * column_y1 - column_y0 * column_x1;
+        if determinant.abs() < 1e-9 || opacity <= 0.0 || area[2] == 0 || area[3] == 0 {
+            return;
+        }
+        // From a point of the frame back to the picture: the matrix's inverse, row by row.
+        let inverse = [
+            column_y1 / determinant,
+            -column_y0 / determinant,
+            -column_x1 / determinant,
+            column_x0 / determinant,
+        ];
+        let (width, height) = (self.frame.width() as f32, self.frame.height() as f32);
+        let opacity = opacity.min(1.0);
+        // How much of the layer is seen at a point of it, in luma pixels.
+        let seen = |x: f32, y: f32| -> f32 {
+            let Some(alpha) = &layer.alpha else {
+                return opacity;
+            };
+            let row_length = layer.frame.width() as usize;
+            let [left, top] = [area[0] as f32, area[1] as f32];
+            let [right, bottom] = [left + area[2] as f32 - 1.0, top + area[3] as f32 - 1.0];
+            let read = |x: f32, y: f32| {
+                let at = y.clamp(top, bottom) as usize * row_length + x.clamp(left, right) as usize;
+                f32::from(alpha.get(at).copied().unwrap_or(0))
+            };
+            opacity * bilinear(read, x, y) / 255.0
+        };
+        // `scale` is 1 for luma, 2 for chroma: a chroma sample covers two pixels each way.
+        let lay = |target: &mut frame::Video, plane: usize, scale: f32, interleaved: bool| {
+            let stride = target.stride(plane);
+            let rows = (height / scale).ceil() as usize;
+            let columns = (width / scale).ceil() as usize;
+            let source_stride = layer.frame.stride(plane);
+            let source = layer.frame.data(plane);
+            // The area, in this plane's samples.
+            let [left, top, area_width, area_height] = area.map(|side| side as f32 / scale);
+            // Only where the placed picture can be: the box round its four corners.
+            let mut low = [f32::MAX; 2];
+            let mut high = [f32::MIN; 2];
+            for corner in [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0f32]] {
+                let x = column_x0 * corner[0] + column_y0 * corner[1] + offset_x;
+                let y = column_x1 * corner[0] + column_y1 * corner[1] + offset_y;
+                let pixel = [(x + 1.0) / 2.0 * width / scale, (1.0 - y) / 2.0 * height / scale];
+                for axis in 0..2 {
+                    low[axis] = low[axis].min(pixel[axis]);
+                    high[axis] = high[axis].max(pixel[axis]);
+                }
+            }
+            let first_column = low[0].floor().max(0.0) as usize;
+            let last_column = (high[0].ceil().max(0.0) as usize).min(columns);
+            let first_row = low[1].floor().max(0.0) as usize;
+            let last_row = (high[1].ceil().max(0.0) as usize).min(rows);
+            let data = target.data_mut(plane);
+            let values = if interleaved { 2 } else { 1 };
+            for row in first_row..last_row {
+                let frame_y = 1.0 - (row as f32 + 0.5) * scale / height * 2.0;
+                let y = frame_y - offset_y;
+                for column in first_column..last_column {
+                    let frame_x = (column as f32 + 0.5) * scale / width * 2.0 - 1.0;
+                    if wipe.is_some_and(|(direction, threshold)| {
+                        direction[0] * frame_x + direction[1] * frame_y > threshold
+                    }) {
+                        continue;
+                    }
+                    let x = frame_x - offset_x;
+                    let local_x = inverse[0] * x + inverse[1] * y;
+                    let local_y = inverse[2] * x + inverse[3] * y;
+                    if local_x.abs() > 1.0 || local_y.abs() > 1.0 {
+                        continue;
+                    }
+                    // The sample of the layer it comes from, between four of them.
+                    let source_x = left + (local_x + 1.0) / 2.0 * area_width - 0.5;
+                    let source_y = top + (1.0 - local_y) / 2.0 * area_height - 0.5;
+                    let seen = seen((source_x + 0.5) * scale - 0.5, (source_y + 0.5) * scale - 0.5);
+                    if seen <= 0.0 {
+                        continue;
+                    }
+                    for value in 0..values {
+                        let read = |sample_x: f32, sample_y: f32| {
+                            let sample_x = sample_x.clamp(left, left + area_width - 1.0);
+                            let sample_y = sample_y.clamp(top, top + area_height - 1.0);
+                            let at = sample_y as usize * source_stride
+                                + sample_x as usize * values
+                                + value;
+                            f32::from(source[at])
+                        };
+                        let sampled = bilinear(read, source_x, source_y);
+                        let at = row * stride + column * values + value;
+                        let under = f32::from(data[at]);
+                        let laid = under + (sampled - under) * seen;
+                        data[at] = laid.round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        };
+        let nv12 = self.frame.format() == Pixel::NV12;
+        lay(&mut self.frame, 0, 1.0, false);
+        if nv12 {
+            lay(&mut self.frame, 1, 2.0, true);
+        } else {
+            lay(&mut self.frame, 1, 2.0, false);
+            lay(&mut self.frame, 2, 2.0, false);
+        }
+    }
+
+    /// Makes it all black, and all of it seen.
     pub fn clear(&mut self) {
+        self.alpha = None;
         let height = self.frame.height() as usize;
         for plane in 0..self.frame.planes() {
             let value = if plane == 0 { BLACK_LUMA } else { BLACK_CHROMA };
@@ -87,6 +248,16 @@ impl FilmPicture {
             data[..end].fill(value);
         }
     }
+}
+
+/// The value between four samples at `(x, y)`, read by `read` at whole positions.
+fn bilinear(read: impl Fn(f32, f32) -> f32, x: f32, y: f32) -> f32 {
+    let (base_x, base_y) = (x.floor(), y.floor());
+    let (fraction_x, fraction_y) = (x - base_x, y - base_y);
+    let top = read(base_x, base_y) * (1.0 - fraction_x) + read(base_x + 1.0, base_y) * fraction_x;
+    let below = base_y + 1.0;
+    let bottom = read(base_x, below) * (1.0 - fraction_x) + read(base_x + 1.0, below) * fraction_x;
+    top * (1.0 - fraction_y) + bottom * fraction_y
 }
 
 /// Reads a clip's pictures at full size, in order, as a film needs them.
@@ -105,6 +276,8 @@ pub struct ClipReader {
     scaler: *mut ffi::SwsContext,
     /// What the scaler was made for: source format and size, destination size.
     scaler_for: Option<(i32, u32, u32, u32, u32)>,
+    /// Where the last picture went in the film's frame: left, top, width, height.
+    drawn: Option<[u32; 4]>,
 }
 
 // The scaler is only used by the reader that owns it, on one thread at a time.
@@ -165,7 +338,14 @@ impl ClipReader {
             drained: false,
             scaler: ptr::null_mut(),
             scaler_for: None,
+            drawn: None,
         })
+    }
+
+    /// Where the last picture drawn went in the film's frame: left, top, width and height, in
+    /// pixels. None before the first.
+    pub fn drawn_area(&self) -> Option<[u32; 4]> {
+        self.drawn
     }
 
     fn frame_to_pts(&self, frame: u64) -> i64 {
@@ -275,6 +455,7 @@ impl ClipReader {
             (out_width - fit_width) / 2 & !1,
             (out_height - fit_height) / 2 & !1,
         );
+        self.drawn = Some([left, top, fit_width, fit_height]);
         let source_format = unsafe { (*source.as_ptr()).format };
         let wanted = (source_format, width, height, fit_width, fit_height);
         unsafe {
@@ -476,6 +657,13 @@ impl FilmWriter {
     /// The picture the next frame is drawn into.
     pub fn picture(&mut self) -> &mut FilmPicture {
         &mut self.picture
+    }
+
+    /// A picture of the film's size and format, to draw a layer in before it is laid over the
+    /// film's own (see [`FilmPicture::lay_over`]).
+    pub fn spare_picture(&self) -> FilmPicture {
+        let frame = &self.picture.frame;
+        FilmPicture::new(frame.format(), frame.width(), frame.height())
     }
 
     /// Encodes the picture as frame `index` of the film.

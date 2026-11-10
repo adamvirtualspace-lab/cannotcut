@@ -15,11 +15,16 @@ use serde_json::{Map, Value, json};
 
 use crate::Error;
 use crate::model::{
-    Clip, Extras, FrameRange, Item, Media, Rate, Timeline, Track, TrackKind, new_id,
+    Clip, Extras, FrameRange, Item, Media, Rate, SPEEDS, Timeline, Track, TrackKind, new_id,
 };
+use crate::transform::{Transform, keyframes_from_value, keyframes_value};
+use crate::title::Title;
+use crate::transition::{Transition, TransitionKind};
 
 /// The metadata key under which cannotcut keeps what the format has no field for.
 const OWN_METADATA: &str = "cannotcut";
+/// The `generator_kind` of a text clip's media.
+const TITLE_GENERATOR: &str = "cannotcut.text";
 /// The name OpenTimelineIO gives a clip's media reference when there is only one.
 const DEFAULT_MEDIA: &str = "DEFAULT_MEDIA";
 /// The rate of a timeline whose file gives no hint of one.
@@ -125,15 +130,18 @@ fn write_track(track: &Track, index: usize, rate: Rate) -> Value {
     let children: Vec<Value> = track
         .items()
         .iter()
-        .map(|item| match item {
+        .flat_map(|item| match item {
             Item::Clip(clip) => {
                 let inside = clip.media.project.as_ref().filter(|_| clip.media.is_inside());
-                match inside {
+                let written = match inside {
                     Some(nested) => write_inside(clip, &nested.timeline, rate),
                     None => write_clip(clip, rate),
-                }
+                };
+                // A transition stands between the clips it joins.
+                let way_in = clip.transition_in.map(|way| write_transition(&way, rate));
+                way_in.into_iter().chain([written]).collect::<Vec<_>>()
             }
-            Item::Gap(duration) => json!({
+            Item::Gap(duration) => vec![json!({
                 "OTIO_SCHEMA": "Gap.1",
                 "effects": [],
                 "enabled": true,
@@ -141,7 +149,7 @@ fn write_track(track: &Track, index: usize, rate: Rate) -> Value {
                 "metadata": {},
                 "name": "",
                 "source_range": range(0, *duration, rate),
-            }),
+            })],
         })
         .collect();
     let mut metadata = track.extras.metadata.clone();
@@ -190,23 +198,70 @@ fn write_clip(clip: &Clip, rate: Rate) -> Value {
     if let Some(target) = &media.target {
         reference["OTIO_SCHEMA"] = json!("ExternalReference.1");
         reference["target_url"] = json!(target);
+    } else if let Some(title) = &media.title {
+        reference["OTIO_SCHEMA"] = json!("GeneratorReference.1");
+        reference["generator_kind"] = json!(TITLE_GENERATOR);
+        reference["parameters"] = title.value();
     }
     // The range is written at the timeline's rate, where its numbers are whole.
     let source_start = media_start(media, rate) + clip.source_start;
     let mut clip_metadata = clip.extras.metadata.clone();
+    let mut own = serde_json::Map::new();
     if clip.volume != 1.0 {
-        clip_metadata.insert(OWN_METADATA.to_string(), json!({ "volume": clip.volume }));
+        own.insert("volume".to_string(), json!(clip.volume));
+    }
+    if !clip.transform.is_identity() {
+        own.insert("transform".to_string(), clip.transform.value());
+    }
+    if !clip.keyframes.is_empty() {
+        own.insert("keyframes".to_string(), keyframes_value(&clip.keyframes));
+    }
+    if !own.is_empty() {
+        clip_metadata.insert(OWN_METADATA.to_string(), Value::Object(own));
     }
     json!({
         "OTIO_SCHEMA": "Clip.2",
         "active_media_reference_key": DEFAULT_MEDIA,
-        "effects": clip.extras.effects,
+        "effects": effects_with_speed(clip),
         "enabled": clip.enabled,
         "markers": clip.extras.markers,
         "media_references": { DEFAULT_MEDIA: reference },
         "metadata": clip_metadata,
         "name": clip.name,
         "source_range": range(source_start, clip.duration, rate),
+    })
+}
+
+/// A clip's way in, as OpenTimelineIO has transitions: over the cut, here all of it after the
+/// cut, where the clip before carries on beneath the clip coming in.
+fn write_transition(transition: &Transition, rate: Rate) -> Value {
+    json!({
+        "OTIO_SCHEMA": "Transition.1",
+        "name": transition.kind.name(),
+        "metadata": { OWN_METADATA: { "kind": transition.kind.key() } },
+        "transition_type": transition.kind.otio_type(),
+        "in_offset": time(0, rate),
+        "out_offset": time(transition.duration, rate),
+    })
+}
+
+/// A transition from a file: ours by its kind; others' as a dissolve, as long as both its
+/// offsets together.
+fn read_transition(transition: &Object, rate: Rate) -> Result<Transition, Error> {
+    let kind = transition
+        .get("metadata")
+        .and_then(|metadata| metadata.get(OWN_METADATA))
+        .and_then(|own| own.get("kind"))
+        .and_then(Value::as_str)
+        .and_then(TransitionKind::from_key)
+        .unwrap_or(TransitionKind::Dissolve);
+    let offset = |name: &str| -> Result<i64, Error> {
+        Ok(read_time(transition.get(name))?
+            .map_or(0, |(value, from_rate)| frames(value, from_rate, rate)))
+    };
+    Ok(Transition {
+        kind,
+        duration: offset("in_offset")?.max(0) + offset("out_offset")?.max(0),
     })
 }
 
@@ -217,6 +272,12 @@ fn write_inside(clip: &Clip, inner: &Timeline, rate: Rate) -> Value {
     let mut own = json!({ "rate": rate_json(inner.rate) });
     if clip.volume != 1.0 {
         own["volume"] = json!(clip.volume);
+    }
+    if !clip.transform.is_identity() {
+        own["transform"] = clip.transform.value();
+    }
+    if !clip.keyframes.is_empty() {
+        own["keyframes"] = keyframes_value(&clip.keyframes);
     }
     if inner.name != clip.name {
         own["name"] = json!(inner.name);
@@ -234,7 +295,7 @@ fn write_inside(clip: &Clip, inner: &Timeline, rate: Rate) -> Value {
     json!({
         "OTIO_SCHEMA": "Stack.1",
         "children": tracks,
-        "effects": clip.extras.effects,
+        "effects": effects_with_speed(clip),
         "enabled": clip.enabled,
         "markers": clip.extras.markers,
         "metadata": metadata,
@@ -263,12 +324,29 @@ fn read_track(
         other => return Err(Error(format!("cannotcut has no {other} tracks yet"))),
     };
     let mut items = Vec::new();
+    // A transition read, for the clip after it.
+    let mut way_in: Option<Transition> = None;
     for child in children(track) {
         let child = object(child, "an item on a track")?;
         match schema_name(child) {
-            "Clip" => items.push(Item::Clip(read_clip(child, rate, next_id)?)),
-            "Stack" => items.push(Item::Clip(read_inside(child, rate, next_id)?)),
+            "Clip" | "Stack" => {
+                let mut clip = if schema_name(child) == "Clip" {
+                    read_clip(child, rate, next_id)?
+                } else {
+                    read_inside(child, rate, next_id)?
+                };
+                clip.transition_in = way_in
+                    .take()
+                    .map(|way| Transition {
+                        duration: way.duration.min(clip.duration),
+                        ..way
+                    })
+                    .filter(|way| way.duration >= 1);
+                items.push(Item::Clip(clip));
+            }
+            "Transition" => way_in = Some(read_transition(child, rate)?),
             "Gap" => {
+                way_in = None;
                 let Some((_, duration)) = read_range(child.get("source_range"))? else {
                     return Err(Error("a gap has no length".to_string()));
                 };
@@ -309,9 +387,16 @@ fn read_clip(clip: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error
         Some(reference) => object(reference, "a media reference")?,
         None => return Err(Error(format!("clip \"{name}\" has no media"))),
     };
+    let mut title = None;
     let target = match schema_name(reference) {
         "ExternalReference" => Some(text_of(reference, "target_url")),
         "MissingReference" => None,
+        "GeneratorReference" if text_of(reference, "generator_kind") == TITLE_GENERATOR => {
+            title = Some(Title::from_value(
+                reference.get("parameters").unwrap_or(&Value::Null),
+            ));
+            None
+        }
         _ => return Err(unsupported(schema(reference), "as a clip's media")),
     };
     let available = read_range(reference.get("available_range"))?;
@@ -339,13 +424,25 @@ fn read_clip(clip: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error
         metadata: media_metadata,
         // Loaded by `Timeline::load`, which knows where the file is.
         project: None,
+        title,
     };
     let mut extras = extras(clip);
+    let speed = take_speed(&mut extras.effects);
     let own = extras.metadata.remove(OWN_METADATA);
     let volume = own
+        .as_ref()
         .and_then(|own| own.get("volume")?.as_f64())
         .filter(|volume| volume.is_finite() && *volume >= 0.0)
         .map_or(1.0, |volume| volume as f32);
+    let transform = own
+        .as_ref()
+        .and_then(|own| own.get("transform"))
+        .map_or(Transform::IDENTITY, Transform::from_value);
+    let keyframes = own
+        .as_ref()
+        .and_then(|own| own.get("keyframes"))
+        .map(keyframes_from_value)
+        .unwrap_or_default();
     Ok(Clip {
         id: new_id(next_id),
         name,
@@ -354,6 +451,10 @@ fn read_clip(clip: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error
         media: Arc::new(media),
         enabled: flag(clip, "enabled"),
         volume,
+        transform,
+        keyframes,
+        transition_in: None,
+        speed,
         extras,
     })
 }
@@ -362,6 +463,7 @@ fn read_clip(clip: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error
 fn read_inside(stack: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error> {
     let name = text_of(stack, "name");
     let mut extras = extras(stack);
+    let speed = take_speed(&mut extras.effects);
     let own = extras.metadata.remove(OWN_METADATA).unwrap_or(Value::Null);
     let inner_rate = read_own_rate(&own)
         .or_else(|| first_rate(stack))
@@ -409,6 +511,13 @@ fn read_inside(stack: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Er
         .and_then(Value::as_f64)
         .filter(|volume| volume.is_finite() && *volume >= 0.0)
         .map_or(1.0, |volume| volume as f32);
+    let transform = own
+        .get("transform")
+        .map_or(Transform::IDENTITY, Transform::from_value);
+    let keyframes = own
+        .get("keyframes")
+        .map(keyframes_from_value)
+        .unwrap_or_default();
     Ok(Clip {
         id: new_id(next_id),
         name,
@@ -417,6 +526,10 @@ fn read_inside(stack: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Er
         duration,
         enabled: flag(stack, "enabled"),
         volume,
+        transform,
+        keyframes,
+        transition_in: None,
+        speed,
         extras,
     })
 }
@@ -538,6 +651,40 @@ fn child_object(object: &Object, key: &str) -> Object {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default()
+}
+
+/// A clip's speed, from the effect OpenTimelineIO gives it, taken out of its effects; 1 when it
+/// has none. A frozen frame (no speed) is left in and the clip plays as recorded.
+fn take_speed(effects: &mut Vec<Value>) -> f64 {
+    let speed_of = |effect: &Value| {
+        let effect = effect.as_object()?;
+        (schema_name(effect) == "LinearTimeWarp")
+            .then(|| effect.get("time_scalar")?.as_f64())
+            .flatten()
+            .filter(|scalar| scalar.is_finite() && *scalar > 0.0)
+    };
+    match effects.iter().position(|effect| speed_of(effect).is_some()) {
+        Some(index) => {
+            let speed = speed_of(&effects.remove(index)).unwrap_or(1.0);
+            speed.clamp(*SPEEDS.start(), *SPEEDS.end())
+        }
+        None => 1.0,
+    }
+}
+
+/// A clip's effects as written: those read with it, and its speed when it has one.
+fn effects_with_speed(clip: &Clip) -> Vec<Value> {
+    let mut effects = clip.extras.effects.clone();
+    if clip.speed != 1.0 {
+        effects.push(json!({
+            "OTIO_SCHEMA": "LinearTimeWarp.1",
+            "name": "",
+            "effect_name": "LinearTimeWarp",
+            "metadata": {},
+            "time_scalar": clip.speed,
+        }));
+    }
+    effects
 }
 
 fn extras(object: &Object) -> Extras {
@@ -775,10 +922,86 @@ mod tests {
     }
 
     #[test]
+    fn speed_changes_length_media_and_sound_and_is_kept() {
+        let rate = Rate::new(30, 1);
+        let mut timeline = Timeline::new("speed", rate);
+        let media = Arc::new(Media::from_path(Path::new("a.mp4"), rate, 300));
+        let clip = |source_start, duration| crate::NewClip {
+            name: "a".to_string(),
+            media: media.clone(),
+            source_start,
+            duration,
+        };
+        let put = |timeline: &mut Timeline, at, clip| {
+            let place = Edit::Place {
+                track: 0,
+                at,
+                clip,
+                mode: crate::Placement::Insert,
+            };
+            timeline.apply(&place).unwrap().unwrap()
+        };
+        let first = put(&mut timeline, 0, clip(100, 100));
+        put(&mut timeline, 100, clip(0, 50));
+        // Twice as fast: half as long, the clip after moves up, the media goes by twice as fast.
+        timeline.apply(&Edit::SetSpeed { clip: first, speed: 2.0 }).unwrap();
+        let (_, fast, _) = timeline.clip(first).unwrap();
+        assert_eq!(fast.duration, 50);
+        assert_eq!(fast.media_frame(10, rate), 120);
+        assert_eq!(timeline.duration(), 100);
+        // Half as fast: the same 100 frames of media over 200; the media's last 100 frames
+        // would make 200 more, and no further.
+        timeline.apply(&Edit::SetSpeed { clip: first, speed: 0.5 }).unwrap();
+        let (_, slow, _) = timeline.clip(first).unwrap();
+        assert_eq!(slow.duration, 200);
+        let edge = |frames| Edit::Trim {
+            clip: first,
+            edge: crate::Edge::End,
+            frames,
+            ripple: true,
+        };
+        assert!(timeline.clone().apply(&edge(200)).is_ok());
+        assert!(timeline.clone().apply(&edge(201)).is_err());
+        assert!(timeline.apply(&Edit::SetSpeed { clip: first, speed: 50.0 }).is_err());
+
+        let sounds = timeline.sounds(48_000);
+        assert_eq!(sounds[0].speed, 0.5);
+        assert_eq!((sounds[0].begins, sounds[0].ends), (0, 200 * 1600));
+        let text = timeline.to_otio();
+        assert!(text.contains("LinearTimeWarp.1"), "{text}");
+        assert_eq!(Timeline::from_otio(&text).unwrap(), timeline);
+    }
+
+    #[test]
+    fn text_clips_are_kept_and_not_heard() {
+        let rate = Rate::new(30, 1);
+        let mut timeline = Timeline::new("words", rate);
+        let mut title = Title::new("Hello\nworld");
+        title.color = [10, 20, 30, 255];
+        let place = Edit::Place {
+            track: 0,
+            at: 15,
+            clip: crate::NewClip::title(title.clone(), 90, rate),
+            mode: crate::Placement::Overwrite,
+        };
+        timeline.apply(&place).unwrap();
+        let text = timeline.to_otio();
+        assert!(text.contains("GeneratorReference.1"), "{text}");
+        let back = Timeline::from_otio(&text).unwrap();
+        assert_eq!(back, timeline);
+        let (clip, offset) = back.picture_at(20).unwrap();
+        assert_eq!((offset, clip.duration), (5, 90));
+        assert_eq!(clip.media.title.as_ref(), Some(&title));
+        assert_eq!(clip.name, "Hello");
+        assert!(back.sounds(48_000).is_empty());
+        assert!(back.shots_at(20)[0].file(None).is_none());
+    }
+
+    #[test]
     fn what_cannot_be_edited_yet_is_refused_by_name() {
-        let with_transition = FOREIGN.replace("\"Gap.1\"", "\"Transition.1\"");
-        let error = Timeline::from_otio(&with_transition).unwrap_err();
-        assert!(error.to_string().contains("Transition.1"), "{error}");
+        let with_effect = FOREIGN.replace("\"Gap.1\"", "\"Effect.1\"");
+        let error = Timeline::from_otio(&with_effect).unwrap_err();
+        assert!(error.to_string().contains("Effect.1"), "{error}");
 
         let error = Timeline::from_otio(r#"{ "OTIO_SCHEMA": "Clip.2" }"#).unwrap_err();
         assert!(error.to_string().contains("Clip.2"), "{error}");

@@ -11,14 +11,20 @@ mod edit;
 mod model;
 mod nest;
 mod otio;
+mod title;
+mod transform;
+mod transition;
 
 use std::fmt;
 
 pub use edit::{Edge, Edit, EditError, History, NewClip, Placement};
 pub use model::{
-    Clip, ClipId, Extras, FrameRange, Item, Media, Rate, Timeline, Track, TrackKind,
+    Clip, ClipId, Extras, FrameRange, Item, Media, Rate, SPEEDS, Timeline, Track, TrackKind,
 };
 pub use nest::{Nested, Projects, Shot, Sound, frame_to_sample};
+pub use transform::{Affine, Framing, Keyframe, Transform, transform_at};
+pub use title::{Title, TitleFont};
+pub use transition::{Reveal, Transition, TransitionKind, Wipe};
 
 /// A timeline file could not be read or written.
 #[derive(Debug)]

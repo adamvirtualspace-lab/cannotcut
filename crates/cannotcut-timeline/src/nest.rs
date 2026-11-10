@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use crate::Error;
 use crate::model::{Clip, ClipId, FrameRange, Item, Media, Rate, Timeline, Track, TrackKind};
+use crate::transform::Framing;
+use crate::transition::Reveal;
 
 /// The extension of project files, which a clip's media can be.
 pub(crate) const PROJECT_EXTENSION: &str = "otio";
@@ -83,6 +85,7 @@ impl Media {
             name: String::new(),
             metadata: serde_json::Map::new(),
             project: None,
+            title: None,
         };
         media.adopt(Arc::new(Nested::inside(timeline)));
         media
@@ -377,11 +380,21 @@ impl Timeline {
         })
     }
 
-    /// The picture at `frame`, looked for through nested projects down to a media file. None
-    /// where nothing plays, including a part of a nested project where nothing plays.
+    /// The picture on top at `frame`, looked for through nested projects down to a media file.
+    /// None where nothing plays, including a part of a nested project where nothing plays.
     pub fn shot_at(&self, frame: i64) -> Option<Shot<'_>> {
-        let (clip, offset) = self.picture_at(frame)?;
-        shot_through(clip, offset, self.rate)
+        self.shots_at(frame).pop()
+    }
+
+    /// Every picture at `frame`, the bottom one first: one for each video track with a clip
+    /// there, and as many as a nested project has for a clip that plays one, each placed by its
+    /// clip's transform within those of the clips it is seen through.
+    pub fn shots_at(&self, frame: i64) -> Vec<Shot<'_>> {
+        let mut shots = Vec::new();
+        for (clip, offset, reveal) in self.pictures_at(frame) {
+            shots_through(clip, offset, self.rate, reveal, &mut shots);
+        }
+        shots
     }
 
     /// The first clip with a media file, in track order and looking into nested projects: the
@@ -390,12 +403,15 @@ impl Timeline {
         self.tracks()
             .flat_map(|track| track.clips())
             .find_map(|(_, clip)| match &clip.media.project {
-                None if clip.media.is_project() => None,
+                // Words take the shape of the frame; they do not give it one.
+                None if clip.media.is_project() || clip.media.title.is_some() => None,
                 None => Some(Shot {
                     key: vec![clip.id],
                     clip,
                     media_frame: clip.media_frame(0, self.rate),
                     folder: None,
+                    framing: Framing(vec![clip.transform_at(0)]),
+                    reveal: Reveal::FULL,
                 }),
                 Some(nested) => {
                     let mut shot = nested.timeline.first_shot()?;
@@ -413,11 +429,15 @@ impl Timeline {
         let video = self.tracks().filter(|track| track.kind == TrackKind::Video);
         for (start, clip) in video.flat_map(|track| track.clips()) {
             edges.extend([start, start + clip.duration]);
+            // Where the clip before stops showing beneath it.
+            if let Some(transition) = clip.transition_in {
+                edges.push(start + transition.duration.min(clip.duration));
+            }
             if let Some(nested) = &clip.media.project {
                 let inner_rate = nested.timeline.rate();
                 for edge in nested.timeline.picture_edges() {
                     // The first frame of this timeline on which the inner edge is reached.
-                    let offset = inner_rate.rescale_up(edge, self.rate) - clip.source_start;
+                    let offset = clip.offset_reaching(inner_rate.rescale_up(edge, self.rate));
                     if (1..clip.duration).contains(&offset) {
                         edges.push(start + offset);
                     }
@@ -444,8 +464,10 @@ impl Timeline {
             let (begins, ends) = (to_sample(start), to_sample(start + clip.duration));
             // The sample of the media, or of the nested project, heard at `begins`.
             let from = to_sample(clip.source_start);
+            let speed = clip.speed;
             match &clip.media.project {
-                None if clip.media.is_project() => {}
+                // A project that would not load, and words, are not heard.
+                None if clip.media.is_project() || clip.media.title.is_some() => {}
                 None => sounds.push(Sound {
                     key: vec![clip.id],
                     name: clip.name.clone(),
@@ -455,9 +477,13 @@ impl Timeline {
                     ends,
                     media_sample: from,
                     gain: clip.volume,
+                    speed,
                 }),
                 Some(nested) => {
-                    let until = from + (ends - begins);
+                    // Inner samples heard over the clip, and back to this timeline's.
+                    let until = from + ((ends - begins) as f64 * speed).round() as i64;
+                    let outer =
+                        |inner: i64| begins + ((inner - from) as f64 / speed).round() as i64;
                     for inner in nested.timeline.sounds(sample_rate) {
                         let (first, last) = (inner.begins.max(from), inner.ends.min(until));
                         if first >= last {
@@ -465,15 +491,17 @@ impl Timeline {
                         }
                         let mut key = vec![clip.id];
                         key.extend(inner.key);
+                        let skipped = ((first - inner.begins) as f64 * inner.speed).round() as i64;
                         sounds.push(Sound {
                             key,
                             name: inner.name,
                             media: inner.media,
                             folder: inner.folder.or_else(|| nested.folder.clone()),
-                            begins: first - from + begins,
-                            ends: last - from + begins,
-                            media_sample: inner.media_sample + (first - inner.begins),
+                            begins: outer(first),
+                            ends: outer(last),
+                            media_sample: inner.media_sample + skipped,
                             gain: inner.gain * clip.volume,
+                            speed: inner.speed * speed,
                         });
                     }
                 }
@@ -485,22 +513,39 @@ impl Timeline {
 
 /// The clip a picture comes from at `offset` frames into `clip`, on a timeline running at
 /// `rate`, looking through it when it plays a nested project.
-fn shot_through(clip: &Clip, offset: i64, rate: Rate) -> Option<Shot<'_>> {
+/// The pictures `clip` shows `offset` frames into it, added to `shots` bottom first: its media
+/// file's, or those of the project it plays.
+fn shots_through<'a>(
+    clip: &'a Clip,
+    offset: i64,
+    rate: Rate,
+    reveal: Reveal,
+    shots: &mut Vec<Shot<'a>>,
+) {
     let frame = clip.media_frame(offset, rate);
     let Some(nested) = &clip.media.project else {
-        return Some(Shot {
+        shots.push(Shot {
             key: vec![clip.id],
             clip,
             media_frame: frame,
             folder: None,
+            framing: Framing(vec![clip.transform_at(offset)]),
+            reveal,
         });
+        return;
     };
-    let (inner, inner_offset) = nested.timeline.picture_at(frame)?;
-    let mut shot = shot_through(inner, inner_offset, nested.timeline.rate())?;
-    shot.key.insert(0, clip.id);
-    // The innermost project file the media sits in decides where its relative path starts.
-    shot.folder = shot.folder.or(nested.folder.as_deref());
-    Some(shot)
+    let outer = clip.transform_at(offset);
+    let first = shots.len();
+    for (inner, inner_offset, inner_reveal) in nested.timeline.pictures_at(frame) {
+        shots_through(inner, inner_offset, nested.timeline.rate(), inner_reveal, shots);
+    }
+    for shot in &mut shots[first..] {
+        shot.reveal = shot.reveal.within(&reveal);
+        shot.key.insert(0, clip.id);
+        // The innermost project file the media sits in decides where its relative path starts.
+        shot.folder = shot.folder.or(nested.folder.as_deref());
+        shot.framing.0.insert(0, outer);
+    }
 }
 
 /// A frame of a media file, as the picture at some timeline frame.
@@ -516,6 +561,11 @@ pub struct Shot<'a> {
     /// Where the media's relative path starts when the clip sits in a nested project; None for
     /// the folder of the timeline asked.
     pub folder: Option<&'a Path>,
+    /// Where the picture sits in the frame of the timeline asked: its clip's transform within
+    /// those of the clips it is seen through, at this frame.
+    pub framing: Framing,
+    /// How much of it is seen while a transition brings it in; all of it otherwise.
+    pub reveal: Reveal,
 }
 
 impl Shot<'_> {
@@ -546,6 +596,9 @@ pub struct Sound {
     pub media_sample: i64,
     /// How loud: the volumes of the clips it is heard through, multiplied.
     pub gain: f32,
+    /// Media samples heard for each timeline sample: the speeds of the clips it is heard
+    /// through, multiplied.
+    pub speed: f64,
 }
 
 impl Sound {
@@ -565,6 +618,8 @@ pub fn frame_to_sample(frame: i64, rate: Rate, sample_rate: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transform::Transform;
+    use crate::transform::Keyframe;
     use crate::{Edit, EditError, NewClip, Placement};
 
     const OUTER_RATE: Rate = Rate::new(30, 1);
@@ -667,6 +722,164 @@ mod tests {
         assert_eq!(outer.next_picture_change(30), Some(60));
         assert_eq!(outer.next_picture_change(60), Some(90));
         assert_eq!(outer.next_picture_change(90), None);
+    }
+
+    #[test]
+    fn pictures_are_layered_bottom_first_with_their_transforms() {
+        let folder = Folder::new("layers");
+        let (a, _) = save_inner(&folder);
+        let (mut outer, nest) = outer(&folder);
+        // Above the whole film, a logo in a corner, half seen.
+        let overlay = Edit::AddTrack {
+            index: 1,
+            kind: TrackKind::Video,
+            name: "Overlay".to_string(),
+        };
+        outer.apply(&overlay).unwrap();
+        let logo = place(&mut outer, 1, 0, part("logo", file("logo.png", OUTER_RATE, 900), 0, 90));
+        let corner = Transform {
+            x: 0.4,
+            y: -0.4,
+            scale: 0.2,
+            opacity: 0.5,
+            ..Transform::IDENTITY
+        };
+        outer.apply(&Edit::SetTransform { clip: logo, transform: corner }).unwrap();
+        // The nested project, shrunk to the left half.
+        let left = Transform {
+            x: -0.25,
+            scale: 0.5,
+            ..Transform::IDENTITY
+        };
+        outer.apply(&Edit::SetTransform { clip: nest, transform: left }).unwrap();
+
+        let keys = |frame| -> Vec<Vec<ClipId>> {
+            outer.shots_at(frame).into_iter().map(|shot| shot.key).collect()
+        };
+        assert_eq!(keys(10).len(), 2);
+        assert_eq!(keys(30), vec![vec![nest, a], vec![logo]]);
+        let shots = outer.shots_at(30);
+        assert_eq!(shots[0].framing.0, vec![left, Transform::IDENTITY]);
+        assert_eq!(shots[1].framing.0, vec![corner]);
+        // The top picture is the one on top.
+        assert_eq!(outer.shot_at(30).unwrap().key, vec![logo]);
+        // Where the film below changes, the pictures change, though the logo stays.
+        assert_eq!(outer.next_picture_change(0), Some(30));
+
+        // Transforms are kept in the file, for clips and compound clips alike.
+        outer.save(&folder.0.join("outer.otio")).unwrap();
+        let back = Timeline::load(&folder.0.join("outer.otio")).unwrap();
+        let transforms: Vec<Transform> =
+            back.shots_at(30).iter().map(|shot| shot.framing.0[0]).collect();
+        assert_eq!(transforms, vec![left, corner]);
+        let mut timeline = Timeline::new("compound", OUTER_RATE);
+        let clip = place(&mut timeline, 0, 0, part("x", file("x.mp4", OUTER_RATE, 300), 0, 30));
+        let inside = Arc::new(Media::inside(timeline.compound(&[clip], "inside").unwrap()));
+        timeline.apply(&Edit::Compound { clips: vec![clip], media: inside }).unwrap();
+        let compound = timeline.tracks().next().unwrap().clips().next().unwrap().1.id;
+        timeline.apply(&Edit::SetTransform { clip: compound, transform: corner }).unwrap();
+        let back = Timeline::from_otio(&timeline.to_otio()).unwrap();
+        assert_eq!(back.shots_at(5)[0].framing.0[0], corner);
+    }
+
+    #[test]
+    fn keyframes_move_a_picture_and_stay_with_its_media() {
+        let mut timeline = Timeline::new("moving", OUTER_RATE);
+        // From the media's frame 100 on.
+        let clip = place(&mut timeline, 0, 0, part("x", file("x.mp4", OUTER_RATE, 900), 100, 60));
+        let left = Transform {
+            x: -0.5,
+            ..Transform::IDENTITY
+        };
+        let right = Transform {
+            x: 0.5,
+            skew_x: 20.0,
+            ..Transform::IDENTITY
+        };
+        let keyframes = vec![
+            Keyframe {
+                at: 110,
+                transform: left,
+            },
+            Keyframe {
+                at: 130,
+                transform: right,
+            },
+        ];
+        let keyed = Edit::SetKeyframes {
+            clip,
+            keyframes: keyframes.clone(),
+        };
+        timeline.apply(&keyed).unwrap();
+        let own = |timeline: &Timeline, frame| timeline.shots_at(frame)[0].framing.own();
+        assert_eq!(own(&timeline, 0), left);
+        assert_eq!(own(&timeline, 20).x, 0.0);
+        assert_eq!(own(&timeline, 59), right);
+        let back = Timeline::from_otio(&timeline.to_otio()).unwrap();
+        assert_eq!(back.tracks().next().unwrap().clips().next().unwrap().1.keyframes, keyframes);
+        // Cut in two, each half keeps the motion where it was.
+        timeline.apply(&Edit::Split { track: 0, at: 20 }).unwrap();
+        assert_eq!(own(&timeline, 20).x, 0.0);
+        assert_eq!(own(&timeline, 25).x, own(&back, 25).x);
+        // Out of order, they are refused.
+        let backwards = Edit::SetKeyframes {
+            clip,
+            keyframes: keyframes.into_iter().rev().collect(),
+        };
+        assert!(timeline.apply(&backwards).is_err());
+    }
+
+    #[test]
+    fn a_clip_comes_in_over_the_one_before_by_its_transition() {
+        let mut timeline = Timeline::new("ways in", OUTER_RATE);
+        let a = place(&mut timeline, 0, 0, part("a", file("a.mp4", OUTER_RATE, 900), 0, 30));
+        let b = place(&mut timeline, 0, 30, part("b", file("b.mp4", OUTER_RATE, 900), 0, 30));
+        let wipe = crate::Transition {
+            kind: crate::TransitionKind::WipeFromLeft,
+            duration: 9,
+        };
+        let set = Edit::SetTransition {
+            clip: b,
+            transition: Some(wipe),
+        };
+        timeline.apply(&set).unwrap();
+        // During it, the clip before goes on beneath, past its end; the new one is wiped in.
+        let shots = timeline.shots_at(32);
+        assert_eq!(shots.len(), 2);
+        assert_eq!((shots[0].key.clone(), shots[0].media_frame), (vec![a], 32));
+        assert!(shots[0].reveal.is_full());
+        assert_eq!(shots[1].key, vec![b]);
+        let wiped = shots[1].reveal.wipe.expect("a wipe");
+        assert!((wiped.threshold - (-1.0 + 2.0 * 0.3)).abs() < 1e-6);
+        // After it, the new clip alone.
+        assert_eq!(timeline.shots_at(39).len(), 1);
+        assert_eq!(timeline.next_picture_change(30), Some(39));
+        // Kept in the file as a transition between the two.
+        let text = timeline.to_otio();
+        assert!(text.contains("Transition.1"), "{text}");
+        let back = Timeline::from_otio(&text).unwrap();
+        let second = back.tracks().next().unwrap().clips().nth(1).unwrap().1;
+        assert_eq!(second.transition_in, Some(wipe));
+        // Cut in two, the second half follows straight on.
+        timeline.apply(&Edit::Split { track: 0, at: 45 }).unwrap();
+        assert_eq!(timeline.shots_at(45).len(), 1);
+        // Longer than the clip is refused.
+        let too_long = Edit::SetTransition {
+            clip: b,
+            transition: Some(crate::Transition { duration: 99, ..wipe }),
+        };
+        assert!(timeline.apply(&too_long).is_err());
+        // With a gap before, it comes in over nothing: one picture, being revealed.
+        let mut alone = Timeline::new("alone", OUTER_RATE);
+        let c = place(&mut alone, 0, 10, part("c", file("c.mp4", OUTER_RATE, 900), 0, 30));
+        let fade = crate::Transition {
+            kind: crate::TransitionKind::Dissolve,
+            duration: 3,
+        };
+        alone.apply(&Edit::SetTransition { clip: c, transition: Some(fade) }).unwrap();
+        let shots = alone.shots_at(10);
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].reveal.fade, 0.25);
     }
 
     #[test]

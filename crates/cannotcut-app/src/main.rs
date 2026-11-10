@@ -23,20 +23,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cannotcut_audio::{Player, Status as SoundStatus};
-use cannotcut_export::{Event as ExportEvent, Export, Quality, Resolution};
+use cannotcut_export::{Event as ExportEvent, Export, Quality, Resolution, draw_title};
 use cannotcut_media::{
-    ClipInfo, Event, Options, Output, Pixels, Scrubber, Waveform, picture_size,
+    ClipInfo, Colors, Event, Matrix, Options, Output, Pixels, Scrubber, Waveform, picture_size,
 };
 use cannotcut_timeline::{
     ClipId, Edge, Edit, EditError, History, Media as TimelineMedia, Nested, NewClip, Placement,
-    Projects, Rate, Shot, Timeline, TrackKind,
+    Framing, Keyframe, Projects, Rate, Reveal, SPEEDS, Shot, Timeline, Title, TitleFont, TrackKind,
+    Transform, Transition, TransitionKind,
 };
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, key};
 use iced::futures::channel::oneshot;
 use iced::widget::{
     Column, Stack, center, column, container, image, mouse_area, opaque, pane_grid, pick_list,
-    progress_bar, responsive, row, sensor, shader, slider, space, text, tooltip,
+    progress_bar, responsive, row, sensor, shader, slider, space, text, text_editor, tooltip,
 };
 use iced::{
     Center, Color, ContentFit, Element, Fill, Size, Subscription, Task, Theme, time, window,
@@ -56,7 +57,7 @@ use timeline_panel::{
     Action, LANE_GAP, LANE_HEIGHT, PANEL_HEIGHT, RULER_HEIGHT, View, Waveforms,
     timecode_base, timeline_panel,
 };
-use viewer::{YuvPicture, renderer_probe};
+use viewer::{Composite, YuvPicture, renderer_probe};
 
 /// Keeps the viewer off the shader path, to try the fallback on a machine with a working GPU.
 const CPU_VIEWER_FLAG: &str = "--cpu-viewer";
@@ -81,6 +82,30 @@ const PROJECT_EXTENSION: &str = "otio";
 const FILM_EXTENSION: &str = "mp4";
 const EXPORT_BAR_WIDTH: f32 = 160.0;
 const DIALOG_WIDTH: f32 = 380.0;
+/// How long a transition is when first put in.
+const TRANSITION_SECONDS: f64 = 0.5;
+/// How long a text clip is when first put in.
+const TEXT_SECONDS: f64 = 3.0;
+
+/// Words with their lines ended the same way everywhere: by a line feed alone.
+fn plain_lines(words: &str) -> String {
+    words.replace("
+", "
+")
+}
+
+/// A speed as the slider shows it: two figures, as 0.25, 1.5 or 12.
+fn round_speed(speed: f64) -> f64 {
+    let step = if speed < 1.0 { 0.01 } else { 0.05 };
+    ((speed / step).round() * step).clamp(*SPEEDS.start(), *SPEEDS.end())
+}
+/// Titles are drawn as tall as the frame, but no smaller than this (for a frame of unknown or
+/// tiny size, at `TITLE_HEIGHT`) and no bigger than the other.
+const TITLE_LEAST_HEIGHT: u32 = 360;
+const TITLE_HEIGHT: u32 = 1080;
+const TITLE_MOST_HEIGHT: u32 = 2160;
+/// Titles kept drawn for the viewer.
+const DRAWN_TITLES: usize = 8;
 /// A panel's own window, as it opens, and the least it is made.
 const PANEL_WINDOW_SIZE: Size = Size::new(960.0, 540.0);
 const PANEL_WINDOW_LEAST: Size = Size::new(320.0, 240.0);
@@ -112,7 +137,7 @@ const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm", "m4v", "avi", "
 const BYTES_PER_MB: usize = 1024 * 1024;
 /// Media files kept open at once. Each holds a decoder and its cached pictures, so going back
 /// and forth across a cut stays quick without every file of the project staying in memory.
-const MAX_OPEN_SOURCES: usize = 3;
+const MAX_OPEN_SOURCES: usize = 4;
 const SOURCE_CACHE_BYTES: usize = 96 * BYTES_PER_MB;
 /// How long before playback reaches a cut the decoder for the clip after it is got ready.
 const WARM_UP_SECONDS: f64 = 2.0;
@@ -293,6 +318,38 @@ enum Message {
     VolumeChanged(f32),
     /// The volume slider was let go: the volume it shows is set.
     VolumeReleased,
+    /// The selected clip's picture placed anew, while a slider is dragged.
+    TransformChanged(Transform),
+    TransformReleased,
+    /// The selected clip's picture put back as it comes: fitted, centred, covering.
+    TransformReset,
+    /// The selected clip to come in this way over the one before it.
+    TransitionChosen(TransitionKind),
+    /// How long the selected clip's transition is, in seconds, while its slider is dragged.
+    TransitionLengthChanged(f32),
+    TransitionLengthReleased,
+    /// The selected clip to cut in again, with no transition.
+    TransitionRemoved,
+    /// A text clip put in at the playhead, over the clips there.
+    TextAdded,
+    /// The selected clip's speed slider, dragged: the speed's base-ten logarithm.
+    SpeedChanged(f32),
+    SpeedReleased,
+    /// The selected clip to play at this speed.
+    SpeedChosen(f64),
+    /// The selected text clip's words, as typed.
+    TitleTextChanged(String),
+    /// Typing, moving or selecting in the selected text clip's words box.
+    TitleEdited(text_editor::Action),
+    TitleFontChosen(TitleFont),
+    /// The selected text clip's size, while its slider is dragged.
+    TitleSizeChanged(f32),
+    TitleSizeReleased,
+    TitleColorChosen([u8; 4]),
+    /// A keyframe at the playhead on the selected clip, added or taken away.
+    KeyframeToggled,
+    /// The playhead to the selected clip's next keyframe, or with false its previous one.
+    KeyframeStepped(bool),
     /// A media file's waveform has been read, or could not be.
     WaveformRead(String, Option<Arc<Waveform>>),
     /// A project chosen to go on the timeline as a clip has been loaded, or could not be.
@@ -517,10 +574,12 @@ struct Playback {
     warmed: bool,
     /// The timeline frame asked for last; it runs a little ahead of the clock.
     asked: i64,
-    /// Requests made while playing: source, request and the timeline frame it was for.
-    requests: VecDeque<(u64, u64, i64)>,
-    /// Pictures that have arrived and wait for their frame's turn, earliest first.
-    ready: VecDeque<(i64, Shown)>,
+    /// Requests made while playing: source, request, the timeline frame it was for and the
+    /// layer (`Layer::key`) it was for.
+    requests: VecDeque<(u64, u64, i64, Vec<ClipId>)>,
+    /// Pictures that have arrived and wait for their frame's turn, earliest first: the frame,
+    /// the layer, and the source that made it.
+    ready: VecDeque<(i64, Vec<ClipId>, u64, Shown)>,
     /// When the display shows its frames, at a steady pace.
     ticks: Ticks,
     /// How far, in frames, the frame shown runs ahead of the clock: nudges that keep frame
@@ -646,10 +705,10 @@ struct App {
     /// Counts steps in and out, so that what was loaded for a project no longer shown is left
     /// alone.
     nest_step: u64,
-    /// The source of the clip under the playhead; pictures from any other are out of date.
-    active: Option<u64>,
-    /// The source being got ready for the clip after the next cut.
-    warming: Option<u64>,
+    /// The pictures at the playhead, the bottom one first.
+    layers: Vec<Layer>,
+    /// The sources being got ready for the clips after the next cut.
+    warming: Vec<u64>,
     /// Plays the timeline's sound, and keeps time while playing.
     sound: Player,
     /// Plays without sound, as asked on the command line.
@@ -670,7 +729,6 @@ struct App {
     pending: Option<Pending>,
     /// Pictures accepted from decoders so far; gives each one its place in line.
     arrivals: u64,
-    shown: Option<Shown>,
     latency: Latency,
     /// Unknown until the window's renderer has been probed; chosen once.
     viewer: Option<ViewerPath>,
@@ -698,6 +756,21 @@ struct App {
     reading_waveform: bool,
     /// The volume the slider stands at while it is dragged.
     volume_drag: Option<f32>,
+    /// The length being dragged for the selected clip's transition, in frames.
+    transition_drag: Option<i64>,
+    /// The edit a text clip's size slider makes, shown before it is made.
+    title_drag: Option<Edit>,
+    /// The speed being dragged for the selected clip.
+    speed_drag: Option<f64>,
+    /// The text clip whose words were typed in last: more typing carries on that undo step.
+    typing: Option<ClipId>,
+    /// The words box of the selected text clip, kept with its cursor between frames.
+    title_editor: Option<(ClipId, text_editor::Content)>,
+    /// Titles drawn for the viewer, at the size they were drawn; the one used last at the end.
+    titles: Vec<(Title, (u32, u32), YuvPicture)>,
+    /// The transform being dragged on the selected clip, and the edit it makes, shown before it
+    /// is made.
+    transform_drag: Option<(Transform, Edit)>,
     exporting: Option<Exporting>,
     /// The export choices are on show.
     export_dialog: bool,
@@ -817,6 +890,32 @@ struct Shown {
     size: (u32, u32),
 }
 
+/// One of the pictures at the playhead: a clip on a video track, or one inside a nested
+/// project there.
+struct Layer {
+    /// The clips it is seen through (`Shot::key`); the same key is the same picture source.
+    key: Vec<ClipId>,
+    /// Where it sits in the frame.
+    framing: Framing,
+    /// How much of it is seen while a transition brings it in.
+    reveal: Reveal,
+    /// The source decoding it; None while playing until its first picture comes.
+    generation: Option<u64>,
+    shown: Option<Shown>,
+}
+
+/// What a picture at a frame needs, taken out of the timeline before sources are opened.
+struct Wanted {
+    key: Vec<ClipId>,
+    framing: Framing,
+    reveal: Reveal,
+    /// A text clip's words, drawn rather than decoded.
+    title: Option<Title>,
+    media_frame: u64,
+    location: Option<(String, PathBuf)>,
+    name: String,
+}
+
 enum Displayed {
     /// Holding the allocation keeps the picture on the GPU, so drawing it never shows a gap.
     Image(Allocation),
@@ -847,8 +946,8 @@ impl App {
             parents: Vec::new(),
             unchanged: Timeline::new("Untitled", EMPTY_PROJECT_RATE),
             nest_step: 0,
-            active: None,
-            warming: None,
+            layers: Vec::new(),
+            warming: Vec::new(),
             sound: Player::start(settings.sound_output.clone()),
             silent: false,
             sound_delay: None,
@@ -860,7 +959,6 @@ impl App {
             play_stats: None,
             pending: None,
             arrivals: 0,
-            shown: None,
             latency: Latency::default(),
             viewer: None,
             viewer_area: None,
@@ -876,6 +974,13 @@ impl App {
             waveform_queue: VecDeque::new(),
             reading_waveform: false,
             volume_drag: None,
+            transform_drag: None,
+            transition_drag: None,
+            title_drag: None,
+            speed_drag: None,
+            typing: None,
+            title_editor: None,
+            titles: Vec::new(),
             exporting: None,
             export_dialog: false,
             about: None,
@@ -965,16 +1070,15 @@ impl App {
         self.selecting = false;
         self.preview = None;
         self.stop_playing();
-        self.warming = None;
+        self.warming.clear();
         self.playhead = 0;
         // The old project's files are closed; the new one's open as the playhead reaches them.
         self.sources.clear();
         self.adding.clear();
         self.opening = None;
         self.opening_project = false;
-        self.active = None;
+        self.layers.clear();
         self.pending = None;
-        self.shown = None;
         self.notice = None;
         self.show_playhead()
     }
@@ -1190,7 +1294,7 @@ impl App {
                 return Task::batch([loaded, shown]);
             }
             let key = file_key(&path);
-            let (index, task) = match self.source(&key, &path, 0, false) {
+            let (index, task) = match self.source(&key, &path, 0, &[]) {
                 Ok(found) => found,
                 Err(error) => {
                     self.notice = Some(error);
@@ -1374,21 +1478,21 @@ impl App {
 
     /// An open source for a media file to show `frame` from, opening one if need be. `target`
     /// is the file's key ([`file_key`]). A file can be open more than once; the source whose
-    /// decoder is nearest that frame is taken. With `spare` the source showing the picture now
-    /// is left alone. Returns the source's place in `sources` and the task that brings in its
-    /// events.
+    /// decoder is nearest that frame is taken, other than those in `avoid`, which are at work
+    /// on other pictures. Returns the source's place in `sources` and the task that brings in
+    /// its events.
     fn source(
         &mut self,
         target: &str,
         path: &Path,
         frame: u64,
-        spare: bool,
+        avoid: &[u64],
     ) -> Result<(usize, Task<Message>), String> {
         let mut task = Task::none();
         let nearest = (0..self.sources.len())
             .filter(|index| {
                 let source = &self.sources[*index];
-                source.target == target && !(spare && Some(source.generation) == self.active)
+                source.target == target && !avoid.contains(&source.generation)
             })
             .min_by_key(|index| {
                 let last = self.sources[*index].last_frame;
@@ -1424,12 +1528,18 @@ impl App {
                     last_frame: None,
                 });
                 task = Task::run(events, move |event| Message::Media(generation, event.into()));
-                // Closing a source ends its decode thread and frees its pictures.
+                // Closing a source ends its decode thread and frees its pictures. Those at work
+                // stay open, however many that takes.
+                let mut at_work = self.layers_at_work();
+                at_work.extend(self.warming.iter().copied());
+                at_work.extend(self.opening);
+                at_work.extend(avoid.iter().copied());
+                at_work.push(generation);
                 while self.sources.len() > MAX_OPEN_SOURCES {
-                    let idle = self.sources.iter().position(|source| {
-                        ![self.active, self.opening, self.warming, Some(generation)]
-                            .contains(&Some(source.generation))
-                    });
+                    let idle = self
+                        .sources
+                        .iter()
+                        .position(|source| !at_work.contains(&source.generation));
                     match idle {
                         Some(index) => drop(self.sources.remove(index)),
                         None => break,
@@ -1447,8 +1557,9 @@ impl App {
         self.show_frame(look_at.unwrap_or(self.playhead))
     }
 
-    /// Asks for the picture of timeline frame `at`; while an edit is being dragged, of the
-    /// timeline as that edit would leave it.
+    /// Asks for the pictures of timeline frame `at`, one for each layer; while an edit is being
+    /// dragged, of the timeline as that edit would leave it. While playing, the layers on
+    /// screen are left to the clock (`play_tick`): this only asks ahead.
     fn show_frame(&mut self, at: i64) -> Task<Message> {
         let Some(form) = self.form else {
             // The first picture waits until the viewer knows what it wants.
@@ -1458,53 +1569,103 @@ impl App {
             Some(preview) => &preview.timeline,
             None => self.history.timeline(),
         };
-        let Some(shot) = timeline.shot_at(at) else {
+        let wanted: Vec<Wanted> = timeline
+            .shots_at(at)
+            .iter()
+            .map(|shot| Wanted {
+                key: shot.key.clone(),
+                framing: shot.framing.clone(),
+                reveal: shot.reveal,
+                title: shot.clip.media.title.clone(),
+                media_frame: shot.media_frame.max(0) as u64,
+                location: self.location(shot),
+                name: shot.clip.name.clone(),
+            })
+            .collect();
+        let playing = self.playback.is_some();
+        if wanted.is_empty() {
             // Nothing plays here: the viewer goes black. While playing that waits for the
             // clock to get there.
-            self.active = None;
             self.pending = None;
-            if self.playback.is_none() {
-                self.shown = None;
+            if !playing {
+                self.layers.clear();
             }
             return Task::none();
-        };
-        let frame = shot.media_frame.max(0) as u64;
-        let Some((target, path)) = self.location(&shot) else {
-            self.notice = Some(format!("the media of \"{}\" is missing", shot.clip.name));
-            self.active = None;
-            self.shown = None;
-            return Task::none();
-        };
-        match self.source(&target, &path, frame, false) {
-            Ok((index, task)) => {
-                let source = &mut self.sources[index];
-                self.active = Some(source.generation);
-                if self.warming == self.active {
-                    self.warming = None;
+        }
+        let top = wanted.len() - 1;
+        let mut tasks = Vec::new();
+        let mut layers = Vec::new();
+        let mut used: Vec<u64> = Vec::new();
+        for (place, wanted) in wanted.into_iter().enumerate() {
+            if let Some(title) = &wanted.title {
+                let shown = self.title_shown(title);
+                if !playing {
+                    layers.push(Layer {
+                        key: wanted.key,
+                        framing: wanted.framing,
+                        reveal: wanted.reveal,
+                        generation: None,
+                        shown: Some(shown),
+                    });
                 }
-                let pending = Pending {
-                    generation: source.generation,
-                    request: source.request(frame, form),
+                continue;
+            }
+            let Some((target, path)) = wanted.location else {
+                self.notice = Some(format!("the media of \"{}\" is missing", wanted.name));
+                continue;
+            };
+            let (index, task) = match self.source(&target, &path, wanted.media_frame, &used) {
+                Ok(found) => found,
+                Err(error) => {
+                    self.notice = Some(error);
+                    continue;
+                }
+            };
+            tasks.push(task);
+            let source = &mut self.sources[index];
+            let generation = source.generation;
+            let request = source.request(wanted.media_frame, form);
+            used.push(generation);
+            self.warming.retain(|warming| *warming != generation);
+            if let Some(playback) = &mut self.playback {
+                playback
+                    .requests
+                    .push_back((generation, request, at, wanted.key.clone()));
+                while playback.requests.len() > REMEMBERED_REQUESTS {
+                    playback.requests.pop_front();
+                }
+            }
+            // The top picture's arrival is what the readout times.
+            if place == top {
+                self.pending = Some(Pending {
+                    generation,
+                    request,
                     at: Instant::now(),
                     seen: false,
-                };
-                if let Some(playback) = &mut self.playback {
-                    let asked = (pending.generation, pending.request, at);
-                    playback.requests.push_back(asked);
-                    if playback.requests.len() > REMEMBERED_REQUESTS {
-                        playback.requests.pop_front();
-                    }
-                }
-                self.pending = Some(pending);
-                task
+                });
             }
-            Err(error) => {
-                self.notice = Some(error);
-                self.active = None;
-                self.shown = None;
-                Task::none()
+            if !playing {
+                // Until its new picture comes, a layer shows the one it had, or else the one
+                // that was in its place: never a gap.
+                let held = self
+                    .layers
+                    .iter()
+                    .position(|layer| layer.key == wanted.key)
+                    .or((place < self.layers.len()).then_some(place))
+                    .and_then(|index| self.layers[index].shown.take());
+                layers.push(Layer {
+                    key: wanted.key,
+                    framing: wanted.framing,
+                    reveal: wanted.reveal,
+                    generation: Some(generation),
+                    shown: held,
+                });
             }
         }
+        if !playing {
+            self.layers = layers;
+        }
+        Task::batch(tasks)
     }
 
     /// Where the media file of a picture is: its key ([`file_key`]) and its path on disk. None
@@ -1535,34 +1696,46 @@ impl App {
             return Task::none();
         }
         playback.warmed = true;
-        let Some(shot) = timeline.shot_at(cut) else {
-            // Nothing plays after the cut.
-            return Task::none();
+        let pictures = |frame: i64| -> Vec<(Vec<ClipId>, u64, Option<(String, PathBuf)>)> {
+            timeline
+                .shots_at(frame)
+                .iter()
+                .map(|shot| {
+                    let media_frame = shot.media_frame.max(0) as u64;
+                    (shot.key.clone(), media_frame, self.location(shot))
+                })
+                .collect()
         };
-        let frame = shot.media_frame.max(0) as u64;
-        let Some((target, path)) = self.location(&shot) else {
-            return Task::none();
-        };
-        // Where the next clip goes on in the file from where this one stops, the decoder at
-        // work simply carries on.
-        let carries_on = timeline.shot_at(cut - 1).is_some_and(|before| {
-            let stops_at = before.media_frame.max(0) as u64;
-            self.location(&before).is_some_and(|(key, _)| key == target)
-                && (stops_at..=stops_at + CARRY_ON_FRAMES).contains(&frame)
-        });
-        if carries_on {
-            return Task::none();
-        }
-        match self.source(&target, &path, frame, true) {
-            Ok((index, task)) => {
+        let after = pictures(cut);
+        let before = pictures(cut - 1);
+        let mut at_work = self.layers_at_work();
+        let mut tasks = Vec::new();
+        for (key, frame, location) in after {
+            let Some((target, path)) = location else {
+                continue;
+            };
+            // A layer going on past the cut needs nothing. Where the next clip goes on in the
+            // file from where one before stops, the decoder at work simply carries on.
+            let carries_on = before.iter().any(|(before_key, stops_at, before_location)| {
+                *before_key == key
+                    || before_location.as_ref().is_some_and(|(before_target, _)| {
+                        *before_target == target
+                            && (*stops_at..=stops_at + CARRY_ON_FRAMES).contains(&frame)
+                    })
+            });
+            if carries_on {
+                continue;
+            }
+            if let Ok((index, task)) = self.source(&target, &path, frame, &at_work) {
                 let source = &mut self.sources[index];
-                self.warming = Some(source.generation);
+                at_work.push(source.generation);
+                self.warming.push(source.generation);
                 // Its picture is not shown; asking for it is what puts the decoder in place.
                 source.request(frame, form);
-                task
+                tasks.push(task);
             }
-            Err(_) => Task::none(),
         }
+        Task::batch(tasks)
     }
 
     /// A display frame while playing: the clock says which timeline frame is due, the picture
@@ -1604,15 +1777,19 @@ impl App {
         let frame = frame.clamp(self.playhead, last_frame);
         self.playhead = frame;
 
-        // The newest picture that is due; older ones it overtook are dropped.
-        let mut due = None;
-        while playback.ready.front().is_some_and(|(at, _)| *at <= frame) {
-            due = playback.ready.pop_front();
+        // The newest picture that is due for each layer; older ones it overtook are dropped.
+        let mut due: Vec<(Vec<ClipId>, u64, Shown)> = Vec::new();
+        while playback.ready.front().is_some_and(|(at, ..)| *at <= frame) {
+            if let Some((_, key, generation, shown)) = playback.ready.pop_front() {
+                due.retain(|(due_key, ..)| *due_key != key);
+                due.push((key, generation, shown));
+            }
         }
         let ahead = (frame + (LEAD_SECONDS * rate).ceil() as i64).min(last_frame);
         let ask = (ahead > playback.asked).then(|| playback.asked = ahead);
-        if let Some((_, shown)) = due {
-            self.shown = Some(shown);
+        let any_due = !due.is_empty();
+        self.place_layers(frame, due);
+        if any_due {
             if let Some(stats) = &mut self.play_stats {
                 if let Some(last) = stats.last {
                     let gap = now.saturating_duration_since(last);
@@ -1628,9 +1805,8 @@ impl App {
                 stats.last = Some(now);
             }
         }
-        if self.history.timeline().shot_at(frame).is_none() {
+        if self.layers.is_empty() {
             // Nothing plays here. The wait for the next picture is no stutter.
-            self.shown = None;
             if let Some(stats) = &mut self.play_stats {
                 stats.last = None;
             }
@@ -1647,10 +1823,104 @@ impl App {
         Task::batch([asked, self.warm_up()])
     }
 
+    /// The layers at timeline frame `frame` while playing, with the pictures `due` for them
+    /// (layer, source, picture). A layer whose picture is not due yet shows the one it had, or
+    /// else the one that was in its place.
+    fn place_layers(&mut self, frame: i64, mut due: Vec<(Vec<ClipId>, u64, Shown)>) {
+        let (at_frame, titles): (Vec<(Vec<ClipId>, Framing, Reveal)>, Vec<Option<Title>>) = self
+            .history
+            .timeline()
+            .shots_at(frame)
+            .iter()
+            .map(|shot| {
+                let placed = (shot.key.clone(), shot.framing.clone(), shot.reveal);
+                (placed, shot.clip.media.title.clone())
+            })
+            .unzip();
+        let mut drawn: Vec<Option<Shown>> = titles
+            .iter()
+            .map(|title| title.as_ref().map(|title| self.title_shown(title)))
+            .collect();
+        let mut before: Vec<Option<Layer>> = self.layers.drain(..).map(Some).collect();
+        let mut layers: Vec<Layer> = at_frame
+            .iter()
+            .enumerate()
+            .map(|(place, (key, framing, reveal))| {
+                if let Some(shown) = drawn[place].take() {
+                    return Layer {
+                        key: key.clone(),
+                        framing: framing.clone(),
+                        reveal: *reveal,
+                        generation: None,
+                        shown: Some(shown),
+                    };
+                }
+                let kept = before
+                    .iter()
+                    .position(|layer| layer.as_ref().is_some_and(|layer| layer.key == *key))
+                    .and_then(|index| before[index].take());
+                let arrived = due
+                    .iter()
+                    .position(|(due_key, ..)| due_key == key)
+                    .map(|index| due.swap_remove(index));
+                match (arrived, kept) {
+                    (Some((_, generation, shown)), _) => Layer {
+                        key: key.clone(),
+                        framing: framing.clone(),
+                        reveal: *reveal,
+                        generation: Some(generation),
+                        shown: Some(shown),
+                    },
+                    (None, Some(layer)) => Layer {
+                        framing: framing.clone(),
+                        reveal: *reveal,
+                        ..layer
+                    },
+                    (None, None) => Layer {
+                        key: key.clone(),
+                        framing: framing.clone(),
+                        reveal: *reveal,
+                        generation: None,
+                        shown: None,
+                    },
+                }
+            })
+            .collect();
+        for (place, layer) in layers.iter_mut().enumerate() {
+            if layer.shown.is_none() {
+                layer.shown = before
+                    .get_mut(place)
+                    .and_then(|old| old.as_mut())
+                    .and_then(|old| old.shown.take());
+            }
+        }
+        self.layers = layers;
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
+        self.follow_title_editor();
         // Whatever happened may have put a new file on the timeline.
         Task::batch([task, self.read_waveforms()])
+    }
+
+    /// Keeps the words box showing the selected text clip's words: a fresh box when another
+    /// clip is selected, or when its words changed other than by typing there (undo, redo).
+    fn follow_title_editor(&mut self) {
+        let wanted = self.selected_clip().and_then(|id| {
+            let (_, clip, _) = self.history.timeline().clip(id)?;
+            Some((id, clip.media.title.as_ref()?.text.clone()))
+        });
+        let Some((id, words)) = wanted else {
+            self.title_editor = None;
+            return;
+        };
+        let stale = self.title_editor.as_ref().is_none_or(|(held, content)| {
+            *held != id || plain_lines(&content.text()) != words
+        });
+        if stale {
+            self.title_editor = Some((id, text_editor::Content::with_text(&words)));
+        }
     }
 
     /// Asks for the waveform of every media file on the timeline that has none yet.
@@ -2150,6 +2420,187 @@ impl App {
                     return self.sound_edit(&Edit::SetVolume { clip, volume });
                 }
             }
+            Message::TransformChanged(transform) => {
+                // Shown in the viewer while dragging; made an edit once let go.
+                if let Some(edit) = self.transform_edit(transform) {
+                    let mut timeline = self.history.timeline().clone();
+                    if timeline.apply(&edit).is_ok() {
+                        self.transform_drag = Some((transform, edit));
+                        self.preview = Some(Preview {
+                            timeline,
+                            look_at: None,
+                        });
+                        self.place_again();
+                    }
+                }
+            }
+            Message::TransformReleased => {
+                self.preview = None;
+                if let Some((_, edit)) = self.transform_drag.take() {
+                    let task = self.edit(&edit);
+                    self.place_again();
+                    return task;
+                }
+            }
+            Message::TransitionChosen(kind) => {
+                let Some((clip, ..)) = self.clip_at_playhead() else {
+                    self.notice = Some(
+                        "Select the clip a transition brings in, then pick it again".to_string(),
+                    );
+                    return Task::none();
+                };
+                let rate = self.history.timeline().rate().as_f64();
+                let length = clip
+                    .transition_in
+                    .map_or((TRANSITION_SECONDS * rate).round() as i64, |way| way.duration)
+                    .clamp(1, clip.duration.max(1));
+                let transition = Some(Transition {
+                    kind,
+                    duration: length,
+                });
+                let edit = Edit::SetTransition {
+                    clip: clip.id,
+                    transition,
+                };
+                let task = self.edit(&edit);
+                self.place_again();
+                return task;
+            }
+            Message::TransitionLengthChanged(seconds) => {
+                let rate = self.history.timeline().rate().as_f64();
+                self.transition_drag = Some((f64::from(seconds) * rate).round().max(1.0) as i64);
+            }
+            Message::TransitionLengthReleased => {
+                let length = self.transition_drag.take();
+                let way = self
+                    .clip_at_playhead()
+                    .and_then(|(clip, ..)| Some((clip.id, clip.transition_in?, clip.duration)));
+                if let (Some(length), Some((clip, way, most))) = (length, way) {
+                    let transition = Some(Transition {
+                        duration: length.clamp(1, most),
+                        ..way
+                    });
+                    let task = self.edit(&Edit::SetTransition { clip, transition });
+                    self.place_again();
+                    return task;
+                }
+            }
+            Message::TextAdded => return self.add_text(),
+            Message::SpeedChanged(power) => {
+                let speed = 10f64.powf(f64::from(power));
+                self.speed_drag = Some(round_speed(speed));
+            }
+            Message::SpeedReleased => {
+                if let Some(speed) = self.speed_drag.take() {
+                    return self.update(Message::SpeedChosen(speed));
+                }
+            }
+            Message::SpeedChosen(speed) => {
+                if let Some(clip) = self.selected_clip() {
+                    let speed = speed.clamp(*SPEEDS.start(), *SPEEDS.end());
+                    let task = self.edit(&Edit::SetSpeed { clip, speed });
+                    return Task::batch([task, self.show_playhead()]);
+                }
+            }
+            Message::TitleEdited(action) => {
+                let Some((_, content)) = &mut self.title_editor else {
+                    return Task::none();
+                };
+                let typed = action.is_edit();
+                content.perform(action);
+                if typed {
+                    let words = plain_lines(&content.text());
+                    return self.handle(Message::TitleTextChanged(words));
+                }
+            }
+            Message::TitleTextChanged(text) => {
+                let typing = self.selected_clip();
+                if let Some(edit) = self.title_edit(|title| title.text = text) {
+                    let carries_on = typing.is_some() && self.typing == typing;
+                    let applied = if carries_on {
+                        self.history.apply_onto_last(&edit)
+                    } else {
+                        self.history.apply(&edit)
+                    };
+                    if let Err(error) = applied {
+                        self.notice = Some(error.to_string());
+                    }
+                    let task = self.timeline_changed();
+                    self.typing = typing;
+                    return task;
+                }
+            }
+            Message::TitleFontChosen(font) => {
+                if let Some(edit) = self.title_edit(|title| title.font = font) {
+                    return self.edit(&edit);
+                }
+            }
+            Message::TitleColorChosen(color) => {
+                if let Some(edit) = self.title_edit(|title| title.color = color) {
+                    return self.edit(&edit);
+                }
+            }
+            Message::TitleSizeChanged(size) => {
+                if let Some(edit) = self.title_edit(|title| title.size = size) {
+                    let mut timeline = self.history.timeline().clone();
+                    if timeline.apply(&edit).is_ok() {
+                        self.title_drag = Some(edit);
+                        self.preview = Some(Preview {
+                            timeline,
+                            look_at: None,
+                        });
+                        return self.show_frame(self.playhead);
+                    }
+                }
+            }
+            Message::TitleSizeReleased => {
+                self.preview = None;
+                if let Some(edit) = self.title_drag.take() {
+                    return self.edit(&edit);
+                }
+            }
+            Message::TransitionRemoved => {
+                if let Some(clip) = self.selected_clip() {
+                    let task = self.edit(&Edit::SetTransition {
+                        clip,
+                        transition: None,
+                    });
+                    self.place_again();
+                    return task;
+                }
+            }
+            Message::TransformReset => {
+                if let Some(clip) = self.selected_clip() {
+                    let reset = Edit::Many {
+                        label: "Reset transform",
+                        edits: vec![
+                            Edit::SetKeyframes {
+                                clip,
+                                keyframes: Vec::new(),
+                            },
+                            Edit::SetTransform {
+                                clip,
+                                transform: Transform::IDENTITY,
+                            },
+                        ],
+                    };
+                    let task = self.edit(&reset);
+                    self.place_again();
+                    return task;
+                }
+            }
+            Message::KeyframeToggled => {
+                if let Some(edit) = self.keyframe_toggle() {
+                    let task = self.edit(&edit);
+                    self.place_again();
+                    return task;
+                }
+            }
+            Message::KeyframeStepped(forward) => {
+                if let Some(frame) = self.next_keyframe(forward) {
+                    return self.move_playhead(frame);
+                }
+            }
             Message::CompoundOpened => match self.compound_problem() {
                 Some(problem) => self.notice = Some(problem),
                 None => {
@@ -2363,7 +2814,11 @@ impl App {
             Media::Picture { picture, surface } => {
                 // While playing, pictures are told apart by the request they answer, as the
                 // clip before a cut and the one after it are both at work around it.
-                if self.active != Some(generation) && self.playback.is_none() {
+                let at_work = self
+                    .layers
+                    .iter()
+                    .any(|layer| layer.generation == Some(generation));
+                if !at_work && self.playback.is_none() {
                     return Task::none();
                 }
                 self.arrivals += 1;
@@ -2406,8 +2861,9 @@ impl App {
             let asked = playback
                 .requests
                 .iter()
-                .find(|(source, request, _)| (*source, *request) == (generation, info.request));
-            if let Some((_, _, frame)) = asked.filter(|_| info.exact) {
+                .find(|(source, request, ..)| (*source, *request) == (generation, info.request));
+            if let Some((_, _, frame, key)) = asked.filter(|_| info.exact) {
+                let (frame, key) = (*frame, key.clone());
                 let shown = Shown {
                     picture,
                     order,
@@ -2415,8 +2871,8 @@ impl App {
                     hardware: info.hardware,
                     size: info.size,
                 };
-                let place = playback.ready.partition_point(|(at, _)| at <= frame);
-                playback.ready.insert(place, (*frame, shown));
+                let place = playback.ready.partition_point(|(at, ..)| *at <= frame);
+                playback.ready.insert(place, (frame, key, generation, shown));
                 if let Some(pending) = self.pending.take_if(|pending| {
                     pending.generation == generation && pending.request == info.request
                 }) {
@@ -2428,8 +2884,17 @@ impl App {
         }
         // The playhead may have left the clip while the picture was on its way, and uploads
         // finish independently, so an older picture can complete after a newer one.
-        if self.active != Some(generation)
-            || self.shown.as_ref().is_some_and(|shown| shown.order > order)
+        let Some(place) = self
+            .layers
+            .iter()
+            .position(|layer| layer.generation == Some(generation))
+        else {
+            return;
+        };
+        if self.layers[place]
+            .shown
+            .as_ref()
+            .is_some_and(|shown| shown.order > order)
         {
             return;
         }
@@ -2449,13 +2914,161 @@ impl App {
                 self.pending = None;
             }
         }
-        self.shown = Some(Shown {
+        self.layers[place].shown = Some(Shown {
             picture,
             order,
             exact: info.exact,
             hardware: info.hardware,
             size: info.size,
         });
+    }
+
+    /// The layers on screen placed as the timeline now has them, as while a transform is being
+    /// dragged: their pictures stay, so nothing is decoded again.
+    fn place_again(&mut self) {
+        let timeline = match &self.preview {
+            Some(preview) => &preview.timeline,
+            None => self.history.timeline(),
+        };
+        let at = self
+            .preview
+            .as_ref()
+            .and_then(|preview| preview.look_at)
+            .unwrap_or(self.playhead);
+        let placed: Vec<(Vec<ClipId>, Framing, Reveal)> = timeline
+            .shots_at(at)
+            .iter()
+            .map(|shot| (shot.key.clone(), shot.framing.clone(), shot.reveal))
+            .collect();
+        for layer in &mut self.layers {
+            if let Some((_, framing, reveal)) = placed.iter().find(|(key, ..)| *key == layer.key) {
+                layer.framing = framing.clone();
+                layer.reveal = *reveal;
+            }
+        }
+    }
+
+    /// The selected clip, where it starts, and how far into it the playhead is (inside it).
+    fn clip_at_playhead(&self) -> Option<(&cannotcut_timeline::Clip, i64, i64)> {
+        let (_, clip, start) = self.history.timeline().clip(self.selected_clip()?)?;
+        let offset = (self.playhead - start).clamp(0, (clip.duration - 1).max(0));
+        Some((clip, start, offset))
+    }
+
+    /// The edit that gives the selected clip `transform` at the playhead: its only transform
+    /// while it has no keyframes, else a keyframe there, put in or changed.
+    fn transform_edit(&self, transform: Transform) -> Option<Edit> {
+        let (clip, _, offset) = self.clip_at_playhead()?;
+        if clip.keyframes.is_empty() {
+            return Some(Edit::SetTransform {
+                clip: clip.id,
+                transform,
+            });
+        }
+        let at = clip.source_at(offset);
+        let mut keyframes = clip.keyframes.clone();
+        match keyframes.binary_search_by_key(&at, |keyframe| keyframe.at) {
+            Ok(index) => keyframes[index].transform = transform,
+            Err(index) => keyframes.insert(index, Keyframe { at, transform }),
+        }
+        Some(Edit::SetKeyframes {
+            clip: clip.id,
+            keyframes,
+        })
+    }
+
+    /// The edit that puts a keyframe at the playhead on the selected clip, holding where its
+    /// picture is now, or takes away the one there.
+    fn keyframe_toggle(&self) -> Option<Edit> {
+        let (clip, _, offset) = self.clip_at_playhead()?;
+        let at = clip.source_at(offset);
+        let mut keyframes = clip.keyframes.clone();
+        match keyframes.binary_search_by_key(&at, |keyframe| keyframe.at) {
+            Ok(index) => {
+                let taken = keyframes.remove(index);
+                // The last one gone, the clip keeps where it was.
+                if keyframes.is_empty() {
+                    return Some(Edit::Many {
+                        label: "Keyframes",
+                        edits: vec![
+                            Edit::SetKeyframes {
+                                clip: clip.id,
+                                keyframes,
+                            },
+                            Edit::SetTransform {
+                                clip: clip.id,
+                                transform: taken.transform,
+                            },
+                        ],
+                    });
+                }
+            }
+            Err(index) => keyframes.insert(
+                index,
+                Keyframe {
+                    at,
+                    transform: clip.transform_at(offset),
+                },
+            ),
+        }
+        Some(Edit::SetKeyframes {
+            clip: clip.id,
+            keyframes,
+        })
+    }
+
+    /// The timeline frame of the selected clip's next keyframe after the playhead, or with
+    /// `forward` false the one before it.
+    fn next_keyframe(&self, forward: bool) -> Option<i64> {
+        let (clip, start, _) = self.clip_at_playhead()?;
+        let frames = clip
+            .keyframes
+            .iter()
+            .map(|keyframe| start + clip.offset_of(keyframe.at))
+            .filter(|frame| (start..start + clip.duration).contains(frame));
+        if forward {
+            frames.filter(|frame| *frame > self.playhead).min()
+        } else {
+            frames.filter(|frame| *frame < self.playhead).max()
+        }
+    }
+
+    /// The sources at work on the layers on screen.
+    fn layers_at_work(&self) -> Vec<u64> {
+        self.layers.iter().filter_map(|layer| layer.generation).collect()
+    }
+
+    /// The top picture on screen, which the readout tells about.
+    fn top_shown(&self) -> Option<&Shown> {
+        self.layers.iter().rev().find_map(|layer| layer.shown.as_ref())
+    }
+
+    /// The pictures on screen as the GPU viewer draws them, bottom first; None when one of them
+    /// is drawn another way, or there are none.
+    fn composite(&self) -> Option<Composite> {
+        let mut layers = Vec::new();
+        for layer in &self.layers {
+            match layer.shown.as_ref().map(|shown| &shown.picture) {
+                Some(Displayed::Yuv(picture)) => {
+                    layers.push((picture.clone(), layer.framing.clone(), layer.reveal));
+                }
+                Some(Displayed::Image(_)) => return None,
+                None => {}
+            }
+        }
+        (!layers.is_empty()).then(|| Composite {
+            frame: self.frame_shape(),
+            layers,
+        })
+    }
+
+    /// The shape of the frame the pictures are placed in: that of the film, which takes it
+    /// from the first clip's picture, as far as known.
+    fn frame_shape(&self) -> (u32, u32) {
+        self.film_source()
+            .and_then(|(target, _)| self.picture_sizes.get(&target).copied())
+            .or_else(|| self.top_shown().map(|shown| shown.size))
+            .unwrap_or((16, 9))
     }
 
     fn last_frame(&self) -> i64 {
@@ -2488,6 +3101,124 @@ impl App {
     }
 
     /// The selected clip, when exactly one is.
+    /// The edit that changes the selected text clip's title by `change`; None when no text
+    /// clip is selected.
+    fn title_edit(&self, change: impl FnOnce(&mut Title)) -> Option<Edit> {
+        let (_, clip, _) = self.history.timeline().clip(self.selected_clip()?)?;
+        let mut title = clip.media.title.clone()?;
+        change(&mut title);
+        Some(Edit::SetMedia {
+            clip: clip.id,
+            media: Arc::new(clip.media.with_title(title)),
+        })
+    }
+
+    /// Puts a text clip in at the playhead, on the lowest track above the main one with room
+    /// for it there, or on a new track at the top, and selects it.
+    fn add_text(&mut self) -> Task<Message> {
+        let timeline = self.history.timeline();
+        let rate = timeline.rate();
+        let at = self.playhead;
+        let duration = (TEXT_SECONDS * rate.as_f64()).round() as i64;
+        let free = |track: &cannotcut_timeline::Track| {
+            track.kind == TrackKind::Video
+                && track
+                    .clips()
+                    .all(|(start, clip)| start + clip.duration <= at || start >= at + duration)
+        };
+        let found = timeline
+            .tracks()
+            .enumerate()
+            .skip(1)
+            .find(|(_, track)| free(track))
+            .map(|(index, _)| index);
+        let clip = NewClip::title(Title::new("Text"), duration, rate);
+        let (track, mut edits) = match found {
+            Some(track) => (track, Vec::new()),
+            None => {
+                let index = timeline.tracks().len().max(1);
+                let add = Edit::AddTrack {
+                    index,
+                    kind: TrackKind::Video,
+                    name: "Text".to_string(),
+                };
+                (index, vec![add])
+            }
+        };
+        edits.push(Edit::Place {
+            track,
+            at,
+            clip,
+            mode: Placement::Overwrite,
+        });
+        let edit = Edit::Many {
+            label: "Add text",
+            edits,
+        };
+        self.typing = None;
+        match self.history.apply(&edit) {
+            Ok(created) => {
+                self.notice = None;
+                self.selected = created.into_iter().collect();
+                self.details_tab = DetailsTab::Video;
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+        self.timeline_changed()
+    }
+
+    /// The selected clip's title drawn for the viewer, as big as the frame is shown at most.
+    fn title_shown(&mut self, title: &Title) -> Shown {
+        let (frame_width, frame_height) = self.frame_shape();
+        let height = if frame_height < TITLE_LEAST_HEIGHT {
+            TITLE_HEIGHT
+        } else {
+            frame_height.min(TITLE_MOST_HEIGHT)
+        };
+        let width = (f64::from(height) * f64::from(frame_width) / f64::from(frame_height.max(1)))
+            .round() as u32;
+        let size = (width.max(2) & !1, height & !1);
+        let picture = match self
+            .titles
+            .iter()
+            .position(|(drawn, drawn_size, _)| drawn == title && *drawn_size == size)
+        {
+            Some(place) => {
+                let used = self.titles.remove(place);
+                let picture = used.2.clone();
+                self.titles.push(used);
+                picture
+            }
+            None => {
+                let drawn = draw_title(title, size);
+                let colors = Colors {
+                    matrix: Matrix::Bt709,
+                    full_range: false,
+                };
+                let picture = YuvPicture::with_alpha(
+                    drawn.width,
+                    drawn.height,
+                    drawn.luma,
+                    drawn.chroma,
+                    Some(drawn.alpha),
+                    colors,
+                );
+                self.titles.push((title.clone(), size, picture.clone()));
+                if self.titles.len() > DRAWN_TITLES {
+                    self.titles.remove(0);
+                }
+                picture
+            }
+        };
+        Shown {
+            size: picture.size(),
+            picture: Displayed::Yuv(picture),
+            order: 0,
+            exact: true,
+            hardware: false,
+        }
+    }
+
     fn selected_clip(&self) -> Option<ClipId> {
         match self.selected.as_slice() {
             [clip] => Some(*clip),
@@ -2580,6 +3311,7 @@ impl App {
 
     /// Makes an edit the user asked for; it can be undone.
     fn edit(&mut self, edit: &Edit) -> Task<Message> {
+        self.typing = None;
         match self.history.apply(edit) {
             Ok(_) => self.notice = None,
             Err(error) => self.notice = Some(error.to_string()),
@@ -3437,7 +4169,10 @@ impl App {
         let source = self
             .sources
             .iter()
-            .find(|source| Some(source.generation) == self.active.or(self.opening));
+            .find(|source| {
+                let top = self.layers.last().and_then(|layer| layer.generation);
+                Some(source.generation) == top.or(self.opening)
+            });
         match source {
             Some(Source {
                 name,
@@ -3470,7 +4205,7 @@ impl App {
             format!("first {}", milliseconds(self.latency.first_picture)),
             format!("exact {}", milliseconds(self.latency.exact)),
         ];
-        if let Some(shown) = &self.shown {
+        if let Some(shown) = self.top_shown() {
             if !shown.exact {
                 parts.push("keyframe".to_string());
             }
@@ -3481,12 +4216,15 @@ impl App {
             Some(ViewerPath::Cpu) => "CPU viewer",
             None => "viewer",
         };
-        match &self.shown {
+        match self.top_shown() {
             Some(Shown {
                 size: (width, height),
                 ..
             }) => parts.push(format!("{path} {width}x{height}")),
             None => parts.push(path.to_string()),
+        }
+        if self.layers.len() > 1 {
+            parts.push(format!("{} layers", self.layers.len()));
         }
         if let Some(stats) = self.play_stats.filter(|stats| !stats.stepping.is_zero()) {
             parts.push(format!(

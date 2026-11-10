@@ -11,8 +11,8 @@ use std::cell::Cell;
 use super::*;
 use crate::dock::Part;
 use crate::icons::{ICON_BUTTON_WIDTH, ICON_GAP, ICON_SIZE, Icon, glyph, icon, ink};
-use cannotcut_timeline::{Clip, Item};
-use iced::widget::{Row, column, pane_grid, row, scrollable, stack};
+use cannotcut_timeline::{Clip, Item, Title, TitleFont};
+use iced::widget::{Row, column, pane_grid, row, scrollable, stack, text_editor};
 use iced::{Padding, Point, Rectangle, mouse};
 
 /// The bar along the top of the window.
@@ -583,15 +583,17 @@ impl App {
     /// double-clicking the picture does, if anything.
     fn viewer_body(&self, room: f32, double_click: Option<Message>) -> Element<'_, Message> {
         let timeline = self.history.timeline();
-        let picture: Element<'_, Message> = match self.shown.as_ref().map(|shown| &shown.picture) {
-            Some(Displayed::Yuv(planes)) => shader(planes).width(Fill).height(Fill).into(),
-            Some(Displayed::Image(allocation)) => image(allocation.handle().clone())
+        // On the GPU, every layer, placed in the frame; drawn otherwise, the top one alone.
+        let top = self.top_shown().map(|shown| &shown.picture);
+        let picture: Element<'_, Message> = match (self.composite(), top) {
+            (Some(composite), _) => shader(composite).width(Fill).height(Fill).into(),
+            (None, Some(Displayed::Image(allocation))) => image(allocation.handle().clone())
                 .content_fit(ContentFit::Contain)
                 .width(Fill)
                 .height(Fill)
                 .into(),
-            None if timeline.duration() == 0 => center(text("Add a clip to start")).into(),
-            None => center(text("")).into(),
+            _ if timeline.duration() == 0 => center(text("Add a clip to start")).into(),
+            _ => center(text("")).into(),
         };
         let picture = container(picture)
             .width(Fill)
@@ -780,10 +782,8 @@ impl App {
     fn media_body(&self) -> Element<'_, Message> {
         match self.media_tab {
             MediaTab::Media => self.media_list(),
-            MediaTab::Text => coming("Titles and text over the picture come in a later step."),
-            MediaTab::Transitions => {
-                coming("Cross-fades and wipes between clips come in a later step.")
-            }
+            MediaTab::Text => self.text_list(),
+            MediaTab::Transitions => self.transition_list(),
             MediaTab::Effects => coming("Colour and filters come in a later step."),
         }
     }
@@ -798,6 +798,10 @@ impl App {
                 let Item::Clip(clip) = item else {
                     continue;
                 };
+                // Words are no media file.
+                if clip.media.title.is_some() {
+                    continue;
+                }
                 let same = |seen: &&mut (&Arc<TimelineMedia>, Vec<ClipId>)| {
                     Arc::ptr_eq(seen.0, &clip.media)
                         || (seen.0.target.is_some() && seen.0.target == clip.media.target)
@@ -901,11 +905,14 @@ impl App {
         let selected = self.selected_clip().and_then(|id| timeline.clip(id));
         match (self.selected.len(), selected) {
             (1, Some((track, clip, start))) => match self.details_tab {
-                DetailsTab::Video => self.clip_details(clip, start),
-                DetailsTab::Audio => self.clip_sound(track),
-                DetailsTab::Speed => {
-                    coming("Faster, slower and reversed clips come in a later step.")
+                DetailsTab::Video => {
+                    let video = timeline
+                        .track(track)
+                        .is_some_and(|track| track.kind == TrackKind::Video);
+                    self.clip_details(clip, start, video)
                 }
+                DetailsTab::Audio => self.clip_sound(track),
+                DetailsTab::Speed => self.speed_controls(clip),
             },
             (0, _) => self.project_details(),
             (count, _) => {
@@ -923,11 +930,13 @@ impl App {
         }
     }
 
-    /// What the selected clip is.
-    fn clip_details(&self, clip: &Clip, start: i64) -> Element<'_, Message> {
+    /// What the selected clip is, and, for one on a video track, where its picture sits.
+    fn clip_details(&self, clip: &Clip, start: i64, video: bool) -> Element<'_, Message> {
         let rate = self.history.timeline().rate();
         let source = if clip.media.is_inside() {
             "Kept inside this project".to_string()
+        } else if clip.media.title.is_some() {
+            "Text".to_string()
         } else {
             clip.media
                 .file(self.project_folder.as_deref())
@@ -952,15 +961,336 @@ impl App {
             let inside = Message::StepInside(clip.id);
             rows = rows.push(button(theme::display("Step inside")).on_press(inside));
         }
-        let transform = column![
-            section("Transform".to_string()),
-            text("Scale, position, rotation and opacity come with layered video.")
-                .size(DETAIL_TEXT_SIZE).font(theme::SMALL)
+        let mut details = column![rows].spacing(PANEL_PADDING).padding(PANEL_PADDING);
+        if let Some(title) = &clip.media.title {
+            details = details.push(rule()).push(self.title_controls(title));
+        }
+        if video {
+            details = details
+                .push(rule())
+                .push(self.transition_controls(clip))
+                .push(rule())
+                .push(self.transform_controls(clip));
+        }
+        scrollable(details).height(Fill).into()
+    }
+
+    /// How fast the selected clip plays: a slider from a tenth as fast to ten times, and the
+    /// usual speeds as buttons.
+    fn speed_controls(&self, clip: &Clip) -> Element<'_, Message> {
+        let speed = self.speed_drag.unwrap_or(clip.speed);
+        let rate = self.history.timeline().rate();
+        let length = (clip.duration as f64 * clip.speed / speed).round() as i64;
+        let slider = iced::widget::slider(-1.0..=1.0, speed.log10() as f32, Message::SpeedChanged)
+            .step(0.005_f32)
+            .on_release(Message::SpeedReleased);
+        let presets = SPEED_PRESETS.map(|preset| {
+            let lit = (clip.speed - preset).abs() < 1e-6;
+            button(text(format!("{preset}x")).size(DETAIL_TEXT_SIZE))
+                .padding([4, 8])
+                .style(if lit { theme::on } else { theme::quiet })
+                .on_press(Message::SpeedChosen(preset))
+                .into()
+        });
+        let about = "The clip gets shorter or longer to play the same part of its media; its \
+            sound goes up or down in pitch with it.";
+        column![
+            section("Speed".to_string()),
+            row![
+                text("Speed")
+                    .size(DETAIL_TEXT_SIZE)
+                    .font(theme::SMALL)
+                    .color(theme::TEXT_DIM)
+                    .width(DETAIL_LABEL_WIDTH),
+                slider,
+                text(format!("{speed:.2}x"))
+                    .size(DETAIL_TEXT_SIZE)
+                    .width(TRANSFORM_VALUE_WIDTH),
+            ]
+            .spacing(8)
+            .align_y(Center),
+            Row::with_children(presets).spacing(4).wrap(),
+            detail("Length", timecode(length, rate)),
+            text(about).size(DETAIL_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM),
+        ]
+        .spacing(8)
+        .padding(PANEL_PADDING)
+        .into()
+    }
+
+    /// The Text tab: putting a text clip in at the playhead.
+    fn text_list(&self) -> Element<'_, Message> {
+        let add = button(labelled(Icon::Text, "Add text", theme::ON_ACCENT))
+            .style(theme::primary)
+            .on_press(Message::TextAdded);
+        let about = "Puts words over the picture at the playhead. Select the text clip to \
+            change its words, face, size and colour; place it with Transform.";
+        column![
+            add,
+            text(about).size(DETAIL_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM),
+        ]
+        .spacing(PANEL_PADDING)
+        .padding(PANEL_PADDING)
+        .into()
+    }
+
+    /// The selected text clip's words and how they look.
+    fn title_controls(&self, title: &Title) -> Element<'_, Message> {
+        let label = |words: &'static str| {
+            text(words)
+                .size(DETAIL_TEXT_SIZE)
+                .font(theme::SMALL)
+                .color(theme::TEXT_DIM)
+                .width(DETAIL_LABEL_WIDTH)
+        };
+        // Several lines: Enter starts a new one.
+        let words: Element<'_, Message> = match &self.title_editor {
+            Some((_, content)) => text_editor(content)
+                .placeholder("Words")
+                .on_action(Message::TitleEdited)
+                .size(DETAIL_TEXT_SIZE + 2.0)
+                .height(iced::Length::Shrink)
+                .into(),
+            None => text(title.text.clone()).into(),
+        };
+        let faces = TitleFont::ALL.map(|font| {
+            let lit = title.font == font;
+            button(text(font.name()).size(DETAIL_TEXT_SIZE))
+                .padding([4, 8])
+                .style(if lit { theme::on } else { theme::quiet })
+                .on_press(Message::TitleFontChosen(font))
+                .into()
+        });
+        let size = self
+            .title_drag
+            .as_ref()
+            .and_then(|_| self.preview.as_ref())
+            .and_then(|preview| preview.timeline.clip(self.selected_clip()?))
+            .and_then(|(_, clip, _)| clip.media.title.as_ref().map(|title| title.size))
+            .unwrap_or(title.size);
+        let slider = iced::widget::slider(Title::SIZES, size, Message::TitleSizeChanged)
+            .step(0.005_f32)
+            .on_release(Message::TitleSizeReleased);
+        let swatches = TITLE_COLORS.map(|color| {
+            let [red, green, blue, _] = color;
+            let face = Color::from_rgb8(red, green, blue);
+            let lit = title.color == color;
+            let ring = if lit { theme::TEXT } else { Color::TRANSPARENT };
+            button(space().width(SWATCH).height(SWATCH))
+                .padding(0)
+                .style(move |_, _| button::Style {
+                    background: Some(face.into()),
+                    border: iced::Border {
+                        color: ring,
+                        width: 2.0,
+                        radius: 4.0.into(),
+                    },
+                    ..button::Style::default()
+                })
+                .on_press(Message::TitleColorChosen(color))
+                .into()
+        });
+        column![
+            section("Text".to_string()),
+            row![label("Words"), words].spacing(8),
+            row![label("Face"), Row::with_children(faces).spacing(4)].spacing(8).align_y(Center),
+            row![
+                label("Size"),
+                slider,
+                text(format!("{:.0}%", size * 100.0))
+                    .size(DETAIL_TEXT_SIZE)
+                    .width(TRANSFORM_VALUE_WIDTH),
+            ]
+            .spacing(8)
+            .align_y(Center),
+            row![label("Colour"), Row::with_children(swatches).spacing(6)]
+                .spacing(8)
+                .align_y(Center),
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    /// The ways a clip can come in over the one before it: picking one gives it to the selected
+    /// clip.
+    fn transition_list(&self) -> Element<'_, Message> {
+        let chosen = self.clip_at_playhead().and_then(|(clip, ..)| clip.transition_in);
+        let can = self.selected_clip().is_some();
+        let entries = TransitionKind::ALL.map(|kind| {
+            let lit = chosen.is_some_and(|way| way.kind == kind);
+            let entry = row![
+                icon(Icon::Transitions, ENTRY_ICON_SIZE, theme::TEXT_DIM),
+                text(kind.name()),
+            ]
+            .spacing(BAR_PADDING)
+            .align_y(Center);
+            button(entry)
+                .width(Fill)
+                .style(if lit { theme::on } else { theme::quiet })
+                .on_press_maybe(can.then_some(Message::TransitionChosen(kind)))
+                .into()
+        });
+        let about = if can {
+            "Pick how the selected clip comes in over the clip before it."
+        } else {
+            "Select a clip, then pick how it comes in over the clip before it."
+        };
+        column![
+            text(about).size(DETAIL_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM),
+            Column::with_children(entries).spacing(2),
+        ]
+        .spacing(PANEL_PADDING)
+        .padding(PANEL_PADDING)
+        .into()
+    }
+
+    /// The selected clip's way in: which, how long, or none.
+    fn transition_controls(&self, clip: &Clip) -> Element<'_, Message> {
+        let mut rows = column![section("Transition in".to_string())].spacing(8);
+        let Some(way) = clip.transition_in else {
+            let none = "Cuts straight in. Pick a transition in the Transitions tab.";
+            return rows
+                .push(text(none).size(DETAIL_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM))
+                .into();
+        };
+        let rate = self.history.timeline().rate().as_f64() as f32;
+        let frames = self.transition_drag.unwrap_or(way.duration);
+        let seconds = frames as f32 / rate;
+        let most = (clip.duration as f32 / rate).max(1.0 / rate);
+        let range = 1.0 / rate..=most.min(MOST_TRANSITION_SECONDS);
+        let slider = iced::widget::slider(range, seconds, Message::TransitionLengthChanged)
+        .step(1.0 / rate)
+        .on_release(Message::TransitionLengthReleased);
+        rows = rows.push(text(way.kind.name()));
+        rows = rows.push(
+            row![
+                text("Length")
+                    .size(DETAIL_TEXT_SIZE)
+                    .font(theme::SMALL)
+                    .color(theme::TEXT_DIM)
+                    .width(DETAIL_LABEL_WIDTH),
+                slider,
+                text(format!("{seconds:.2} s"))
+                    .size(DETAIL_TEXT_SIZE)
+                    .width(TRANSFORM_VALUE_WIDTH),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        );
+        rows.push(
+            button(theme::display("Remove"))
+                .style(theme::normal)
+                .on_press(Message::TransitionRemoved),
+        )
+        .into()
+    }
+
+    /// Sliders placing the clip's picture in the frame, over the tracks below it.
+    fn transform_controls(&self, clip: &Clip) -> Element<'_, Message> {
+        let offset = self
+            .clip_at_playhead()
+            .map_or(0, |(_, _, offset)| offset);
+        let now = self
+            .transform_drag
+            .as_ref()
+            .map_or_else(|| clip.transform_at(offset), |(transform, _)| *transform);
+        let percent = |share: f32| format!("{:.0}%", share * 100.0);
+        let rows = [
+            transform_row("Position X", -1.0..=1.0, 0.005, now.x, percent(now.x), move |x| {
+                Transform { x, ..now }
+            }),
+            transform_row("Position Y", -1.0..=1.0, 0.005, now.y, percent(now.y), move |y| {
+                Transform { y, ..now }
+            }),
+            transform_row(
+                "Scale",
+                Transform::LEAST_SCALE..=MOST_SCALE,
+                0.01,
+                now.scale,
+                percent(now.scale),
+                move |scale| Transform { scale, ..now },
+            ),
+            transform_row(
+                "Rotation",
+                -180.0..=180.0,
+                1.0,
+                now.rotation,
+                format!("{:.0}°", now.rotation),
+                move |rotation| Transform { rotation, ..now },
+            ),
+            transform_row(
+                "Skew X",
+                -Transform::MOST_SKEW..=Transform::MOST_SKEW,
+                1.0,
+                now.skew_x,
+                format!("{:.0}°", now.skew_x),
+                move |skew_x| Transform { skew_x, ..now },
+            ),
+            transform_row(
+                "Skew Y",
+                -Transform::MOST_SKEW..=Transform::MOST_SKEW,
+                1.0,
+                now.skew_y,
+                format!("{:.0}°", now.skew_y),
+                move |skew_y| Transform { skew_y, ..now },
+            ),
+            transform_row(
+                "Opacity",
+                0.0..=1.0,
+                0.01,
+                now.opacity,
+                percent(now.opacity),
+                move |opacity| Transform { opacity, ..now },
+            ),
+        ];
+        let untouched = clip.keyframes.is_empty() && clip.transform.is_identity();
+        let reset = button(theme::display("Reset"))
+            .style(theme::normal)
+            .on_press_maybe((!untouched).then_some(Message::TransformReset));
+        // Keyframes: one here or not, and the way to those either side.
+        let here = clip.source_at(offset);
+        let on_one = clip.keyframes.iter().any(|keyframe| keyframe.at == here);
+        let toggle = button(theme::display(if on_one {
+            "Remove keyframe"
+        } else {
+            "Add keyframe"
+        }))
+        .style(if on_one { theme::on } else { theme::normal })
+        .on_press(Message::KeyframeToggled);
+        let step = |which: Icon, forward: bool, words: &'static str| {
+            hint(
+                icon_button(which, theme::TEXT)
+                    .style(theme::quiet)
+                    .on_press_maybe(
+                        self.next_keyframe(forward)
+                            .map(|_| Message::KeyframeStepped(forward)),
+                    ),
+                words,
+            )
+        };
+        let about = match clip.keyframes.len() {
+            0 => "No keyframes: the picture stays put. Add one to move it over time.".to_string(),
+            1 => "1 keyframe. Add another elsewhere to move between them.".to_string(),
+            count => format!("{count} keyframes: the sliders set the one at the playhead."),
+        };
+        let keyframes = column![
+            row![
+                step(Icon::Previous, false, "Previous keyframe"),
+                toggle,
+                step(Icon::Next, true, "Next keyframe"),
+            ]
+            .spacing(4)
+            .align_y(Center),
+            text(about)
+                .size(DETAIL_TEXT_SIZE)
+                .font(theme::SMALL)
                 .color(theme::TEXT_DIM),
         ]
-        .spacing(8);
-        scrollable(column![rows, rule(), transform].spacing(PANEL_PADDING).padding(PANEL_PADDING))
-            .height(Fill)
+        .spacing(6);
+        column![section("Transform".to_string()), keyframes]
+            .extend(rows)
+            .push(reset)
+            .spacing(8)
             .into()
     }
 
@@ -1099,6 +1429,57 @@ fn pop_out<'a>(part: Part, height: f32) -> Element<'a, Message> {
 /// `content` on a bar across the top of a panel.
 fn across(content: Element<'_, Message>) -> Element<'_, Message> {
     container(content).width(Fill).style(theme::bar).into()
+}
+
+/// The colours a title can take: white, black, and bright ones that read over most pictures.
+const TITLE_COLORS: [[u8; 4]; 8] = [
+    [255, 255, 255, 255],
+    [0, 0, 0, 255],
+    [255, 214, 0, 255],
+    [255, 72, 72, 255],
+    [72, 220, 120, 255],
+    [64, 200, 255, 255],
+    [180, 120, 255, 255],
+    [255, 128, 200, 255],
+];
+/// Speeds a clip can be given with one press.
+const SPEED_PRESETS: [f64; 7] = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0];
+/// The side of a colour swatch.
+const SWATCH: f32 = 22.0;
+/// The longest a transition's slider goes, in seconds.
+const MOST_TRANSITION_SECONDS: f32 = 5.0;
+/// The most a picture is scaled up to: four times as big as fitted.
+const MOST_SCALE: f32 = 4.0;
+/// Wide enough for "-100%" and "-180°", so the slider beside it stays put.
+const TRANSFORM_VALUE_WIDTH: f32 = 48.0;
+
+/// A labelled slider for one of a transform's numbers: `make` turns a value into the whole
+/// transform.
+fn transform_row<'a>(
+    label: &'a str,
+    range: std::ops::RangeInclusive<f32>,
+    step: f32,
+    value: f32,
+    shown: String,
+    make: impl Fn(f32) -> Transform + 'a,
+) -> Element<'a, Message> {
+    let slider = iced::widget::slider(range, value, move |value| {
+        Message::TransformChanged(make(value))
+    })
+    .step(step)
+    .on_release(Message::TransformReleased);
+    row![
+        text(label)
+            .size(DETAIL_TEXT_SIZE)
+            .font(theme::SMALL)
+            .color(theme::TEXT_DIM)
+            .width(DETAIL_LABEL_WIDTH),
+        slider,
+        text(shown).size(DETAIL_TEXT_SIZE).width(TRANSFORM_VALUE_WIDTH),
+    ]
+    .spacing(8)
+    .align_y(Center)
+    .into()
 }
 
 /// A row of tabs across the top of a panel: words, whether chosen, what choosing does.

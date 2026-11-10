@@ -13,6 +13,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+ab_glyph = "0.2.32"
 cannotcut-audio = { path = "crates/cannotcut-audio" }
 cannotcut-export = { path = "crates/cannotcut-export" }
 cannotcut-media = { path = "crates/cannotcut-media" }

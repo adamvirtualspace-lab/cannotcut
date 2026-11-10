@@ -5,9 +5,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::model::{
-    Clip, ClipId, Extras, Item, MAX_FRAMES, Media, Rate, Timeline, Track, TrackKind, new_id,
+    Clip, ClipId, Extras, Item, MAX_FRAMES, Media, Rate, SPEEDS, Timeline, Track, TrackKind,
+    new_id,
 };
 use crate::nest::Projects;
+use crate::transform::{Keyframe, Transform};
+use crate::title::Title;
+use crate::transition::Transition;
 
 /// How many edits can be undone; older ones are forgotten.
 const MAX_UNDO_STEPS: usize = 500;
@@ -71,6 +75,29 @@ pub enum Edit {
         track: usize,
         muted: bool,
     },
+    /// Places a clip's picture in the frame (see [`Transform`]), where it has no keyframes.
+    SetTransform {
+        clip: ClipId,
+        transform: Transform,
+    },
+    /// Plays a clip's media faster or slower (see [`Clip::speed`]), within [`SPEEDS`]. The
+    /// clip gets longer or shorter to play the same stretch of it, as far as the media lasts;
+    /// on a magnetic track what follows moves along, elsewhere a longer clip needs the room.
+    SetSpeed {
+        clip: ClipId,
+        speed: f64,
+    },
+    /// Gives a clip a way in over the one before it, or takes it away.
+    SetTransition {
+        clip: ClipId,
+        transition: Option<Transition>,
+    },
+    /// Gives a clip these keyframes, in place of those it had: in order of their frames, none
+    /// at the same one.
+    SetKeyframes {
+        clip: ClipId,
+        keyframes: Vec<Keyframe>,
+    },
     /// Makes a track's clips keep together, or go where they are put (see
     /// [`Track::magnetic`]). The clips already on it stay where they are.
     SetMagnetic {
@@ -111,6 +138,10 @@ impl Edit {
             Self::SetVolume { .. } => "Volume",
             Self::SetMuted { muted: true, .. } => "Mute",
             Self::SetMuted { muted: false, .. } => "Unmute",
+            Self::SetTransform { .. } => "Transform",
+            Self::SetKeyframes { .. } => "Keyframes",
+            Self::SetTransition { .. } => "Transition",
+            Self::SetSpeed { .. } => "Speed",
             Self::SetMagnetic { magnetic: true, .. } => "Magnetic track",
             Self::SetMagnetic { magnetic: false, .. } => "Free track",
             Self::Compound { .. } => "Compound clip",
@@ -142,6 +173,16 @@ impl NewClip {
             source_start: 0,
             duration,
         })
+    }
+
+    /// A text clip `duration` timeline frames long, on a timeline running at `timeline_rate`.
+    pub fn title(title: Title, duration: i64, timeline_rate: Rate) -> Self {
+        Self {
+            name: title.label(),
+            media: Arc::new(Media::from_title(title, timeline_rate)),
+            source_start: 0,
+            duration: duration.max(1),
+        }
     }
 }
 
@@ -241,6 +282,10 @@ impl Timeline {
                     duration: clip.duration,
                     enabled: true,
                     volume: 1.0,
+                    transform: Transform::IDENTITY,
+                    keyframes: Vec::new(),
+                    transition_in: None,
+                    speed: 1.0,
                     extras: Extras::default(),
                 };
                 let id = clip.id;
@@ -324,6 +369,76 @@ impl Timeline {
                 Arc::make_mut(track).muted = *muted;
                 Ok(None)
             }
+            Edit::SetTransform { clip, transform } => {
+                if !transform.is_valid() {
+                    return Err(EditError::OutOfBounds);
+                }
+                let (track, index) = self.locate(*clip)?;
+                if let Item::Clip(clip) = &mut Arc::make_mut(&mut self.tracks[track]).items[index] {
+                    clip.transform = *transform;
+                }
+                Ok(None)
+            }
+            Edit::SetSpeed { clip, speed } => {
+                if !SPEEDS.contains(speed) {
+                    return Err(EditError::OutOfBounds);
+                }
+                let (track, index) = self.locate(*clip)?;
+                let magnetic = self.tracks[track].magnetic;
+                let rate = self.rate;
+                let id = *clip;
+                let Item::Clip(clip) = &mut Arc::make_mut(&mut self.tracks[track]).items[index]
+                else {
+                    return Err(EditError::NoSuchClip(id));
+                };
+                // The same stretch of media, played at the new speed, as far as the media goes.
+                let wanted = (clip.duration as f64 * clip.speed / speed).round().max(1.0) as i64;
+                let length = clip
+                    .longest_at(*speed, rate)
+                    .map_or(wanted, |longest| wanted.min(longest));
+                let change = length - clip.duration;
+                clip.speed = *speed;
+                if let Some(way) = &mut clip.transition_in {
+                    way.duration = way.duration.min(length);
+                }
+                let allowed = self
+                    .trim_range(id, Edge::End, magnetic)
+                    .ok_or(EditError::NoSuchClip(id))?;
+                if !allowed.contains(&change) {
+                    let next = self.tracks[track].items[index + 1..]
+                        .iter()
+                        .find_map(|item| match item {
+                            Item::Clip(clip) => Some(clip.id),
+                            Item::Gap(_) => None,
+                        });
+                    return Err(next.map_or(EditError::OutOfBounds, EditError::InTheWay));
+                }
+                Arc::make_mut(&mut self.tracks[track]).trim(index, Edge::End, change, magnetic);
+                Ok(None)
+            }
+            Edit::SetTransition { clip, transition } => {
+                let (track, index) = self.locate(*clip)?;
+                if let Item::Clip(clip) = &mut Arc::make_mut(&mut self.tracks[track]).items[index] {
+                    let most = clip.duration;
+                    if transition.is_some_and(|way| way.duration < 1 || way.duration > most) {
+                        return Err(EditError::OutOfBounds);
+                    }
+                    clip.transition_in = *transition;
+                }
+                Ok(None)
+            }
+            Edit::SetKeyframes { clip, keyframes } => {
+                let in_order = keyframes.windows(2).all(|pair| pair[0].at < pair[1].at);
+                let valid = keyframes.iter().all(|keyframe| keyframe.transform.is_valid());
+                if !in_order || !valid {
+                    return Err(EditError::OutOfBounds);
+                }
+                let (track, index) = self.locate(*clip)?;
+                if let Item::Clip(clip) = &mut Arc::make_mut(&mut self.tracks[track]).items[index] {
+                    clip.keyframes = keyframes.clone();
+                }
+                Ok(None)
+            }
             Edit::SetMagnetic { track, magnetic } => {
                 let track = self
                     .tracks
@@ -353,6 +468,10 @@ impl Timeline {
                     duration,
                     enabled: true,
                     volume: 1.0,
+                    transform: Transform::IDENTITY,
+                    keyframes: Vec::new(),
+                    transition_in: None,
+                    speed: 1.0,
                     extras: Extras::default(),
                 };
                 let id = clip.id;
@@ -462,7 +581,8 @@ impl Timeline {
         let shorter = clip.duration - 1;
         Some(match edge {
             Edge::Start => {
-                let media = clip.source_start.max(0);
+                // Each frame earlier takes `speed` frames of the media.
+                let media = (clip.source_start.max(0) as f64 / clip.speed).floor() as i64;
                 let before = match index.checked_sub(1) {
                     // The first item starts on frame zero.
                     None => 0,
@@ -540,7 +660,7 @@ impl Track {
         };
         match edge {
             Edge::Start => {
-                clip.source_start += frames;
+                clip.source_start = clip.source_at(frames);
                 clip.duration -= frames;
                 // Without ripple the clip's end stays where it is, so the space before it makes
                 // up the difference.
@@ -598,6 +718,17 @@ impl History {
         if self.undo.len() > MAX_UNDO_STEPS {
             self.undo.remove(0);
         }
+        self.redo.clear();
+        Ok(created)
+    }
+
+    /// Makes an edit that carries on the last one, such as one more letter typed: undoing
+    /// takes both back at once. Without a last edit it is one of its own.
+    pub fn apply_onto_last(&mut self, edit: &Edit) -> Result<Option<ClipId>, EditError> {
+        if self.undo.is_empty() {
+            return self.apply(edit);
+        }
+        let created = self.timeline.apply(edit)?;
         self.redo.clear();
         Ok(created)
     }

@@ -2,8 +2,10 @@
 //! on a thread of its own, at the size and quality asked for.
 
 mod choices;
+mod title;
 
 pub use choices::{Options, Quality, Resolution};
+pub use title::{TitlePicture, draw_title, font_file};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,16 +15,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cannotcut_audio::{Mixer, frame_to_sample};
-use cannotcut_media::{CHANNELS, ClipReader, FilmFormat, FilmWriter, picture_size};
-use cannotcut_timeline::{ClipId, Shot, Timeline};
+use cannotcut_media::{CHANNELS, ClipReader, FilmFormat, FilmPicture, FilmWriter, picture_size};
+use cannotcut_timeline::{ClipId, Shot, Timeline, Title};
 
 const SAMPLE_RATE: u32 = 48_000;
 /// Sound is mixed this many samples at a time.
 const CHUNK: usize = 1024;
 /// How often progress is reported.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
-/// Clips whose readers are kept open, for timelines that go back and forth between them.
+/// Clips whose readers are kept open, for timelines that go back and forth between them; and
+/// as many more as there are layers at a frame.
 const OPEN_READERS: usize = 3;
+/// Titles kept drawn, for timelines that go back and forth between them.
+const DRAWN_TITLES: usize = 8;
 
 /// What an export reports while it runs.
 #[derive(Clone, Debug)]
@@ -159,39 +164,89 @@ fn make(
     let rate = timeline.rate();
     let mut mixer = Mixer::new(timeline.clone(), 0, SAMPLE_RATE, folder.map(Path::to_path_buf));
     let mut sound = vec![0.0; CHUNK * CHANNELS];
-    // By the clips a picture is seen through: each clip reads its media from front to back.
+    // By the clips a picture is seen through, the one used last at the end: each clip reads
+    // its media from front to back.
     let mut readers: Vec<(Vec<ClipId>, ClipReader)> = Vec::new();
+    // Where a layer is drawn before it is laid over the film's picture.
+    let mut spare = writer.spare_picture();
+    let film_size = (film.width, film.height);
+    // Text clips' words, drawn once each; the one used last at the end.
+    let mut titles: Vec<(Title, FilmPicture)> = Vec::new();
     let mut reported = Instant::now();
 
     for index in 0..total {
         if cancelled.load(Ordering::Relaxed) {
             return Err("cancelled".to_string());
         }
-        let picture = writer.picture();
-        match timeline.shot_at(index) {
-            Some(shot) => {
-                let clip = shot.clip;
-                let place = match readers.iter().position(|(key, _)| *key == shot.key) {
-                    Some(place) => place,
-                    None => {
-                        let reader = ClipReader::open(&locate(&shot)?, true)
-                            .map_err(|error| format!("{}: {error}", clip.name))?;
-                        readers.push((shot.key.clone(), reader));
-                        if readers.len() > OPEN_READERS {
-                            readers.remove(0);
-                        }
-                        readers.len() - 1
+        let shots = timeline.shots_at(index);
+        // A single picture as it comes is drawn straight into the film's, as before layers.
+        let plain = shots.len() == 1
+            && shots[0].clip.media.title.is_none()
+            && shots[0].framing.is_identity()
+            && shots[0].reveal.is_full();
+        let open = OPEN_READERS.max(shots.len());
+        if !plain {
+            // Where nothing plays the film is black, and layers go over black.
+            writer.picture().clear();
+        }
+        for shot in &shots {
+            let clip = shot.clip;
+            if let Some(title) = &clip.media.title {
+                match titles.iter().position(|(drawn, _)| drawn == title) {
+                    Some(place) => {
+                        let used = titles.remove(place);
+                        titles.push(used);
                     }
-                };
-                let frame = shot.media_frame.max(0) as u64;
-                let reader = &mut readers[place].1;
-                // Past the end of its media a clip shows its last picture, which stays drawn.
-                reader
-                    .draw(frame, picture)
-                    .map_err(|error| format!("{}: {error}", clip.name))?;
+                    None => {
+                        let drawn = draw_title(title, film_size);
+                        let mut picture = writer.spare_picture();
+                        picture.fill(&drawn.luma, &drawn.chroma, drawn.alpha);
+                        titles.push((title.clone(), picture));
+                        if titles.len() > DRAWN_TITLES {
+                            titles.remove(0);
+                        }
+                    }
+                }
+                let (_, picture) = titles.last().expect("just drawn or put back");
+                let area = [0, 0, film.width & !1, film.height & !1];
+                let corners = shot.framing.corners(film_size, (area[2], area[3])).0;
+                let opacity = shot.framing.opacity() * shot.reveal.fade;
+                let wipe = shot.reveal.wipe.map(|wipe| (wipe.direction, wipe.threshold));
+                writer.picture().lay_over(picture, area, corners, opacity, wipe);
+                continue;
             }
-            // Where nothing plays the film is black.
-            None => picture.clear(),
+            let reader = match readers.iter().position(|(key, _)| *key == shot.key) {
+                Some(place) => {
+                    let used = readers.remove(place);
+                    readers.push(used);
+                    &mut readers.last_mut().expect("just put back").1
+                }
+                None => {
+                    let reader = ClipReader::open(&locate(shot)?, true)
+                        .map_err(|error| format!("{}: {error}", clip.name))?;
+                    readers.push((shot.key.clone(), reader));
+                    while readers.len() > open {
+                        readers.remove(0);
+                    }
+                    &mut readers.last_mut().expect("just opened").1
+                }
+            };
+            let frame = shot.media_frame.max(0) as u64;
+            let drawn_into = if plain {
+                writer.picture()
+            } else {
+                &mut spare
+            };
+            // Past the end of its media a clip shows its last picture, which stays drawn.
+            reader
+                .draw(frame, drawn_into)
+                .map_err(|error| format!("{}: {error}", clip.name))?;
+            if !plain && let Some(area) = reader.drawn_area() {
+                let corners = shot.framing.corners(film_size, (area[2], area[3])).0;
+                let opacity = shot.framing.opacity() * shot.reveal.fade;
+                let wipe = shot.reveal.wipe.map(|wipe| (wipe.direction, wipe.threshold));
+                writer.picture().lay_over(&spare, area, corners, opacity, wipe);
+            }
         }
         writer.write_picture(index).map_err(|error| error.to_string())?;
 
