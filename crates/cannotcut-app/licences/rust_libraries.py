@@ -5,8 +5,12 @@ Run from anywhere after the dependencies change (it reads `cargo metadata` and t
 cargo has downloaded):
 
     python crates/cannotcut-app/licences/rust_libraries.py
+
+With --check it writes nothing, and fails if rust-libraries.txt is not what it would write,
+which is how CI catches a dependency added without running it again.
 """
 
+import difflib
 import json
 import os
 import re
@@ -36,7 +40,9 @@ STANDARD = {
 
 def metadata():
     command = ["cargo", "metadata", "--format-version", "1", "--filter-platform", TARGET]
-    return json.loads(subprocess.run(command, capture_output=True, check=True).stdout)
+    # From here, so that cargo finds the workspace wherever it is run from.
+    result = subprocess.run(command, capture_output=True, check=True, cwd=HERE)
+    return json.loads(result.stdout)
 
 
 def reachable(meta, name):
@@ -60,7 +66,8 @@ def read(path):
         return file.read()
 
 
-def main():
+def generate():
+    """The text of rust-libraries.txt, how many libraries it lists, and which full texts."""
     meta = metadata()
     packages = {p["id"]: p for p in meta["packages"]}
     libraries = sorted(
@@ -96,9 +103,27 @@ def main():
     for kind in STANDARD:
         if kind in standard_texts:
             lines += ["", "", "=" * 72, kind, "=" * 72, "", standard_texts[kind]]
+    return "\n".join(lines) + "\n", len(libraries), list(standard_texts)
+
+
+def main():
+    text, count, texts = generate()
+    if "--check" in sys.argv[1:]:
+        # Read with universal newlines, as a Windows checkout may have made the file CRLF.
+        current = read(OUT) if os.path.exists(OUT) else ""
+        if current == text:
+            print(f"{OUT} is up to date: {count} libraries")
+            return 0
+        diff = difflib.unified_diff(
+            current.splitlines(), text.splitlines(), "committed", "expected", lineterm="", n=1
+        )
+        print(f"{OUT} is out of date with Cargo.lock. Run this script again and commit the result:")
+        print("\n".join(list(diff)[:60]))
+        return 1
     with open(OUT, "w", encoding="utf-8", newline="\n") as file:
-        file.write("\n".join(lines) + "\n")
-    print(f"wrote {OUT}: {len(libraries)} libraries, texts: {', '.join(standard_texts)}")
+        file.write(text)
+    print(f"wrote {OUT}: {count} libraries, texts: {', '.join(texts)}")
+    return 0
 
 
 if __name__ == "__main__":

@@ -1,0 +1,86 @@
+# Builds cannotcut on a clean Windows machine for every push and pull request: checks that the
+# Rust licence list matches Cargo.lock, runs the tests, and packages the app with package.ps1.
+# The packaged folder is kept as a download on the run's page (Artifacts) for 30 days.
+
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The FFmpeg the app ships with: LGPL 3.0 and shared, so its DLLs sit beside the program.
+  # When this build is dropped from "latest", move it to the next release branch.
+  FFMPEG_REPO: FFmpeg-Builds/FFmpeg-Builds
+  FFMPEG_ASSET: ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip
+  # The runner image has LLVM installed; ffmpeg-sys-next's bindgen needs its libclang.
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc -V
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: FFmpeg
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          gh release download latest --repo $env:FFMPEG_REPO --pattern $env:FFMPEG_ASSET --dir $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw "could not download $env:FFMPEG_ASSET" }
+          $release = gh api "repos/$env:FFMPEG_REPO/releases/tags/latest" | ConvertFrom-Json
+          $expected = ($release.assets | Where-Object name -eq $env:FFMPEG_ASSET).digest
+          $zip = Join-Path $env:RUNNER_TEMP $env:FFMPEG_ASSET
+          $actual = "sha256:" + (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "$env:FFMPEG_ASSET is $actual, but the release says $expected" }
+          $unpacked = Join-Path $env:RUNNER_TEMP "ffmpeg"
+          Expand-Archive $zip -DestinationPath $unpacked
+          $dir = (Get-ChildItem $unpacked -Directory | Select-Object -First 1).FullName
+          if (-not (Select-String -Path (Join-Path $dir "LICENSE.txt") -Pattern "LESSER GENERAL PUBLIC" -Quiet)) {
+            throw "$env:FFMPEG_ASSET is not an LGPL build"
+          }
+          if (-not (Test-Path (Join-Path $env:LIBCLANG_PATH "libclang.dll"))) { throw "no libclang.dll in $env:LIBCLANG_PATH" }
+          "FFMPEG_DIR=$dir" >> $env:GITHUB_ENV
+          (Join-Path $dir "bin") >> $env:GITHUB_PATH
+          "Using $env:FFMPEG_ASSET ($actual)"
+
+      - name: Fetch crates
+        run: cargo fetch --locked
+
+      - name: Rust licence list matches Cargo.lock
+        run: python crates/cannotcut-app/licences/rust_libraries.py --check
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Package
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File package.ps1
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cannotcut-windows-${{ github.sha }}
+          path: target/dist/cannotcut-*-windows/
+          if-no-files-found: error
+          retention-days: 30
