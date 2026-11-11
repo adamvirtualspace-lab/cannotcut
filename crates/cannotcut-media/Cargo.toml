@@ -2,6 +2,7 @@
 name = "cannotcut-media"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 ffmpeg-next.workspace = true
