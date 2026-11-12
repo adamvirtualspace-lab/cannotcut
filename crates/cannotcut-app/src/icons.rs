@@ -75,6 +75,9 @@ icons! {
     Text = "typography",
     Transitions = "transition-right",
     Undo = "arrow-back-up",
+    WindowClose = "window-close",
+    WindowMaximize = "window-maximize",
+    WindowMinimize = "window-minimize",
 }
 
 /// `icon` in `color`, `size` logical pixels square.

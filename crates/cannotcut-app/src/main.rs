@@ -207,6 +207,20 @@ fn main_window_settings() -> window::Settings {
         min_size: Some(Size::new(640.0, 480.0)),
         // Closing asks first while there are unsaved changes.
         exit_on_close_request: false,
+        ..own_title_bar()
+    }
+}
+
+/// A window with no title bar from the system: the app draws its own, in its own colours, with
+/// the buttons to minimise, maximise and close it. It keeps the system's shadow round it.
+fn own_title_bar() -> window::Settings {
+    window::Settings {
+        decorations: false,
+        #[cfg(windows)]
+        platform_specific: window::settings::PlatformSpecific {
+            undecorated_shadow: true,
+            ..Default::default()
+        },
         ..window::Settings::default()
     }
 }
@@ -218,7 +232,7 @@ fn panel_window_settings() -> window::Settings {
         min_size: Some(PANEL_WINDOW_LEAST),
         // Closing puts the panel back.
         exit_on_close_request: false,
-        ..window::Settings::default()
+        ..own_title_bar()
     }
 }
 
@@ -236,6 +250,25 @@ struct PanelMotion {
     progress: motion::Tween,
 }
 
+/// Where a panel window being moved by its title bar would go if let go now.
+#[derive(Clone, Copy, Debug)]
+enum DropTarget {
+    /// Beside a docked panel of the main window, on this side of it.
+    Pane(pane_grid::Pane, pane_grid::Edge),
+    /// The main window, too narrow to dock in: back where it came from.
+    Main,
+    /// Into another panel's own window, as a tab.
+    Window(window::Id),
+}
+
+/// A panel window being moved by its title bar.
+#[derive(Clone, Copy, Debug)]
+struct MovingAway {
+    window: window::Id,
+    /// Where on the window it was taken hold of, from its corner.
+    grab: iced::Point,
+}
+
 /// What is open over the window, to tell when something new opens and should ease in.
 #[derive(Clone, Copy, PartialEq)]
 struct Overlays {
@@ -248,9 +281,13 @@ struct Overlays {
 /// A panel in a window of its own.
 struct Away {
     window: window::Id,
+    /// The panel shown.
     part: Part,
     /// Where it goes back to in the main window.
     back: dock::Back,
+    /// Other panels dropped into this window, shown as tabs beside it, and where each goes back
+    /// to.
+    tabs: Vec<(Part, dock::Back)>,
     full_screen: bool,
     /// Where its window is on the screens, as last seen.
     placement: Option<placement::Placement>,
@@ -437,6 +474,29 @@ enum Message {
     MotionFrame,
     /// Whether things move, chosen under Appearance.
     MotionChosen(bool),
+    /// A window's own title bar taken hold of, to move the window.
+    WindowDragged(window::Id),
+    /// The pointer over a window's title bar, from the window's corner.
+    BarPointer(window::Id, iced::Point),
+    /// A window's title bar pressed: it moves the window once the pointer moves, so that a
+    /// click or a double-click on it stays one.
+    BarPressed(window::Id),
+    BarReleased,
+    /// Where a window is on the screens, and how big, as reported.
+    WindowAt(window::Id, Option<iced::Point>),
+    WindowSizeIs(window::Id, Size),
+    /// The mouse button let go in a window: a panel window that was being moved is dropped.
+    PointerReleased(window::Id),
+    /// One of the panels in a panel window, shown.
+    AwayTabChosen(window::Id, usize),
+    /// A docked panel dragged out of the main window and let go there, at this place on the
+    /// screens (none if it was let go inside).
+    TornOff(Part, Option<iced::Point>),
+    /// A window's edge or corner taken hold of, to size the window.
+    WindowEdgeDragged(window::Id, window::Direction),
+    WindowMinimized(window::Id),
+    /// Maximized, or back from it.
+    WindowMaximized(window::Id),
     /// A side panel's key pressed: hidden or shown in a wide window, slid out in a narrow one.
     SideKey(Side),
     /// The main window's size, asked for when a side panel's key was pressed.
@@ -468,6 +528,9 @@ enum Message {
     FullScreenToggled(window::Id),
     /// A window moved or changed size.
     WindowMoved(window::Id),
+    /// A window moved to here on the screens, or changed to this size.
+    WindowMovedTo(window::Id, iced::Point),
+    WindowResizedTo(window::Id, Size),
     /// Where a panel's own window is now.
     PlacementRead(window::Id, Option<placement::Placement>),
     Key(keyboard::Event),
@@ -863,6 +926,19 @@ struct App {
     /// Side panels hidden from the dock by their buttons in the top bar, and where each goes
     /// back to; in the order they were hidden.
     hidden: Vec<(Side, dock::Back)>,
+    /// Where each window is on the screens and how big, as last heard, in the units of its
+    /// own drawing.
+    window_at: HashMap<window::Id, iced::Point>,
+    window_size: HashMap<window::Id, Size>,
+    /// The pointer over each window's title bar, as last seen.
+    bar_pointer: HashMap<window::Id, iced::Point>,
+    /// A window's title bar pressed, until the pointer moves (which moves the window) or the
+    /// button is let go.
+    bar_pressed: Option<window::Id>,
+    /// A panel window being moved by its title bar, and where it would go if let go now.
+    moving_away: Option<MovingAway>,
+    drop_target: Option<DropTarget>,
+
     /// A docked side panel closing or opening, while it does.
     panel_motion: Option<PanelMotion>,
     /// The side panel shown over the viewer in a narrow window, also while it slides back, and
@@ -1077,6 +1153,12 @@ impl App {
             main_window: window::Id::unique(),
             away: Vec::new(),
             hidden: Vec::new(),
+            window_at: HashMap::new(),
+            window_size: HashMap::new(),
+            bar_pointer: HashMap::new(),
+            bar_pressed: None,
+            moving_away: None,
+            drop_target: None,
             panel_motion: None,
             drawer_shown: None,
             drawer_out: motion::Tween::at(0.0),
@@ -2200,6 +2282,68 @@ impl App {
                     self.menu_shown = None;
                 }
             }
+            Message::WindowDragged(window) => {
+                if !self.away.iter().any(|away| away.window == window) {
+                    return window::drag(window);
+                }
+                // A panel's window: it can be dropped on another window, to dock there.
+                let grab = self.bar_pointer.get(&window).copied().unwrap_or_default();
+                self.moving_away = Some(MovingAway { window, grab });
+                self.drop_target = None;
+                let mut tasks = vec![window::drag(window)];
+                let others = std::iter::once(self.main_window)
+                    .chain(self.away.iter().map(|away| away.window));
+                for other in others {
+                    tasks.push(window::position(other).map(move |at| Message::WindowAt(other, at)));
+                    tasks.push(window::size(other).map(move |size| Message::WindowSizeIs(other, size)));
+                }
+                return Task::batch(tasks);
+            }
+            Message::BarPointer(window, at) => {
+                self.bar_pointer.insert(window, at);
+                if self.bar_pressed.take_if(|pressed| *pressed == window).is_some() {
+                    return self.update(Message::WindowDragged(window));
+                }
+            }
+            Message::BarPressed(window) => self.bar_pressed = Some(window),
+            Message::BarReleased => self.bar_pressed = None,
+            Message::WindowAt(window, at) => {
+                // Asked for, it comes without the UI's own scale; reported as it moves, with.
+                if let Some(at) = at {
+                    let scale = theme::ui_scale();
+                    self.window_at.insert(window, iced::Point::new(at.x / scale, at.y / scale));
+                }
+            }
+            Message::WindowSizeIs(window, size) => {
+                self.window_size.insert(window, size);
+            }
+            Message::PointerReleased(window) => {
+                if self.moving_away.is_some_and(|moving| moving.window == window) {
+                    self.moving_away = None;
+                    return match self.drop_target.take() {
+                        Some(target) => self.drop_away(window, target),
+                        None => Task::none(),
+                    };
+                }
+            }
+            Message::AwayTabChosen(window, index) => {
+                if let Some(away) = self.away.iter_mut().find(|away| away.window == window)
+                    && let Some((part, back)) = away.tabs.get_mut(index)
+                {
+                    std::mem::swap(&mut away.part, part);
+                    std::mem::swap(&mut away.back, back);
+                    self.scale_factor = None;
+                    self.keep_layout();
+                }
+            }
+            Message::TornOff(part, at) => {
+                if let Some(at) = at {
+                    return self.pop_out(part, Some(at));
+                }
+            }
+            Message::WindowEdgeDragged(window, edge) => return window::drag_resize(window, edge),
+            Message::WindowMinimized(window) => return window::minimize(window, true),
+            Message::WindowMaximized(window) => return window::toggle_maximize(window),
             Message::MotionChosen(on) => {
                 self.set_look(theme::Look {
                     motion: on,
@@ -2248,12 +2392,19 @@ impl App {
                 self.keep_layout();
             }
             Message::DividerHovered(divider) => self.divider_hover = divider,
+            Message::PaneDragged(pane_grid::DragEvent::Picked { .. }) => {}
+            Message::PaneDragged(pane_grid::DragEvent::Canceled { pane }) => {
+                // Let go outside the main window: torn off into a window of its own, there.
+                if let Some(part) = self.dock.get(pane).copied() {
+                    return placement::pointer_outside(self.main_window)
+                        .map(move |at| Message::TornOff(part, at));
+                }
+            }
             Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
                 self.finish_panel_motion();
                 self.dock.drop(pane, target);
                 self.keep_layout();
             }
-            Message::PaneDragged(_) => {}
             Message::PaneResized(resized) => {
                 self.dock.resize(resized.split, resized.ratio);
                 self.dock_resizing = true;
@@ -2274,29 +2425,7 @@ impl App {
                 self.keep_layout();
                 return Task::batch(closing);
             }
-            Message::PopOut(part) => {
-                self.finish_panel_motion();
-                if self.is_away(part) {
-                    return Task::none();
-                }
-                // Not the last panel: the main window keeps one.
-                let Some(back) = dock::take_out(&mut self.dock, part) else {
-                    return Task::none();
-                };
-                let (window, opened) = window::open(panel_window_settings());
-                self.away.push(Away {
-                    window,
-                    part,
-                    back,
-                    full_screen: false,
-                    placement: None,
-                });
-                if part == Part::Viewer {
-                    self.scale_factor = None;
-                }
-                self.keep_layout();
-                return opened.then(title_bar::dress);
-            }
+            Message::PopOut(part) => return self.pop_out(part, None),
             Message::PutBack(window) => return self.put_back(window),
             Message::FullScreenToggled(window) => {
                 if let Some(away) = self.away.iter_mut().find(|away| away.window == window) {
@@ -2962,6 +3091,17 @@ impl App {
                 }
             }
             Message::Key(_) => {}
+            Message::WindowMovedTo(window, at) => {
+                self.window_at.insert(window, at);
+                if self.moving_away.is_some_and(|moving| moving.window == window) {
+                    self.drop_target = self.drop_target_at(window, at);
+                }
+                return self.update(Message::WindowMoved(window));
+            }
+            Message::WindowResizedTo(window, size) => {
+                self.window_size.insert(window, size);
+                return self.update(Message::WindowMoved(window));
+            }
             Message::WindowMoved(window) => {
                 // Over the whole screen it is where it was before; that is what is kept.
                 let moving = self
@@ -3822,8 +3962,11 @@ impl App {
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
                     Some(Message::Rescaled(window, scale_factor))
                 }
-                iced::Event::Window(window::Event::Moved(_) | window::Event::Resized(_)) => {
-                    Some(Message::WindowMoved(window))
+                iced::Event::Window(window::Event::Moved(at)) => {
+                    Some(Message::WindowMovedTo(window, at))
+                }
+                iced::Event::Window(window::Event::Resized(size)) => {
+                    Some(Message::WindowResizedTo(window, size))
                 }
                 _ => None,
             }),
@@ -3831,6 +3974,16 @@ impl App {
         if self.resized_at.is_some() {
             subscriptions.push(time::every(RESIZE_POLL).map(|_| Message::ResizeTick));
         }
+        if self.moving_away.is_some() {
+            // Windows posts the button's release when it is done moving the window.
+            subscriptions.push(iced::event::listen_with(|event, _status, window| match event {
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                    Some(Message::PointerReleased(window))
+                }
+                _ => None,
+            }));
+        }
+
         if self.moving(Instant::now()) {
             // One for every frame the display shows, while something moves.
             subscriptions.push(window::frames().map(|_| Message::MotionFrame));
@@ -4030,7 +4183,128 @@ impl App {
 
     /// Whether `part` is in a window of its own.
     fn is_away(&self, part: Part) -> bool {
-        self.away.iter().any(|away| away.part == part)
+        self.away
+            .iter()
+            .any(|away| away.part == part || away.tabs.iter().any(|(tab, _)| *tab == part))
+    }
+
+    /// Takes `part` out of the dock into a window of its own, at `at` on the screens if given
+    /// (as windows are placed: screen pixels over the screen's scaling).
+    fn pop_out(&mut self, part: Part, at: Option<iced::Point>) -> Task<Message> {
+        self.finish_panel_motion();
+        if self.is_away(part) {
+            return Task::none();
+        }
+        // Not the last panel: the main window keeps one.
+        let Some(back) = dock::take_out(&mut self.dock, part) else {
+            return Task::none();
+        };
+        let mut settings = panel_window_settings();
+        if let Some(at) = at {
+            // Its title bar under the pointer, as it was let go.
+            let scale = theme::ui_scale();
+            settings.position = window::Position::Specific(iced::Point::new(
+                at.x - 60.0 * scale,
+                at.y - 16.0 * scale,
+            ));
+        }
+        let (window, opened) = window::open(settings);
+        self.away.push(Away {
+            window,
+            part,
+            back,
+            tabs: Vec::new(),
+            full_screen: false,
+            placement: None,
+        });
+        if part == Part::Viewer {
+            self.scale_factor = None;
+        }
+        self.keep_layout();
+        opened.then(title_bar::dress)
+    }
+
+    /// Where the panel window `moving`, whose corner is at `at`, would go if let go now: by
+    /// where its title bar was taken hold of, which is under the pointer.
+    fn drop_target_at(&self, moving: window::Id, at: iced::Point) -> Option<DropTarget> {
+        let grab = self.moving_away?.grab;
+        let pointer = iced::Point::new(at.x + grab.x, at.y + grab.y);
+        let inside = |window: window::Id| -> Option<iced::Point> {
+            let corner = self.window_at.get(&window)?;
+            let size = self.window_size.get(&window)?;
+            let local = iced::Point::new(pointer.x - corner.x, pointer.y - corner.y);
+            let over = local.x >= 0.0
+                && local.y >= 0.0
+                && local.x <= size.width
+                && local.y <= size.height;
+            over.then_some(local)
+        };
+        // Other panel windows first: they are usually in front of the main one.
+        for away in &self.away {
+            if away.window != moving && !away.full_screen && inside(away.window).is_some() {
+                return Some(DropTarget::Window(away.window));
+            }
+        }
+        let local = inside(self.main_window)?;
+        let size = self.window_size.get(&self.main_window)?;
+        match self.dock_region_at(*size, local) {
+            Some((pane, edge)) => Some(DropTarget::Pane(pane, edge)),
+            None if size.width < panels::DOCKED_WIDTH => Some(DropTarget::Main),
+            None => None,
+        }
+    }
+
+    /// Drops the panel window `window` on `target`: docked there, back in the main window, or
+    /// into another panel's window as a tab.
+    fn drop_away(&mut self, window: window::Id, target: DropTarget) -> Task<Message> {
+        match target {
+            DropTarget::Main => self.put_back(window),
+            DropTarget::Pane(mut pane, edge) => {
+                if self.dock.get(pane).is_none() {
+                    return Task::none();
+                }
+                let Some(index) = self.away.iter().position(|away| away.window == window) else {
+                    return Task::none();
+                };
+                let away = self.away.remove(index);
+                let axis = match edge {
+                    pane_grid::Edge::Left | pane_grid::Edge::Right => pane_grid::Axis::Vertical,
+                    pane_grid::Edge::Top | pane_grid::Edge::Bottom => pane_grid::Axis::Horizontal,
+                };
+                let parts = std::iter::once(away.part).chain(away.tabs.iter().map(|(part, _)| *part));
+                for part in parts {
+                    if let Some((new, _)) = self.dock.split(axis, pane, part) {
+                        // A split puts the new panel after; before is the left or the top.
+                        if matches!(edge, pane_grid::Edge::Left | pane_grid::Edge::Top) {
+                            self.dock.swap(new, pane);
+                        }
+                        pane = new;
+                    }
+                }
+                self.scale_factor = None;
+                self.keep_layout();
+                window::close(window)
+            }
+            DropTarget::Window(other) => {
+                let Some(index) = self.away.iter().position(|away| away.window == window) else {
+                    return Task::none();
+                };
+                if !self.away.iter().any(|away| away.window == other) {
+                    return Task::none();
+                }
+                let moved = self.away.remove(index);
+                if let Some(into) = self.away.iter_mut().find(|away| away.window == other) {
+                    // Shown there, with what was shown and the rest as tabs.
+                    let shown = std::mem::replace(&mut into.part, moved.part);
+                    let back = std::mem::replace(&mut into.back, moved.back);
+                    into.tabs.push((shown, back));
+                    into.tabs.extend(moved.tabs);
+                }
+                self.scale_factor = None;
+                self.keep_layout();
+                window::close(window)
+            }
+        }
     }
 
     /// The window the viewer is in.
@@ -4071,10 +4345,25 @@ impl App {
                 visible: false,
                 ..panel_window_settings()
             });
+            // Panels that were tabs in it.
+            let mut tabs = Vec::new();
+            let kept_tabs = entry.get("tabs").and_then(|tabs| tabs.as_array());
+            for tab in kept_tabs.into_iter().flatten() {
+                let Some(tab) = tab.as_str().and_then(Part::from_key) else {
+                    continue;
+                };
+                if tab == Part::Timeline || tab == part || self.is_away(tab) {
+                    continue;
+                }
+                if let Some(back) = dock::take_out(&mut self.dock, tab) {
+                    tabs.push((tab, back));
+                }
+            }
             self.away.push(Away {
                 window,
                 part,
                 back,
+                tabs,
                 full_screen,
                 placement,
             });
@@ -4101,6 +4390,17 @@ impl App {
         let Some(index) = self.away.iter().position(|away| away.window == window) else {
             return Task::none();
         };
+        let away = &mut self.away[index];
+        // With other panels in it as tabs, only the one shown goes back, and the next shows.
+        if !away.tabs.is_empty() {
+            let (part, back) = away.tabs.remove(0);
+            let shown = std::mem::replace(&mut away.part, part);
+            let back = std::mem::replace(&mut away.back, back);
+            dock::put_back(&mut self.dock, shown, &back);
+            self.scale_factor = None;
+            self.keep_layout();
+            return Task::none();
+        }
         let away = self.away.remove(index);
         dock::put_back(&mut self.dock, away.part, &away.back);
         if away.part == Part::Viewer {
@@ -4120,7 +4420,10 @@ impl App {
             dock: Some(dock::to_value(
                 &self.dock,
                 (self.hidden.iter().rev().map(|(side, back)| (side.part(), back)))
-                    .chain(self.away.iter().rev().map(|away| (away.part, &away.back))),
+                    .chain(self.away.iter().rev().flat_map(|away| {
+                        let tabs = away.tabs.iter().rev().map(|(part, back)| (*part, back));
+                        tabs.chain(std::iter::once((away.part, &away.back)))
+                    })),
             )),
             away: Some(serde_json::Value::Array(
                 self.away
@@ -4128,6 +4431,7 @@ impl App {
                     .map(|away| {
                         serde_json::json!({
                             "part": away.part.key(),
+                            "tabs": away.tabs.iter().map(|(part, _)| part.key()).collect::<Vec<_>>(),
                             "placement": away.placement.map(|placement| placement.value()),
                             "full_screen": away.full_screen,
                         })

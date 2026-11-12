@@ -61,6 +61,20 @@ pub fn apply<Message: Send + 'static>(id: window::Id, placement: Placement) -> T
     }
 }
 
+/// Where the pointer is, if it is outside the window `id`: on the screens, in the units windows
+/// are placed in (screen pixels over the screen's scaling).
+pub fn pointer_outside(id: window::Id) -> Task<Option<iced::Point>> {
+    #[cfg(windows)]
+    {
+        window::run(id, windows::pointer_outside)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = id;
+        Task::done(None)
+    }
+}
+
 #[cfg(windows)]
 mod windows {
     use raw_window_handle::RawWindowHandle;
@@ -104,6 +118,30 @@ mod windows {
         fn GetWindowPlacement(window: isize, placement: *mut WindowPlacement) -> i32;
         fn SetWindowPlacement(window: isize, placement: *const WindowPlacement) -> i32;
         fn MonitorFromRect(rect: *const Rect, flags: u32) -> isize;
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn GetWindowRect(window: isize, rect: *mut Rect) -> i32;
+        fn GetDpiForWindow(window: isize) -> u32;
+    }
+
+    pub fn pointer_outside(window: &dyn iced::window::Window) -> Option<iced::Point> {
+        let window = handle(window)?;
+        let mut pointer = Point::default();
+        let mut rect = Rect::default();
+        // SAFETY: plain structs filled in by Windows; the window is the app's own and open.
+        let (got_pointer, got_rect, dpi) = unsafe {
+            (
+                GetCursorPos(&raw mut pointer),
+                GetWindowRect(window, &raw mut rect),
+                GetDpiForWindow(window),
+            )
+        };
+        if got_pointer == 0 || got_rect == 0 {
+            return None;
+        }
+        let inside = (rect.left..rect.right).contains(&pointer.x)
+            && (rect.top..rect.bottom).contains(&pointer.y);
+        let scale = f32::from(u16::try_from(dpi.max(1)).unwrap_or(96)) / 96.0;
+        (!inside).then(|| iced::Point::new(pointer.x as f32 / scale, pointer.y as f32 / scale))
     }
 
     fn handle(window: &dyn iced::window::Window) -> Option<isize> {

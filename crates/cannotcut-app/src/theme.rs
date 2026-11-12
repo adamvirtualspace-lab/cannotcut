@@ -468,6 +468,20 @@ pub fn quiet(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// Closing a window, on its title bar: quiet until the pointer is over it, then red.
+pub fn closing(theme: &Theme, status: button::Status) -> button::Style {
+    let style = quiet(theme, status);
+    match status {
+        button::Status::Hovered | button::Status::Pressed => button::Style {
+            background: Some(Background::Color(DANGER)),
+            text_color: Color::WHITE,
+            border: outlined(Color::TRANSPARENT),
+            ..style
+        },
+        _ => style,
+    }
+}
+
 /// A tab: words alone until the pointer is over it; the chosen one in the accent colour, on a
 /// faint face.
 pub fn tab(chosen: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
@@ -503,6 +517,19 @@ pub fn dock(_: &Theme) -> pane_grid::Style {
             color: DIVIDER_HOVER,
             width: 2.0,
         },
+    }
+}
+
+/// Where a panel being moved would dock: the accent colour, seen through, and outlined.
+pub fn drop_zone(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color { a: 0.25, ..accent() })),
+        border: Border {
+            color: accent(),
+            width: 2.0,
+            radius: 0.0.into(),
+        },
+        ..container::Style::default()
     }
 }
 

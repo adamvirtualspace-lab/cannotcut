@@ -265,11 +265,21 @@ impl App {
         let building = std::time::Instant::now();
         let docked = window.width >= DOCKED_WIDTH;
         let room = window.width - 2.0 * GUTTER;
-        let top = self.top_bar(room - 2.0 * BAR_PADDING, docked);
-        let top = container(top.row)
+        let top = self.top_bar(room - 2.0 * BAR_PADDING - WINDOW_CONTROLS_WIDTH, docked);
+        let main = self.main_window;
+        let top = row![top.row, window_controls(main, Message::CloseRequested(main))]
+            .spacing(ROW_SPACING)
+            .align_y(Center);
+        let top = container(top)
             .padding([0.0, BAR_PADDING])
             .height(TOP_BAR_HEIGHT)
             .center_y(TOP_BAR_HEIGHT);
+        // The window's title bar: taken up by wherever no button is, to move the window.
+        let top = mouse_area(top)
+            .on_press(Message::BarPressed(main))
+            .on_release(Message::BarReleased)
+            .on_double_click(Message::WindowMaximized(main))
+            .on_move(move |at| Message::BarPointer(main, at));
         let Middle {
             panels,
             tools_menu,
@@ -400,10 +410,75 @@ impl App {
             let rise = (1.0 - risen) * DIALOG_RISE;
             layers.push(slid(center(opaque(card)), Vector::new(0.0, rise)));
         }
+        layers.extend(self.drop_highlight(window));
+        layers.push(window_edges(main));
         // Last, so that it is drawn after everything else.
         layers.push(frame_meter::frame_meter());
         frame_meter::built(building);
         Stack::with_children(layers).into()
+    }
+
+    /// The docked panel at `at` in the main window, `window` in size, and its side nearest
+    /// `at`; none in a narrow window, or off the panels.
+    pub(super) fn dock_region_at(
+        &self,
+        window: Size,
+        at: Point,
+    ) -> Option<(pane_grid::Pane, pane_grid::Edge)> {
+        if window.width < DOCKED_WIDTH {
+            return None;
+        }
+        let area = Size::new(
+            window.width - 2.0 * GUTTER,
+            window.height - TOP_BAR_HEIGHT - STATUS_HEIGHT - 2.0 * GUTTER,
+        );
+        let corner = Point::new(GUTTER, TOP_BAR_HEIGHT + GUTTER);
+        let local = Point::new(at.x - corner.x, at.y - corner.y);
+        let regions = self.dock.layout().pane_regions(GUTTER, MIN_PANE, area);
+        let (pane, region) = regions.into_iter().find(|(_, region)| region.contains(local))?;
+        let (x, y) = ((local.x - region.x) / region.width, (local.y - region.y) / region.height);
+        let edge = [
+            (x, pane_grid::Edge::Left),
+            (1.0 - x, pane_grid::Edge::Right),
+            (y, pane_grid::Edge::Top),
+            (1.0 - y, pane_grid::Edge::Bottom),
+        ]
+        .into_iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0))?
+        .1;
+        Some((pane, edge))
+    }
+
+    /// Where a panel window would dock if let go now, lit up over the main window `window` in
+    /// size: half of a docked panel, or the whole window.
+    fn drop_highlight(&self, window: Size) -> Option<Element<'_, Message>> {
+        let rectangle = match self.drop_target? {
+            crate::DropTarget::Pane(pane, edge) => {
+                let area = Size::new(
+                    window.width - 2.0 * GUTTER,
+                    window.height - TOP_BAR_HEIGHT - STATUS_HEIGHT - 2.0 * GUTTER,
+                );
+                let regions = self.dock.layout().pane_regions(GUTTER, MIN_PANE, area);
+                let region = *regions.get(&pane)?;
+                let (x, y) = (GUTTER + region.x, TOP_BAR_HEIGHT + GUTTER + region.y);
+                let (w, h) = (region.width, region.height);
+                match edge {
+                    pane_grid::Edge::Left => Rectangle::new(Point::new(x, y), Size::new(w / 2.0, h)),
+                    pane_grid::Edge::Right => {
+                        Rectangle::new(Point::new(x + w / 2.0, y), Size::new(w / 2.0, h))
+                    }
+                    pane_grid::Edge::Top => Rectangle::new(Point::new(x, y), Size::new(w, h / 2.0)),
+                    pane_grid::Edge::Bottom => {
+                        Rectangle::new(Point::new(x, y + h / 2.0), Size::new(w, h / 2.0))
+                    }
+                }
+            }
+            crate::DropTarget::Main => Rectangle::new(Point::ORIGIN, window),
+            crate::DropTarget::Window(_) => return None,
+        };
+        let zone = container(space().width(rectangle.width).height(rectangle.height))
+            .style(theme::drop_zone);
+        Some(placed(zone.into(), rectangle.x, rectangle.y))
     }
 
     /// The panels docked in a wide window, each with its title bar to take it up by.
@@ -716,17 +791,48 @@ impl App {
         ]
         .spacing(4)
         .align_y(Center);
-        let bar = row![title, space().width(Fill), buttons]
+        let controls = window_controls(window, Message::PutBack(window));
+        let bar = row![title, space().width(Fill), buttons, controls]
+            .spacing(ROW_SPACING)
             .align_y(Center)
             .padding(Padding {
                 right: BAR_PADDING,
                 ..Padding::ZERO
             });
-        container(column![across(bar.into()), body])
+        // Its title bar: taken up by wherever no button is, to move the window.
+        let bar = mouse_area(across(bar.into()))
+            .on_press(Message::BarPressed(window))
+            .on_release(Message::BarReleased)
+            .on_double_click(Message::WindowMaximized(window))
+            .on_move(move |at| Message::BarPointer(window, at));
+        let mut page = column![];
+        // Other panels dropped in this window: tabs above, to show one.
+        if let Some(away) = self.away.iter().find(|away| away.window == window)
+            && !away.tabs.is_empty()
+        {
+            let mut tabs = row![text_tab(part.name(), true, None)].spacing(2);
+            for (index, (tab, _)) in away.tabs.iter().enumerate() {
+                tabs = tabs.push(text_tab(
+                    tab.name(),
+                    false,
+                    Some(Message::AwayTabChosen(window, index)),
+                ));
+            }
+            let tabs = mouse_area(container(tabs).padding([2.0, BAR_PADDING]).width(Fill))
+                .on_press(Message::BarPressed(window))
+                .on_release(Message::BarReleased)
+                .on_move(move |at| Message::BarPointer(window, at));
+            page = page.push(container(tabs).style(theme::window));
+        }
+        let page = container(page.push(bar).push(body))
             .width(Fill)
             .height(Fill)
-            .style(theme::panel)
-            .into()
+            .style(theme::panel);
+        let mut layers = vec![page.into(), window_edges(window)];
+        if matches!(self.drop_target, Some(crate::DropTarget::Window(over)) if over == window) {
+            layers.push(container(space().width(Fill).height(Fill)).style(theme::drop_zone).into());
+        }
+        Stack::with_children(layers).into()
     }
 
     /// The line over the picture on what it shows, at most `room` wide.
@@ -1457,6 +1563,80 @@ impl App {
             .align_y(Center)
             .into()
     }
+}
+
+/// A tab naming a panel in a panel window: lit while it is the one shown.
+fn text_tab<'a>(name: &'a str, shown: bool, show: Option<Message>) -> Element<'a, Message> {
+    button(ui_text(name).size(theme::text_size(TAB_TEXT_SIZE)).font(theme::small_font()))
+        .padding([4, 10])
+        .style(theme::tab(shown))
+        .on_press_maybe(show)
+        .into()
+}
+
+/// The buttons at the end of a window's own title bar: minimise, maximise, and `close`.
+const WINDOW_CONTROL_PADDING: [f32; 2] = [7.0, 12.0];
+const WINDOW_CONTROLS_WIDTH: f32 = 3.0 * (ICON_SIZE + 2.0 * WINDOW_CONTROL_PADDING[1]) + 4.0;
+
+fn window_controls<'a>(window: iced::window::Id, close: Message) -> Element<'a, Message> {
+    let control = |which: Icon, words: &'static str, does: Message, closes: bool| {
+        let pressed = button(glyph(which, theme::TEXT))
+            .padding(WINDOW_CONTROL_PADDING)
+            .style(if closes { theme::closing } else { theme::quiet })
+            .on_press(does);
+        hint_below(pressed, words)
+    };
+    row![
+        control(Icon::WindowMinimize, "Minimise", Message::WindowMinimized(window), false),
+        control(Icon::WindowMaximize, "Maximise", Message::WindowMaximized(window), false),
+        control(Icon::WindowClose, "Close", close, true),
+    ]
+    .spacing(2)
+    .align_y(Center)
+    .into()
+}
+
+/// How far in from a window's edge it can be taken hold of to size it, and from a corner.
+const EDGE_GRIP: f32 = 5.0;
+const CORNER_GRIP: f32 = 12.0;
+
+/// A layer over a window with no system frame: its edges and corners, to size it by.
+fn window_edges<'a>(window: iced::window::Id) -> Element<'a, Message> {
+    use iced::window::Direction;
+    let grip = |width: iced::Length, height: iced::Length, edge: Direction| -> Element<'a, Message> {
+        let look = match edge {
+            Direction::North | Direction::South => mouse::Interaction::ResizingVertically,
+            Direction::East | Direction::West => mouse::Interaction::ResizingHorizontally,
+            Direction::NorthWest | Direction::SouthEast => {
+                mouse::Interaction::ResizingDiagonallyDown
+            }
+            Direction::NorthEast | Direction::SouthWest => mouse::Interaction::ResizingDiagonallyUp,
+        };
+        mouse_area(space().width(width).height(height))
+            .interaction(look)
+            .on_press(Message::WindowEdgeDragged(window, edge))
+            .into()
+    };
+    let (edge, corner) = (iced::Length::Fixed(EDGE_GRIP), iced::Length::Fixed(CORNER_GRIP));
+    column![
+        row![
+            grip(corner, edge, Direction::NorthWest),
+            grip(Fill.into(), edge, Direction::North),
+            grip(corner, edge, Direction::NorthEast),
+        ],
+        row![
+            grip(edge, Fill.into(), Direction::West),
+            space().width(Fill).height(Fill),
+            grip(edge, Fill.into(), Direction::East),
+        ]
+        .height(Fill),
+        row![
+            grip(corner, edge, Direction::SouthWest),
+            grip(Fill.into(), edge, Direction::South),
+            grip(corner, edge, Direction::SouthEast),
+        ],
+    ]
+    .into()
 }
 
 /// `element`, moved by `by` while that is not nothing: drawn over the rest as it moves.
