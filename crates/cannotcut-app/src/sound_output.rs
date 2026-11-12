@@ -144,8 +144,8 @@ impl App {
         let chosen = self.settings.sound_output.as_deref();
         let choice = |name: String, about: String, pick: Option<String>| {
             let lit = pick.as_deref() == chosen;
-            let about = text(about).size(STATUS_TEXT_SIZE).font(theme::SMALL);
-            button(column![text(name), about].spacing(2))
+            let about = ui_text(about).size(theme::text_size(STATUS_TEXT_SIZE)).font(theme::small_font());
+            button(column![ui_text(name), about].spacing(2))
                 .width(Fill)
                 .padding([8, 12])
                 .style(if lit { theme::on } else { theme::normal })
@@ -153,8 +153,8 @@ impl App {
                 .into()
         };
         let list: Element<'_, Message> = match outputs {
-            None => text("Looking for sound outputs...")
-                .font(theme::SMALL)
+            None => ui_text("Looking for sound outputs...")
+                .font(theme::small_font())
                 .color(theme::TEXT_DIM)
                 .into(),
             Some(outputs) => {
@@ -195,14 +195,14 @@ impl App {
              changes."
         );
         let body = column![
-            text(note).size(STATUS_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM),
+            ui_text(note).size(theme::text_size(STATUS_TEXT_SIZE)).font(theme::small_font()).color(theme::TEXT_DIM),
             container(list).max_height(LIST_HEIGHT),
             rule::horizontal(1),
             self.sync_section(),
         ]
         .spacing(12);
         let card = column![
-            text("Sound output").size(DIALOG_TITLE_SIZE).font(theme::DISPLAY),
+            ui_text("Sound output").size(theme::text_size(DIALOG_TITLE_SIZE)).font(theme::display_font()),
             scrollable(container(body).padding(iced::Padding {
                 right: 14.0,
                 ..iced::Padding::ZERO
@@ -226,9 +226,9 @@ impl App {
     /// Lining the sound up with the pictures, for the output in use.
     fn sync_section(&self) -> Element<'_, Message> {
         let SoundStatus::Ready { device, .. } = self.sound.status() else {
-            return text("No sound output to line up.")
-                .size(STATUS_TEXT_SIZE)
-                .font(theme::SMALL)
+            return ui_text("No sound output to line up.")
+                .size(theme::text_size(STATUS_TEXT_SIZE))
+                .font(theme::small_font())
                 .color(theme::TEXT_DIM)
                 .into();
         };
@@ -262,13 +262,13 @@ impl App {
         let about = "A beep and a flash each second. Move the delay until they come \
                      together, or let the microphone measure it.";
         let mut section = column![
-            text("Line up with pictures").font(theme::DISPLAY),
-            text(about).size(STATUS_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM),
+            ui_text("Line up with pictures").font(theme::display_font()),
+            ui_text(about).size(theme::text_size(STATUS_TEXT_SIZE)).font(theme::small_font()).color(theme::TEXT_DIM),
             row![test, flash].spacing(12).align_y(Center),
             row![
-                text("Delay").font(theme::SMALL),
+                ui_text("Delay").font(theme::small_font()),
                 slider,
-                text(format!("{delay} ms")).width(VOLUME_LABEL_WIDTH),
+                ui_text(format!("{delay} ms")).width(VOLUME_LABEL_WIDTH),
             ]
             .spacing(VOLUME_SPACING)
             .align_y(Center),
@@ -276,7 +276,7 @@ impl App {
         ]
         .spacing(10);
         if let Some(result) = self.sync_test.as_ref().and_then(|test| test.result.clone()) {
-            section = section.push(text(result).size(STATUS_TEXT_SIZE).font(theme::SMALL));
+            section = section.push(ui_text(result).size(theme::text_size(STATUS_TEXT_SIZE)).font(theme::small_font()));
         }
         section.into()
     }

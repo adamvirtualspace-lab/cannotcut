@@ -8,11 +8,14 @@ use std::sync::Mutex;
 use cannotcut_export::{Options as ExportOptions, Quality, Resolution};
 use serde_json::{Map, Value, json};
 
+use crate::theme::{self, Look, UiFont};
+
 const FILE: &str = "settings.json";
 const SOUND_DELAYS: &str = "sound_delay_ms";
 const SOUND_OUTPUT: &str = "sound_output";
 const EXPORT: &str = "export";
 const LAYOUT: &str = "layout";
+const APPEARANCE: &str = "appearance";
 const MEDIA_WIDTH: &str = "media_width";
 const DETAILS_WIDTH: &str = "details_width";
 const TIMELINE_SHARE: &str = "timeline_share";
@@ -49,6 +52,8 @@ pub struct Settings {
     /// What the last film was exported as.
     pub export: ExportOptions,
     pub layout: Layout,
+    /// The accent colour and fonts chosen; as they start, unless chosen.
+    pub look: Look,
 }
 
 impl Settings {
@@ -75,6 +80,25 @@ impl Settings {
             }
             if let Some(quality) = key("quality").and_then(Quality::from_key) {
                 settings.export.quality = quality;
+            }
+        }
+        if let Some(appearance) = saved.get(APPEARANCE) {
+            let key = |name: &str| appearance.get(name).and_then(Value::as_str);
+            if let Some(accent) = key("accent").and_then(theme::from_hex) {
+                settings.look.accent = accent;
+            }
+            if let Some(font) = key("font").and_then(UiFont::from_key) {
+                settings.look.font = font;
+            }
+            let scale = |name: &str, offered: &[f32]| {
+                let kept = appearance.get(name).and_then(Value::as_f64)? as f32;
+                offered.iter().copied().find(|scale| (scale - kept).abs() < 0.001)
+            };
+            if let Some(ui_scale) = scale("ui_scale", &theme::UI_SCALES) {
+                settings.look.ui_scale = ui_scale;
+            }
+            if let Some(text_scale) = scale("text_scale", &theme::TEXT_SCALES) {
+                settings.look.text_scale = text_scale;
             }
         }
         if let Some(layout) = saved.get(LAYOUT) {
@@ -106,6 +130,19 @@ impl Settings {
     /// Keeps the sound output picked in the file.
     pub fn save_sound_output(&self) {
         save(SOUND_OUTPUT, json!(self.sound_output));
+    }
+
+    /// Keeps the accent colour and fonts chosen in the file.
+    pub fn save_look(&self) {
+        save(
+            APPEARANCE,
+            json!({
+                "accent": theme::hex(self.look.accent),
+                "font": self.look.font.key(),
+                "ui_scale": self.look.ui_scale,
+                "text_scale": self.look.text_scale,
+            }),
+        );
     }
 
     /// Keeps the export choices in the file.

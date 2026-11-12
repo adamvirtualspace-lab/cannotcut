@@ -8,14 +8,19 @@
 //! The outline goes around a button's face, not over its edge: every button keeps a clear
 //! ring of [`OUTLINE_WIDTH`] around its face, and the outline only colours that ring in. So
 //! the face is the same size whatever the pointer does, and nothing around it moves.
+//!
+//! The accent colour and the fonts are the user's to choose (see `appearance`): they are read
+//! from here as the window is drawn, so a change shows at once.
 
 use std::f32::consts::PI;
+use std::sync::RwLock;
 
 use iced::gradient::Linear;
 use iced::theme::Palette;
 use iced::widget::button::{self, Button};
 use iced::widget::text::{IntoFragment, Text};
 use iced::widget::{container, pane_grid, text};
+use iced::font::Weight;
 use iced::{Background, Border, Color, Element, Font, Shadow, Theme};
 
 /// Behind everything.
@@ -31,10 +36,20 @@ pub const DIVIDER_HOVER: Color = Color::from_rgb8(0x84, 0x85, 0x90);
 pub const TEXT: Color = Color::from_rgb8(0xe8, 0xe8, 0xeb);
 /// Words that say less: hints, readouts, labels of what cannot be used now.
 pub const TEXT_DIM: Color = Color::from_rgb8(0xa4, 0xa5, 0xae);
-/// What is chosen or switched on, and the main way on (Export).
-pub const ACCENT: Color = Color::from_rgb8(0x1f, 0xc8, 0x8c);
-/// Words on the accent.
-pub const ON_ACCENT: Color = Color::from_rgb8(0x08, 0x1c, 0x14);
+/// What is chosen or switched on, and the main way on (Export), unless another is chosen:
+/// mint.
+pub const DEFAULT_ACCENT: Color = Color::from_rgb8(0x1f, 0xc8, 0x8c);
+/// The accent colours offered, by name; the first is the default.
+pub const ACCENTS: [(&str, Color); 8] = [
+    ("Mint", DEFAULT_ACCENT),
+    ("Sky", Color::from_rgb8(0x3b, 0x9e, 0xf0)),
+    ("Violet", Color::from_rgb8(0x9a, 0x6b, 0xff)),
+    ("Pink", Color::from_rgb8(0xf0, 0x60, 0x9e)),
+    ("Coral", Color::from_rgb8(0xff, 0x7a, 0x59)),
+    ("Orange", Color::from_rgb8(0xf5, 0x9a, 0x23)),
+    ("Yellow", Color::from_rgb8(0xf2, 0xc2, 0x30)),
+    ("Lime", Color::from_rgb8(0x9b, 0xd4, 0x3b)),
+];
 pub const DANGER: Color = Color::from_rgb8(0xe0, 0x4b, 0x4f);
 /// Words on the danger colour: dark, as on the accent, since both are bright.
 pub const ON_DANGER: Color = Color::from_rgb8(0x1f, 0x08, 0x09);
@@ -67,24 +82,244 @@ const DARKER: f32 = 0.22;
 /// How much of the panel shows through a button that cannot be used now.
 const DISABLED_FADE: f32 = 0.55;
 
-/// Words on buttons with a face of their own, and dialog titles: Anton SC, Anton with small
-/// capitals for its lower-case letters.
-pub const DISPLAY: Font = Font::with_name("Anton SC");
-/// Small words: second lines, hints, notes, readouts. Antonio.
-pub const SMALL: Font = Font::with_name("Antonio");
-/// Every other word: names, values, timecodes, the timeline. Oswald, the app's default font,
-/// so that it looks the same on every system (without it, Windows shows Segoe UI).
-pub const BODY: Font = Font::with_name("Oswald");
-/// The fonts above, for the app to load at start (see `fonts/README.md`).
-pub const FONTS: [&[u8]; 3] = [
+/// The fonts the app carries, for it to load at start (see `fonts/README.md`). Inter and
+/// Roboto are variable fonts: one file draws every weight.
+pub const FONTS: [&[u8]; 5] = [
     include_bytes!("../fonts/AntonSC-Regular.ttf"),
     include_bytes!("../fonts/Antonio-Regular.ttf"),
     include_bytes!("../fonts/Oswald-Regular.ttf"),
+    include_bytes!("../fonts/Inter-Variable.ttf"),
+    include_bytes!("../fonts/Roboto-Variable.ttf"),
 ];
 
-/// Words for a button with a face of its own, in [`DISPLAY`].
+/// The fonts the words of the UI can be shown in. Each gives three: for words on buttons and
+/// dialog titles, for small words (hints, notes, readouts), and for every other word.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiFont {
+    /// Narrow, tall letters that fit a lot in: Anton SC on buttons (small capitals), Antonio for
+    /// small words, Oswald for the rest. The same on every system.
+    #[default]
+    Condensed,
+    /// Windows' own; elsewhere, the system's default font stands in.
+    SegoeUi,
+    Inter,
+    Roboto,
+}
+
+impl UiFont {
+    pub const ALL: [UiFont; 4] = [Self::Condensed, Self::SegoeUi, Self::Inter, Self::Roboto];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Condensed => "condensed",
+            Self::SegoeUi => "segoe-ui",
+            Self::Inter => "inter",
+            Self::Roboto => "roboto",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|font| font.key() == key)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Condensed => "Condensed",
+            Self::SegoeUi => "Segoe UI",
+            Self::Inter => "Inter",
+            Self::Roboto => "Roboto",
+        }
+    }
+
+    /// What it is, under its name.
+    pub fn about(self) -> &'static str {
+        match self {
+            Self::Condensed => "Oswald, Antonio and Anton SC: narrow, fits the most in",
+            Self::SegoeUi => "Windows' own",
+            Self::Inter => "Clear at small sizes",
+            Self::Roboto => "Android's own",
+        }
+    }
+
+    /// For every other word: names, values, timecodes, the timeline.
+    pub fn body(self) -> Font {
+        match self {
+            Self::Condensed => Font::with_name("Oswald"),
+            Self::SegoeUi => Font::with_name("Segoe UI"),
+            Self::Inter => Font::with_name("Inter"),
+            Self::Roboto => Font::with_name("Roboto"),
+        }
+    }
+
+    /// For small words: second lines, hints, notes, readouts.
+    pub fn small(self) -> Font {
+        match self {
+            Self::Condensed => Font::with_name("Antonio"),
+            other => other.body(),
+        }
+    }
+
+    /// For words on buttons with a face of their own, and dialog titles.
+    pub fn display(self) -> Font {
+        match self {
+            Self::Condensed => Font::with_name("Anton SC"),
+            other => Font {
+                weight: Weight::Semibold,
+                ..other.body()
+            },
+        }
+    }
+
+    /// How much wider its words are than `fit::text_width` reckons, which is for Segoe UI and
+    /// errs on the wide side.
+    pub fn width_factor(self) -> f32 {
+        match self {
+            Self::Inter => 1.08,
+            _ => 1.0,
+        }
+    }
+}
+
+/// The sizes everything can be shown at, as a share of its own size.
+pub const UI_SCALES: [f32; 6] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5];
+/// The sizes words can be shown at, on top of that.
+pub const TEXT_SCALES: [f32; 4] = [0.9, 1.0, 1.1, 1.25];
+/// Words with no size of their own, before scaling: iced's own default.
+const DEFAULT_TEXT_SIZE: f32 = 16.0;
+
+/// How the UI looks, as chosen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Look {
+    pub accent: Color,
+    pub font: UiFont,
+    /// How large everything is drawn: panels, buttons, icons and words alike. 1 is as made.
+    pub ui_scale: f32,
+    /// How large words are drawn, on top of `ui_scale`.
+    pub text_scale: f32,
+}
+
+impl Look {
+    const START: Look = Look {
+        accent: DEFAULT_ACCENT,
+        font: UiFont::Condensed,
+        ui_scale: 1.0,
+        text_scale: 1.0,
+    };
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Self::START
+    }
+}
+
+static LOOK: RwLock<Look> = RwLock::new(Look::START);
+
+/// How the UI looks now.
+pub fn look() -> Look {
+    LOOK.read().map(|look| *look).unwrap_or_default()
+}
+
+/// Makes the UI look as `look` says, from the next time it is drawn.
+pub fn set_look(look: Look) {
+    if let Ok(mut now) = LOOK.write() {
+        *now = look;
+    }
+}
+
+/// A colour as `#rrggbb`.
+pub fn hex(color: Color) -> String {
+    let [red, green, blue, _] = color.into_rgba8();
+    format!("#{red:02x}{green:02x}{blue:02x}")
+}
+
+/// A colour written as `#rrggbb` or `rrggbb` (or the short `#rgb`), in either case.
+pub fn from_hex(written: &str) -> Option<Color> {
+    let digits = written.trim().trim_start_matches('#');
+    let digits: String = match digits.len() {
+        3 => digits.chars().flat_map(|digit| [digit, digit]).collect(),
+        6 => digits.to_string(),
+        _ => return None,
+    };
+    let channel = |at: usize| u8::from_str_radix(digits.get(at..at + 2)?, 16).ok();
+    Some(Color::from_rgb8(channel(0)?, channel(2)?, channel(4)?))
+}
+
+/// What is chosen or switched on, and the main way on (Export).
+pub fn accent() -> Color {
+    look().accent
+}
+
+/// Words on the accent: dark on a bright accent, light on a dark one, in its own hue.
+pub fn on_accent() -> Color {
+    ink_on(accent())
+}
+
+fn ink_on(face: Color) -> Color {
+    // Relative luminance, from the sRGB channels made linear.
+    let linear = |channel: f32| {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(face.r) + 0.7152 * linear(face.g) + 0.0722 * linear(face.b);
+    // Where black and white words would read equally well against it.
+    if luminance > 0.18 {
+        darker(face, 0.86)
+    } else {
+        lighter(face, 0.92)
+    }
+}
+
+/// Words on buttons with a face of their own, and dialog titles.
+pub fn display_font() -> Font {
+    look().font.display()
+}
+
+/// Small words: second lines, hints, notes, readouts.
+pub fn small_font() -> Font {
+    look().font.small()
+}
+
+/// Every other word.
+pub fn body_font() -> Font {
+    look().font.body()
+}
+
+/// How much wider words are than `fit::text_width` reckons, in the fonts and text size
+/// chosen.
+pub fn width_factor() -> f32 {
+    let look = look();
+    look.font.width_factor() * look.text_scale
+}
+
+/// How large everything is drawn, 1 being as made.
+pub fn ui_scale() -> f32 {
+    look().ui_scale
+}
+
+/// Words meant to be `size` pixels, at the text size chosen.
+pub fn text_size(size: f32) -> f32 {
+    size * look().text_scale
+}
+
+/// Words, in the font for every other word, at the text size chosen. Used in place of iced's
+/// `text`, whose font and size are the ones the app started with.
+pub fn ui_text<'a>(words: impl IntoFragment<'a>) -> Text<'a> {
+    text(words).font(body_font()).size(text_size(DEFAULT_TEXT_SIZE))
+}
+
+/// Words for a button with a face of its own, in the font for those.
 pub fn display<'a>(words: impl IntoFragment<'a>) -> Text<'a> {
-    text(words).font(DISPLAY)
+    text(words).font(display_font()).size(text_size(DEFAULT_TEXT_SIZE))
+}
+
+/// The size of words with no size of their own, at the text size chosen: for widgets that
+/// take it apart from their words.
+pub fn default_text_size() -> f32 {
+    text_size(DEFAULT_TEXT_SIZE)
 }
 
 /// The theme of the whole app: the colours above, for the widgets drawn by iced.
@@ -94,7 +329,7 @@ pub fn theme() -> Theme {
         Palette {
             background: PANEL,
             text: TEXT,
-            primary: ACCENT,
+            primary: accent(),
             success: AUDIO_CLIP,
             warning: Color::from_rgb8(0xe0, 0xa1, 0x3c),
             danger: DANGER,
@@ -189,7 +424,7 @@ pub fn normal(_: &Theme, status: button::Status) -> button::Style {
 
 /// The main way on: Export, Save in a dialog.
 pub fn primary(_: &Theme, status: button::Status) -> button::Style {
-    shaded(ACCENT, ON_ACCENT, status)
+    shaded(accent(), on_accent(), status)
 }
 
 /// One that loses work: Don't save.
@@ -199,7 +434,7 @@ pub fn danger(_: &Theme, status: button::Status) -> button::Style {
 
 /// A switch that is on: Selecting, a muted track.
 pub fn on(_: &Theme, status: button::Status) -> button::Style {
-    shaded(ACCENT, ON_ACCENT, status)
+    shaded(accent(), on_accent(), status)
 }
 
 /// A button with no face of its own until the pointer is over it: in the path, in menus, on
@@ -234,7 +469,7 @@ pub fn tab(chosen: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let mut style = quiet(theme, status);
         if chosen {
-            style.text_color = ACCENT;
+            style.text_color = accent();
             if status == button::Status::Active {
                 style.background = Some(Background::Color(Color { a: 0.06, ..Color::WHITE }));
             }
@@ -248,15 +483,15 @@ pub fn tab(chosen: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
 pub fn dock(_: &Theme) -> pane_grid::Style {
     pane_grid::Style {
         hovered_region: pane_grid::Highlight {
-            background: Background::Color(Color { a: 0.25, ..ACCENT }),
+            background: Background::Color(Color { a: 0.25, ..accent() }),
             border: Border {
-                color: ACCENT,
+                color: accent(),
                 width: 2.0,
                 radius: 0.0.into(),
             },
         },
         picked_split: pane_grid::Line {
-            color: ACCENT,
+            color: accent(),
             width: 2.0,
         },
         hovered_split: pane_grid::Line {
@@ -304,5 +539,42 @@ pub fn window(_: &Theme) -> container::Style {
         background: Some(Background::Color(WINDOW)),
         text_color: Some(TEXT),
         ..container::Style::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn words_on_the_accent_stand_out_from_it() {
+        // Mint keeps the dark words it always had, near enough.
+        let on_mint = ink_on(DEFAULT_ACCENT).into_rgba8();
+        assert!(on_mint[1] < 0x30, "{on_mint:?}");
+        for (name, face) in ACCENTS {
+            let ink = ink_on(face);
+            let gap = (face.r - ink.r).abs() + (face.g - ink.g).abs() + (face.b - ink.b).abs();
+            assert!(gap > 1.2, "{name}: {gap}");
+        }
+        // A dark accent gets light words.
+        assert!(ink_on(Color::from_rgb8(0x20, 0x20, 0x80)).r > 0.8);
+    }
+
+    #[test]
+    fn colours_are_written_and_read_as_hex() {
+        assert_eq!(hex(DEFAULT_ACCENT), "#1fc88c");
+        assert_eq!(from_hex("#1FC88C"), Some(DEFAULT_ACCENT));
+        assert_eq!(from_hex(" 1fc88c "), Some(DEFAULT_ACCENT));
+        assert_eq!(from_hex("#fff"), Some(Color::WHITE));
+        for wrong in ["", "#12345", "#12345g", "1fc88c00", "#"] {
+            assert_eq!(from_hex(wrong), None, "{wrong}");
+        }
+    }
+
+    #[test]
+    fn every_ui_font_comes_back_from_its_key() {
+        for font in UiFont::ALL {
+            assert_eq!(UiFont::from_key(font.key()), Some(font));
+        }
     }
 }

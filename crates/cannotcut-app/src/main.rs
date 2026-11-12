@@ -5,8 +5,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod about;
+mod appearance;
 mod dock;
 mod fit;
+mod frame_meter;
 mod icons;
 mod panels;
 mod placement;
@@ -52,7 +54,7 @@ use panels::{DETAILS_WIDTH, DetailsTab, Divider, MEDIA_WIDTH, MediaTab, Side, ic
     labelled, labelled_width, tool_control};
 use settings::Settings;
 use sound_output::{Outputs, SyncTest};
-use theme::button;
+use theme::{button, ui_text};
 use timeline_panel::{
     Action, LANE_GAP, LANE_HEIGHT, PANEL_HEIGHT, RULER_HEIGHT, View, Waveforms,
     timecode_base, timeline_panel,
@@ -70,6 +72,8 @@ const SOUND_DELAY_FLAG: &str = "--sound-delay=";
 const EXPORT_FLAG: &str = "--export=";
 /// Starts with the playhead on a frame, to look at a spot without touching the mouse.
 const PLAYHEAD_FLAG: &str = "--at=";
+/// Starts playing once the project is open, to watch it play without touching anything.
+const PLAY_FLAG: &str = "--play";
 /// Adds a file to the end of the main track as "Add clips" does; for a project, that puts it in
 /// as a clip instead of opening it.
 const ADD_FLAG: &str = "--add=";
@@ -180,13 +184,16 @@ const EMPTY_PROJECT_RATE: Rate = Rate::new(30, 1);
 fn main() -> iced::Result {
     // Windows of its own: the main one, opened at the start, and one for each panel taken out
     // of it.
+    // The fonts chosen are known before the first word is drawn.
+    theme::set_look(settings::Settings::load().look);
     let app = theme::FONTS
         .into_iter()
         .fold(iced::daemon(App::boot, App::update, App::view), |app, font| app.font(font));
-    app.default_font(theme::BODY)
+    app.default_font(theme::body_font())
         .title(App::title)
         .subscription(App::subscription)
         .theme(|_: &App, _| theme::theme())
+        .scale_factor(|_: &App, _| theme::ui_scale())
         .run()
 }
 
@@ -246,6 +253,20 @@ enum Message {
     AboutClosed,
     /// The card to pick the sound output, from the menu.
     SoundOutputOpened,
+    /// The card to choose how the app looks, opened or closed.
+    AppearanceOpened,
+    AppearanceClosed,
+    /// An accent colour picked from those offered.
+    AccentChosen(Color),
+    /// What is written in the box for a colour of one's own, as it changes.
+    AccentWritten(String),
+    UiFontChosen(theme::UiFont),
+    /// How large everything is drawn.
+    UiScaleChosen(f32),
+    /// How large words are drawn.
+    TextScaleChosen(f32),
+    /// The look put back as it starts.
+    AppearanceReset,
     /// The sound outputs the system offers, listed for the card.
     SoundOutputsListed(Outputs),
     /// An output picked by name, or the system's default.
@@ -727,6 +748,9 @@ struct App {
     sound_opened: u64,
     /// The card to pick the sound output, while it is open: the outputs, once listed.
     sound_outputs: Option<Option<Outputs>>,
+    /// While the card to choose how the app looks is open, what is written in its box for a
+    /// colour of one's own.
+    appearance: Option<String>,
     /// The sync test, while it runs.
     sync_test: Option<SyncTest>,
     settings: Settings,
@@ -749,6 +773,10 @@ struct App {
     timeline_view: Option<View>,
     notice: Option<String>,
     memory_mb: Option<usize>,
+    /// How smoothly the main window was drawn over the last second, while it was drawing.
+    smoothness: Option<frame_meter::Smoothness>,
+    /// Play once the project is open, as asked on the command line.
+    play_on_open: bool,
     /// The waveforms of the media files the project shown uses, by their names in it, as the
     /// panel finds them.
     waveforms: Waveforms,
@@ -962,6 +990,7 @@ impl App {
             sound_delay: None,
             sound_opened: 0,
             sound_outputs: None,
+            appearance: None,
             sync_test: None,
             settings,
             playback: None,
@@ -977,6 +1006,8 @@ impl App {
             timeline_view: None,
             notice: None,
             memory_mb: None,
+            smoothness: None,
+            play_on_open: false,
             waveforms: Waveforms::new(),
             waveform_files: HashMap::new(),
             waveforms_asked: HashSet::new(),
@@ -1026,6 +1057,8 @@ impl App {
             let text = argument.to_string_lossy();
             if text == CPU_VIEWER_FLAG {
                 app.viewer = Some(ViewerPath::Cpu);
+            } else if text == PLAY_FLAG {
+                app.play_on_open = true;
             } else if text == NO_SOUND_FLAG {
                 app.silent = true;
             } else if let Some(milliseconds) = text.strip_prefix(SOUND_DELAY_FLAG) {
@@ -2220,6 +2253,52 @@ impl App {
                 );
             }
             Message::AboutClosed => self.about = None,
+            Message::AppearanceOpened => {
+                self.more = None;
+                self.appearance = Some(theme::hex(theme::accent()));
+            }
+            Message::AppearanceClosed => self.appearance = None,
+            Message::AccentChosen(accent) => {
+                self.appearance = Some(theme::hex(accent));
+                self.set_look(theme::Look {
+                    accent,
+                    ..theme::look()
+                });
+            }
+            Message::AccentWritten(written) => {
+                if let Some(accent) = theme::from_hex(&written) {
+                    self.set_look(theme::Look {
+                        accent,
+                        ..theme::look()
+                    });
+                }
+                self.appearance = Some(written);
+            }
+            Message::UiFontChosen(font) => {
+                self.set_look(theme::Look {
+                    font,
+                    ..theme::look()
+                });
+            }
+            Message::UiScaleChosen(ui_scale) => {
+                self.set_look(theme::Look {
+                    ui_scale,
+                    ..theme::look()
+                });
+                // The viewer's pictures are made for its size on screen.
+                return self.viewer_changed();
+            }
+            Message::TextScaleChosen(text_scale) => {
+                self.set_look(theme::Look {
+                    text_scale,
+                    ..theme::look()
+                });
+            }
+            Message::AppearanceReset => {
+                self.appearance = Some(theme::hex(theme::DEFAULT_ACCENT));
+                self.set_look(theme::Look::default());
+                return self.viewer_changed();
+            }
             Message::SoundOutputOpened => {
                 self.more = None;
                 self.sound_outputs = Some(None);
@@ -2770,6 +2849,9 @@ impl App {
                     }
                     Some(key::Named::Escape) if self.export_dialog => Some(Message::ExportClosed),
                     Some(key::Named::Escape) if self.about.is_some() => Some(Message::AboutClosed),
+                    Some(key::Named::Escape) if self.appearance.is_some() => {
+                        Some(Message::AppearanceClosed)
+                    }
                     Some(key::Named::Escape) if self.sound_outputs.is_some() => {
                         Some(Message::SoundOutputClosed)
                     }
@@ -2819,8 +2901,17 @@ impl App {
             Message::MemoryTick => {
                 self.memory_mb =
                     memory_stats::memory_stats().map(|usage| usage.physical_mem / BYTES_PER_MB);
+                self.smoothness = frame_meter::smoothness();
                 if std::mem::take(&mut self.layout_moved) {
                     self.keep_layout();
+                }
+                let ready = self.history.timeline().duration() > 0
+                    && self.adding.is_empty()
+                    && self.opening.is_none()
+                    && !self.opening_project;
+                if self.play_on_open && ready && self.playback.is_none() {
+                    self.play_on_open = false;
+                    return self.update(Message::PlayToggled);
                 }
             }
         }
@@ -3622,6 +3713,8 @@ impl App {
         else {
             return Task::none();
         };
+        // The screen's own scaling, and the size the UI is drawn at on top of it.
+        let scale = scale * theme::ui_scale();
         let form = Form {
             output: path.output(),
             max_size: (
@@ -3883,22 +3976,22 @@ impl App {
                 if level + 1 == hidden.end {
                     let names: Vec<String> =
                         self.parents[hidden.clone()].iter().map(name).collect();
-                    let more = button(text("..."))
+                    let more = button(ui_text("..."))
                         .style(theme::quiet)
                         .on_press(Message::StepOut(level));
-                    bar = bar.push(hint(more, names.join(" > "))).push(text(">"));
+                    bar = bar.push(hint(more, names.join(" > "))).push(ui_text(">"));
                 }
                 continue;
             }
             bar = bar
                 .push(
-                    button(text(name(parent)))
+                    button(ui_text(name(parent)))
                         .style(theme::quiet)
                         .on_press(Message::StepOut(level)),
                 )
-                .push(text(">"));
+                .push(ui_text(">"));
         }
-        bar.push(text(own).wrapping(text::Wrapping::None)).into()
+        bar.push(ui_text(own).wrapping(text::Wrapping::None)).into()
     }
 
     /// Picking several clips by tapping them, for when Ctrl-click is not at hand.
@@ -3910,7 +4003,7 @@ impl App {
             if self.selecting {
                 (
                     theme::on,
-                    theme::ON_ACCENT,
+                    theme::on_accent(),
                     "Selecting: tap clips to add or remove them; tap here to stop",
                     "Stop selecting",
                 )
@@ -3952,8 +4045,8 @@ impl App {
         };
         let busy = self.leave_saving;
         let card = column![
-            text(title).size(DIALOG_TITLE_SIZE).font(theme::DISPLAY),
-            text(about).font(theme::SMALL),
+            ui_text(title).size(theme::text_size(DIALOG_TITLE_SIZE)).font(theme::display_font()),
+            ui_text(about).font(theme::small_font()),
             row![
                 button(theme::display("Save"))
                     .style(theme::primary)
@@ -4013,7 +4106,7 @@ impl App {
             count => format!("Compound clip of {count} clips"),
         };
         let choice = |name: &'static str, about: &'static str, keep: Keep| {
-            let about = text(about).size(STATUS_TEXT_SIZE).font(theme::SMALL);
+            let about = ui_text(about).size(theme::text_size(STATUS_TEXT_SIZE)).font(theme::small_font());
             button(column![theme::display(name), about].spacing(2))
                 .width(Fill)
                 .padding([8, 12])
@@ -4021,7 +4114,7 @@ impl App {
                 .on_press(Message::CompoundKept(keep))
         };
         let card = column![
-            text(title).size(DIALOG_TITLE_SIZE).font(theme::DISPLAY),
+            ui_text(title).size(theme::text_size(DIALOG_TITLE_SIZE)).font(theme::display_font()),
             choice(
                 "Linked file",
                 "An .otio of its own; changes show wherever it is used",
@@ -4070,12 +4163,12 @@ impl App {
             None => "Working out the size".to_string(),
         };
         let choice = |label: &'static str, list: Element<'static, Message>| {
-            row![text(label).font(theme::SMALL).width(DIALOG_LABEL_WIDTH), list]
+            row![ui_text(label).font(theme::small_font()).width(DIALOG_LABEL_WIDTH), list]
                 .spacing(12)
                 .align_y(Center)
         };
         let card = column![
-            text("Export").size(DIALOG_TITLE_SIZE).font(theme::DISPLAY),
+            ui_text("Export").size(theme::text_size(DIALOG_TITLE_SIZE)).font(theme::display_font()),
             choice(
                 "Resolution",
                 pick_list(
@@ -4083,14 +4176,18 @@ impl App {
                     Some(options.resolution),
                     Message::ExportResolution
                 )
+                .font(theme::body_font())
+                .text_size(theme::default_text_size())
                 .into()
             ),
             choice(
                 "Quality",
                 pick_list(&Quality::CHOICES[..], Some(options.quality), Message::ExportQuality)
+                    .font(theme::body_font())
+                    .text_size(theme::default_text_size())
                     .into()
             ),
-            text(about).size(STATUS_TEXT_SIZE).font(theme::SMALL),
+            ui_text(about).size(theme::text_size(STATUS_TEXT_SIZE)).font(theme::small_font()),
             row![
                 button(theme::display("Cancel"))
                     .on_press(Message::ExportClosed)
@@ -4114,7 +4211,7 @@ impl App {
         let Some(exporting) = &self.exporting else {
             let has_clips = self.history.timeline().duration() > 0;
             let export = has_clips.then_some(Message::ExportOpened);
-            let ink = if has_clips { theme::ON_ACCENT } else { theme::TEXT_DIM };
+            let ink = if has_clips { theme::on_accent() } else { theme::TEXT_DIM };
             let full = button(labelled(Icon::Export, "Export", ink))
                 .style(theme::primary)
                 .on_press_maybe(export.clone());
@@ -4180,7 +4277,7 @@ impl App {
             ) = if track.magnetic {
                 (
                     theme::on,
-                    theme::ON_ACCENT,
+                    theme::on_accent(),
                     "Magnetic: clips keep together, gaps close. Tap to place clips freely",
                 )
             } else {
@@ -4234,7 +4331,7 @@ impl App {
             .step(0.01_f32)
             .on_release(Message::VolumeReleased)
             .width(slider_width);
-        let label = text(format!("{:.0}%", volume * 100.0)).width(VOLUME_LABEL_WIDTH);
+        let label = ui_text(format!("{:.0}%", volume * 100.0)).width(VOLUME_LABEL_WIDTH);
         Some(row![slider, label].spacing(VOLUME_SPACING).align_y(Center).into())
     }
 
@@ -4325,6 +4422,14 @@ impl App {
             SoundStatus::Starting => "sound starting".to_string(),
             SoundStatus::Unavailable(why) => format!("no sound: {why}"),
         });
+        parts.push(match self.smoothness {
+            Some(smoothness) => format!(
+                "UI {:.0} fps, longest gap {} ms",
+                smoothness.fps,
+                smoothness.longest_gap.as_millis()
+            ),
+            None => "UI idle".to_string(),
+        });
         parts.push(format!("{} open", self.sources.len()));
         if let Some(memory_mb) = self.memory_mb {
             parts.push(format!("{memory_mb} MB"));
@@ -4357,7 +4462,7 @@ fn hint_at<'a>(
 ) -> Element<'a, Message> {
     tooltip(
         control,
-        container(text(words).size(STATUS_TEXT_SIZE).font(theme::SMALL))
+        container(ui_text(words).size(theme::text_size(STATUS_TEXT_SIZE)).font(theme::small_font()))
             .padding(6)
             .style(theme::card),
         position,
@@ -4398,7 +4503,7 @@ fn path_hidden(names: &[String], own: &str, room: f32) -> std::ops::Range<usize>
 fn more_button<'a>(bar: Bar, open: Option<Bar>) -> Element<'a, Message> {
     if open == Some(bar) {
         // No word on it while open: it would cover the menu.
-        return icon_button(Icon::More, theme::ON_ACCENT)
+        return icon_button(Icon::More, theme::on_accent())
             .style(theme::on)
             .on_press(Message::MoreClosed)
             .into();
@@ -4415,7 +4520,7 @@ fn more_button<'a>(bar: Bar, open: Option<Bar>) -> Element<'a, Message> {
 /// nothing right now greyed out.
 fn more_menu<'a>(entries: Vec<(String, Option<Message>)>) -> Element<'a, Message> {
     let entries = entries.into_iter().map(|(words, does)| {
-        button(text(words))
+        button(ui_text(words))
             .width(Fill)
             .style(theme::quiet)
             .on_press_maybe(does.map(|does| Message::FromMenu(Box::new(does))))
@@ -4437,7 +4542,7 @@ fn nothing<'a>() -> Element<'a, Message> {
 /// must keep their height whatever they say: a row that grows squeezes the viewer, and the
 /// picture with it.
 fn one_line<'a>(content: String) -> container::Container<'a, Message> {
-    container(text(content).wrapping(text::Wrapping::None)).clip(true)
+    container(ui_text(content).wrapping(text::Wrapping::None)).clip(true)
 }
 
 /// Opens a file dialog made by `pick`, owned by the app's window so that Windows puts it on

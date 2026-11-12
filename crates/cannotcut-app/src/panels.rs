@@ -219,7 +219,7 @@ impl App {
     /// pointer is over it, in the accent colour while it is being dragged.
     fn divider(&self, which: Divider, width: f32, height: f32) -> Element<'_, Message> {
         let color = if self.dividing == Some(which) {
-            theme::ACCENT
+            theme::accent()
         } else if self.dividing.is_none() && self.divider_hover == Some(which) {
             theme::DIVIDER_HOVER
         } else {
@@ -257,6 +257,7 @@ impl App {
 
     /// Everything, laid out for a window of this size in logical pixels.
     pub(super) fn layout(&self, window: Size) -> Element<'_, Message> {
+        let building = std::time::Instant::now();
         let docked = window.width >= DOCKED_WIDTH;
         let room = window.width - 2.0 * GUTTER;
         let top = self.top_bar(room - 2.0 * BAR_PADDING, docked);
@@ -350,6 +351,8 @@ impl App {
             Some((self.compound_dialog(), Some(Message::CompoundClosed)))
         } else if let Some(page) = self.about {
             Some((self.about_dialog(page, window), Some(Message::AboutClosed)))
+        } else if let Some(hex) = &self.appearance {
+            Some((self.appearance_dialog(hex, window), Some(Message::AppearanceClosed)))
         } else if let Some(outputs) = &self.sound_outputs {
             let card = self.sound_output_dialog(outputs.as_ref(), window);
             Some((card, Some(Message::SoundOutputClosed)))
@@ -366,6 +369,9 @@ impl App {
             layers.push(opaque(backdrop));
             layers.push(center(opaque(card)).into());
         }
+        // Last, so that it is drawn after everything else.
+        layers.push(frame_meter::frame_meter());
+        frame_meter::built(building);
         Stack::with_children(layers).into()
     }
 
@@ -531,7 +537,7 @@ impl App {
         // Slid out over the viewer, it shows as on, as the panel covers part of it.
         let slid_out = !docked && self.drawer == Some(side);
         let shown = if docked { !self.is_hidden(side) } else { slid_out };
-        let ink = if slid_out { theme::ON_ACCENT } else { theme::TEXT };
+        let ink = if slid_out { theme::on_accent() } else { theme::TEXT };
         let toggle = icon_button(which, ink)
             .style(if slid_out { theme::on } else { theme::quiet })
             .on_press(if docked {
@@ -547,7 +553,7 @@ impl App {
     /// project is, Export, and the details panel's button.
     fn top_bar(&self, room: f32, docked: bool) -> Fitted<'_, Message> {
         let open = self.more == Some(Bar::Menu);
-        let ink = if open { theme::ON_ACCENT } else { theme::ON_BUTTON };
+        let ink = if open { theme::on_accent() } else { theme::ON_BUTTON };
         let menu = button(labelled(Icon::Menu, MENU_LABEL, ink))
             .style(if open { theme::on } else { theme::normal })
             .on_press(if open {
@@ -566,7 +572,7 @@ impl App {
                 .spacing(ROW_SPACING)
                 .align_y(Center);
             if unsaved && path_room >= self.path_least_width() {
-                let note = text(note).size(DETAIL_TEXT_SIZE).font(theme::SMALL);
+                let note = ui_text(note).size(theme::text_size(DETAIL_TEXT_SIZE)).font(theme::small_font());
                 path = path.push(note.color(theme::TEXT_DIM));
             }
             container(path).clip(true).into()
@@ -587,6 +593,7 @@ impl App {
             ("Add clips...".to_string(), Some(Message::AddRequested)),
             ("Reset panel layout".to_string(), Some(Message::DockReset)),
             ("Sound output...".to_string(), Some(Message::SoundOutputOpened)),
+            ("Appearance...".to_string(), Some(Message::AppearanceOpened)),
             ("About and licences".to_string(), Some(Message::AboutOpened)),
         ]
     }
@@ -604,8 +611,8 @@ impl App {
                 .width(Fill)
                 .height(Fill)
                 .into(),
-            _ if timeline.duration() == 0 => center(text("Add a clip to start")).into(),
-            _ => center(text("")).into(),
+            _ if timeline.duration() == 0 => center(ui_text("Add a clip to start")).into(),
+            _ => center(ui_text("")).into(),
         };
         let picture = container(picture)
             .width(Fill)
@@ -716,7 +723,7 @@ impl App {
         let playing = self.playback.is_some();
         let has_clips = timeline.duration() > 0;
         let play = if playing { Icon::Pause } else { Icon::Play };
-        let play_ink = if has_clips { theme::ON_ACCENT } else { theme::TEXT_DIM };
+        let play_ink = if has_clips { theme::on_accent() } else { theme::TEXT_DIM };
         let buttons = row![
             hint(
                 icon_button(Icon::Previous, theme::TEXT)
@@ -749,13 +756,13 @@ impl App {
         let length = format!(" / {}", timecode(timeline.duration(), timeline.rate()));
         let time: Element<'_, Message> = if text_width(&position) + text_width(&length) <= side {
             row![
-                text(position).color(theme::ACCENT).wrapping(text::Wrapping::None),
-                text(length).color(theme::TEXT_DIM).wrapping(text::Wrapping::None),
+                ui_text(position).color(theme::accent()).wrapping(text::Wrapping::None),
+                ui_text(length).color(theme::TEXT_DIM).wrapping(text::Wrapping::None),
             ]
             .into()
         } else {
             hint(
-                text(position.clone()).color(theme::ACCENT).wrapping(text::Wrapping::None),
+                ui_text(position.clone()).color(theme::accent()).wrapping(text::Wrapping::None),
                 format!("{position}{length}"),
             )
         };
@@ -824,7 +831,7 @@ impl App {
                 }
             }
         }
-        let import = button(labelled(Icon::Import, "Import", theme::ON_ACCENT))
+        let import = button(labelled(Icon::Import, "Import", theme::on_accent()))
             .style(theme::primary)
             .on_press(Message::AddRequested);
         let entries = media.into_iter().map(|(media, clips)| {
@@ -854,8 +861,8 @@ impl App {
             let entry = column![
                 one_line(name),
                 container(
-                    text(format!("{kind}{length}{used}"))
-                        .font(theme::SMALL)
+                    ui_text(format!("{kind}{length}{used}"))
+                        .font(theme::small_font())
                         .wrapping(text::Wrapping::None),
                 )
                 .clip(true)
@@ -902,7 +909,7 @@ impl App {
                 (tab.name(), tab == self.details_tab, Message::DetailsTabChosen(tab))
             }))
         } else {
-            let name = text("Details").size(TAB_TEXT_SIZE).font(theme::SMALL);
+            let name = ui_text("Details").size(theme::text_size(TAB_TEXT_SIZE)).font(theme::small_font());
             container(name.color(theme::TEXT_DIM))
                 .padding([0.0, PANEL_PADDING])
                 .height(TAB_HEIGHT)
@@ -930,8 +937,8 @@ impl App {
             (count, _) => {
                 let about = column![
                     section(format!("{count} clips selected")),
-                    text("Compound makes them one clip, which can be stepped inside.")
-                        .size(DETAIL_TEXT_SIZE).font(theme::SMALL)
+                    ui_text("Compound makes them one clip, which can be stepped inside.")
+                        .size(theme::text_size(DETAIL_TEXT_SIZE)).font(theme::small_font())
                         .color(theme::TEXT_DIM),
                     button(theme::display("Compound")).on_press(Message::CompoundOpened),
                 ]
@@ -998,7 +1005,7 @@ impl App {
             .on_release(Message::SpeedReleased);
         let presets = SPEED_PRESETS.map(|preset| {
             let lit = (clip.speed - preset).abs() < 1e-6;
-            button(text(format!("{preset}x")).size(DETAIL_TEXT_SIZE))
+            button(ui_text(format!("{preset}x")).size(theme::text_size(DETAIL_TEXT_SIZE)))
                 .padding([4, 8])
                 .style(if lit { theme::on } else { theme::quiet })
                 .on_press(Message::SpeedChosen(preset))
@@ -1009,21 +1016,21 @@ impl App {
         column![
             section("Speed".to_string()),
             row![
-                text("Speed")
-                    .size(DETAIL_TEXT_SIZE)
-                    .font(theme::SMALL)
+                ui_text("Speed")
+                    .size(theme::text_size(DETAIL_TEXT_SIZE))
+                    .font(theme::small_font())
                     .color(theme::TEXT_DIM)
                     .width(DETAIL_LABEL_WIDTH),
                 slider,
-                text(format!("{speed:.2}x"))
-                    .size(DETAIL_TEXT_SIZE)
+                ui_text(format!("{speed:.2}x"))
+                    .size(theme::text_size(DETAIL_TEXT_SIZE))
                     .width(TRANSFORM_VALUE_WIDTH),
             ]
             .spacing(8)
             .align_y(Center),
             Row::with_children(presets).spacing(4).wrap(),
             detail("Length", timecode(length, rate)),
-            text(about).size(DETAIL_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM),
+            ui_text(about).size(theme::text_size(DETAIL_TEXT_SIZE)).font(theme::small_font()).color(theme::TEXT_DIM),
         ]
         .spacing(8)
         .padding(PANEL_PADDING)
@@ -1032,14 +1039,14 @@ impl App {
 
     /// The Text tab: putting a text clip in at the playhead.
     fn text_list(&self) -> Element<'_, Message> {
-        let add = button(labelled(Icon::Text, "Add text", theme::ON_ACCENT))
+        let add = button(labelled(Icon::Text, "Add text", theme::on_accent()))
             .style(theme::primary)
             .on_press(Message::TextAdded);
         let about = "Puts words over the picture at the playhead. Select the text clip to \
             change its words, face, size and colour; place it with Transform.";
         column![
             add,
-            text(about).size(DETAIL_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM),
+            ui_text(about).size(theme::text_size(DETAIL_TEXT_SIZE)).font(theme::small_font()).color(theme::TEXT_DIM),
         ]
         .spacing(PANEL_PADDING)
         .padding(PANEL_PADDING)
@@ -1049,9 +1056,9 @@ impl App {
     /// The selected text clip's words and how they look.
     fn title_controls(&self, title: &Title) -> Element<'_, Message> {
         let label = |words: &'static str| {
-            text(words)
-                .size(DETAIL_TEXT_SIZE)
-                .font(theme::SMALL)
+            ui_text(words)
+                .size(theme::text_size(DETAIL_TEXT_SIZE))
+                .font(theme::small_font())
                 .color(theme::TEXT_DIM)
                 .width(DETAIL_LABEL_WIDTH)
         };
@@ -1059,15 +1066,16 @@ impl App {
         let words: Element<'_, Message> = match &self.title_editor {
             Some((_, content)) => text_editor(content)
                 .placeholder("Words")
+                .font(theme::body_font())
                 .on_action(Message::TitleEdited)
-                .size(DETAIL_TEXT_SIZE + 2.0)
+                .size(theme::text_size(DETAIL_TEXT_SIZE + 2.0))
                 .height(iced::Length::Shrink)
                 .into(),
-            None => text(title.text.clone()).into(),
+            None => ui_text(title.text.clone()).into(),
         };
         let faces = TitleFont::ALL.map(|font| {
             let lit = title.font == font;
-            button(text(font.name()).size(DETAIL_TEXT_SIZE))
+            button(ui_text(font.name()).size(theme::text_size(DETAIL_TEXT_SIZE)))
                 .padding([4, 8])
                 .style(if lit { theme::on } else { theme::quiet })
                 .on_press(Message::TitleFontChosen(font))
@@ -1109,8 +1117,8 @@ impl App {
             row![
                 label("Size"),
                 slider,
-                text(format!("{:.0}%", size * 100.0))
-                    .size(DETAIL_TEXT_SIZE)
+                ui_text(format!("{:.0}%", size * 100.0))
+                    .size(theme::text_size(DETAIL_TEXT_SIZE))
                     .width(TRANSFORM_VALUE_WIDTH),
             ]
             .spacing(8)
@@ -1132,7 +1140,7 @@ impl App {
             let lit = chosen.is_some_and(|way| way.kind == kind);
             let entry = row![
                 icon(Icon::Transitions, ENTRY_ICON_SIZE, theme::TEXT_DIM),
-                text(kind.name()),
+                ui_text(kind.name()),
             ]
             .spacing(BAR_PADDING)
             .align_y(Center);
@@ -1148,7 +1156,7 @@ impl App {
             "Select a clip, then pick how it comes in over the clip before it."
         };
         column![
-            text(about).size(DETAIL_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM),
+            ui_text(about).size(theme::text_size(DETAIL_TEXT_SIZE)).font(theme::small_font()).color(theme::TEXT_DIM),
             Column::with_children(entries).spacing(2),
         ]
         .spacing(PANEL_PADDING)
@@ -1162,7 +1170,7 @@ impl App {
         let Some(way) = clip.transition_in else {
             let none = "Cuts straight in. Pick a transition in the Transitions tab.";
             return rows
-                .push(text(none).size(DETAIL_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM))
+                .push(ui_text(none).size(theme::text_size(DETAIL_TEXT_SIZE)).font(theme::small_font()).color(theme::TEXT_DIM))
                 .into();
         };
         let rate = self.history.timeline().rate().as_f64() as f32;
@@ -1173,17 +1181,17 @@ impl App {
         let slider = iced::widget::slider(range, seconds, Message::TransitionLengthChanged)
         .step(1.0 / rate)
         .on_release(Message::TransitionLengthReleased);
-        rows = rows.push(text(way.kind.name()));
+        rows = rows.push(ui_text(way.kind.name()));
         rows = rows.push(
             row![
-                text("Length")
-                    .size(DETAIL_TEXT_SIZE)
-                    .font(theme::SMALL)
+                ui_text("Length")
+                    .size(theme::text_size(DETAIL_TEXT_SIZE))
+                    .font(theme::small_font())
                     .color(theme::TEXT_DIM)
                     .width(DETAIL_LABEL_WIDTH),
                 slider,
-                text(format!("{seconds:.2} s"))
-                    .size(DETAIL_TEXT_SIZE)
+                ui_text(format!("{seconds:.2} s"))
+                    .size(theme::text_size(DETAIL_TEXT_SIZE))
                     .width(TRANSFORM_VALUE_WIDTH),
             ]
             .spacing(8)
@@ -1293,9 +1301,9 @@ impl App {
             ]
             .spacing(4)
             .align_y(Center),
-            text(about)
-                .size(DETAIL_TEXT_SIZE)
-                .font(theme::SMALL)
+            ui_text(about)
+                .size(theme::text_size(DETAIL_TEXT_SIZE))
+                .font(theme::small_font())
                 .color(theme::TEXT_DIM),
         ]
         .spacing(6);
@@ -1350,8 +1358,8 @@ impl App {
             detail("Frame rate", format!("{fps} fps")),
             detail("Length", timecode(timeline.duration(), rate)),
             detail("Tracks", timeline.tracks().len().to_string()),
-            text("Select a clip to see its details.")
-                .size(DETAIL_TEXT_SIZE).font(theme::SMALL)
+            ui_text("Select a clip to see its details.")
+                .size(theme::text_size(DETAIL_TEXT_SIZE)).font(theme::small_font())
                 .color(theme::TEXT_DIM),
         ]
         .spacing(8)
@@ -1394,14 +1402,14 @@ impl App {
     /// Along the bottom: what went wrong, if anything, and the readouts.
     fn status_line(&self) -> Element<'_, Message> {
         let notice = self.notice.clone().map(|notice| {
-            text(notice)
-                .size(STATUS_TEXT_SIZE).font(theme::SMALL)
+            ui_text(notice)
+                .size(theme::text_size(STATUS_TEXT_SIZE)).font(theme::small_font())
                 .color(theme::DANGER)
                 .wrapping(text::Wrapping::None)
         });
         let readout = container(
-            text(self.readout())
-                .size(STATUS_TEXT_SIZE).font(theme::SMALL)
+            ui_text(self.readout())
+                .size(theme::text_size(STATUS_TEXT_SIZE)).font(theme::small_font())
                 .color(theme::TEXT_DIM)
                 .wrapping(text::Wrapping::None),
         )
@@ -1481,13 +1489,13 @@ fn transform_row<'a>(
     .step(step)
     .on_release(Message::TransformReleased);
     row![
-        text(label)
-            .size(DETAIL_TEXT_SIZE)
-            .font(theme::SMALL)
+        ui_text(label)
+            .size(theme::text_size(DETAIL_TEXT_SIZE))
+            .font(theme::small_font())
             .color(theme::TEXT_DIM)
             .width(DETAIL_LABEL_WIDTH),
         slider,
-        text(shown).size(DETAIL_TEXT_SIZE).width(TRANSFORM_VALUE_WIDTH),
+        ui_text(shown).size(theme::text_size(DETAIL_TEXT_SIZE)).width(TRANSFORM_VALUE_WIDTH),
     ]
     .spacing(8)
     .align_y(Center)
@@ -1499,7 +1507,7 @@ fn tab_row<'a, const N: usize>(
     tabs: [(&'static str, bool, Message); N],
 ) -> Element<'a, Message> {
     let tabs = tabs.into_iter().map(|(words, chosen, choose)| {
-        button(text(words).size(TAB_TEXT_SIZE).font(theme::SMALL))
+        button(ui_text(words).size(theme::text_size(TAB_TEXT_SIZE)).font(theme::small_font()))
             .padding([6, 8])
             .style(theme::tab(chosen))
             .on_press(choose)
@@ -1514,14 +1522,14 @@ fn tab_row<'a, const N: usize>(
 
 /// A panel's word on what is not built yet.
 fn coming<'a>(words: &'a str) -> Element<'a, Message> {
-    container(text(words).size(DETAIL_TEXT_SIZE).font(theme::SMALL).color(theme::TEXT_DIM))
+    container(ui_text(words).size(theme::text_size(DETAIL_TEXT_SIZE)).font(theme::small_font()).color(theme::TEXT_DIM))
         .padding(PANEL_PADDING)
         .into()
 }
 
 /// A heading in a panel.
 fn section<'a>(words: String) -> Element<'a, Message> {
-    container(text(words).size(SECTION_TEXT_SIZE).wrapping(text::Wrapping::None))
+    container(ui_text(words).size(theme::text_size(SECTION_TEXT_SIZE)).wrapping(text::Wrapping::None))
         .clip(true)
         .into()
 }
@@ -1529,8 +1537,8 @@ fn section<'a>(words: String) -> Element<'a, Message> {
 /// A line of the details panel: what, and its value.
 fn detail<'a>(label: &'a str, value: String) -> Element<'a, Message> {
     row![
-        text(label)
-            .size(DETAIL_TEXT_SIZE).font(theme::SMALL)
+        ui_text(label)
+            .size(theme::text_size(DETAIL_TEXT_SIZE)).font(theme::small_font())
             .color(theme::TEXT_DIM)
             .width(DETAIL_LABEL_WIDTH),
         one_line(value),
@@ -1596,13 +1604,13 @@ fn icon_tab_row<'a, const N: usize>(
         + 2.0 * 4.0;
     let named = named_width <= width;
     let tabs = tabs.into_iter().map(|(which, words, chosen, choose)| {
-        let ink = if chosen { theme::ACCENT } else { theme::TEXT };
+        let ink = if chosen { theme::accent() } else { theme::TEXT };
         let face: Element<'a, Message> = if named {
             column![
                 icon(which, ICON_TAB_ICON_SIZE, ink),
-                text(words)
-                    .size(ICON_TAB_TEXT_SIZE)
-                    .font(theme::SMALL)
+                ui_text(words)
+                    .size(theme::text_size(ICON_TAB_TEXT_SIZE))
+                    .font(theme::small_font())
                     .wrapping(text::Wrapping::None),
             ]
             .spacing(2)

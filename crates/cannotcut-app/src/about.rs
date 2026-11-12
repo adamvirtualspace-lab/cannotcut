@@ -28,24 +28,36 @@ struct Credit {
     text: &'static str,
 }
 
-const CREDITS: [Credit; 7] = [
+const CREDITS: [Credit; 9] = [
     Credit {
         name: "Anton SC",
-        does: "Words on buttons and dialog titles; its small capitals made the default letters",
+        does: "Condensed fonts: words on buttons and dialog titles; its small capitals made the \n               default letters",
         licence: "SIL Open Font License 1.1",
         text: include_str!("../fonts/AntonSC-OFL.txt"),
     },
     Credit {
         name: "Antonio",
-        does: "Small words: notes, hints, readouts",
+        does: "Condensed fonts: small words, as notes, hints, readouts",
         licence: "SIL Open Font License 1.1",
         text: include_str!("../fonts/Antonio-OFL.txt"),
     },
     Credit {
         name: "Oswald",
-        does: "Every other word",
+        does: "Condensed fonts: every other word",
         licence: "SIL Open Font License 1.1",
         text: include_str!("../fonts/Oswald-OFL.txt"),
+    },
+    Credit {
+        name: "Inter",
+        does: "The words, when Inter is chosen under Appearance",
+        licence: "SIL Open Font License 1.1",
+        text: include_str!("../fonts/Inter-OFL.txt"),
+    },
+    Credit {
+        name: "Roboto",
+        does: "The words, when Roboto is chosen under Appearance",
+        licence: "SIL Open Font License 1.1",
+        text: include_str!("../fonts/Roboto-OFL.txt"),
     },
     Credit {
         name: "Tabler Icons",
@@ -86,7 +98,7 @@ impl App {
             AboutPage::List => {
                 let entries = CREDITS.iter().enumerate().map(|(index, credit)| {
                     let about = format!("{}. {}", credit.licence, credit.does);
-                    let about = text(about).size(STATUS_TEXT_SIZE).font(theme::SMALL);
+                    let about = ui_text(about).size(theme::text_size(STATUS_TEXT_SIZE)).font(theme::small_font());
                     button(column![theme::display(credit.name), about].spacing(2))
                         .width(Fill)
                         .padding([8, 12])
@@ -98,8 +110,8 @@ impl App {
                 let intro = "Built with the work of others, under these licences. Tap one \
                              to read it in full.";
                 let list = column![
-                    text(version).font(theme::SMALL).color(theme::TEXT_DIM),
-                    text(intro).font(theme::SMALL),
+                    ui_text(version).font(theme::small_font()).color(theme::TEXT_DIM),
+                    ui_text(intro).font(theme::small_font()),
                     Column::with_children(entries).spacing(8),
                 ]
                 .spacing(12);
@@ -111,10 +123,10 @@ impl App {
                     .style(theme::normal)
                     .on_press(Message::AboutShown(AboutPage::List));
                 let body = column![
-                    text(format!("{}: {}", credit.licence, credit.does))
-                        .font(theme::SMALL)
+                    ui_text(format!("{}: {}", credit.licence, credit.does))
+                        .font(theme::small_font())
                         .color(theme::TEXT_DIM),
-                    text(credit.text).size(LICENCE_TEXT_SIZE),
+                    ui_text(credit.text).size(theme::text_size(LICENCE_TEXT_SIZE)),
                 ]
                 .spacing(12);
                 (credit.name.to_string(), body, row![back, close].spacing(12))
@@ -128,7 +140,7 @@ impl App {
         .id(ABOUT_SCROLL)
         .height(Fill);
         let card = column![
-            text(title).size(DIALOG_TITLE_SIZE).font(theme::DISPLAY),
+            ui_text(title).size(theme::text_size(DIALOG_TITLE_SIZE)).font(theme::display_font()),
             body,
             buttons,
         ]

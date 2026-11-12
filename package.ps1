@@ -55,8 +55,8 @@ the app: Menu > About and licences):
 
 - FFmpeg (the av*.dll and sw*.dll files): GNU LGPL 3.0, see FFmpeg-LGPL-3.0.txt and
   GPL-3.0.txt. Its source is at https://ffmpeg.org.
-- The fonts Anton SC (changed so that its small capitals show), Antonio and Oswald: SIL Open
-  Font License 1.1, see the *-OFL.txt files.
+- The fonts Anton SC (changed so that its small capitals show), Antonio, Oswald, Inter and
+  Roboto: SIL Open Font License 1.1, see the *-OFL.txt files.
 - Tabler Icons: MIT, see TablerIcons-MIT.txt.
 - The Rust libraries it is made of: see rust-libraries.txt.
 "@ | Set-Content -Path (Join-Path $out "README.txt") -Encoding utf8

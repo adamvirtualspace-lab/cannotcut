@@ -12,7 +12,7 @@ pub const BUTTON_PADDING: f32 = 20.0;
 /// What words in the UI's 16-pixel text take, in logical pixels: per letter, as measured on
 /// Windows' Segoe UI, a little over.
 pub fn text_width(words: &str) -> f32 {
-    words.chars().map(letter_width).sum()
+    words.chars().map(letter_width).sum::<f32>() * crate::theme::width_factor()
 }
 
 /// A button with these words on it.

@@ -1040,7 +1040,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                     renderer::Quad {
                         bounds: area,
                         border: Border {
-                            color: crate::theme::ACCENT,
+                            color: crate::theme::accent(),
                             width: 1.0,
                             radius: 0.0.into(),
                         },
@@ -1048,7 +1048,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for TimelinePanel<'_, Messa
                     },
                     Color {
                         a: 0.15,
-                        ..crate::theme::ACCENT
+                        ..crate::theme::accent()
                     },
                 );
             }
@@ -1128,10 +1128,10 @@ fn fill_label(
 ) {
     let label = text::Text {
         content,
-        bounds: Size::new(f32::INFINITY, LABEL_SIZE * 2.0),
-        size: Pixels(LABEL_SIZE),
+        bounds: Size::new(f32::INFINITY, crate::theme::text_size(LABEL_SIZE) * 2.0),
+        size: Pixels(crate::theme::text_size(LABEL_SIZE)),
         line_height: text::LineHeight::default(),
-        font: renderer.default_font(),
+        font: crate::theme::body_font(),
         align_x: text::Alignment::Left,
         align_y: alignment::Vertical::Center,
         shaping,

@@ -67,7 +67,11 @@
 - Fits small screens down to 640p: side panels slide out over the viewer instead of crowding it
 - Full-screen viewer (<kbd>F11</kbd> on a popped-out viewer)
 - Pick the sound output, with a per-output delay you can set by eye or measure with the microphone
-- Live readouts of decode latency, layers and memory along the bottom
+- Choose the accent colour (eight to pick from, or any as `#rrggbb`), the fonts (Condensed,
+  Segoe UI, Inter or Roboto), the size of everything (80% to 150%) and the text size (90% to
+  125%) under *Menu → Appearance*
+- Live readouts of decode latency, layers, how smoothly the window is drawn (UI fps) and memory
+  along the bottom
 
 **Coming:** colour and filters (the Effects tab).
 
@@ -167,10 +171,15 @@ cannotcut [project.otio] [media files…] [options]
 | *media files* | Adds them to the end of the main track |
 | `--add=<file>` | Adds a file as a clip; for a project, puts it in as a nested clip instead of opening it |
 | `--at=<frame>` | Starts with the playhead on that frame |
+| `--play` | Starts playing as soon as the project is open |
 | `--export=<film.mp4>` | Exports the project as soon as it is open, without asking where |
 | `--no-sound` | Plays without the sound card, following the system clock |
 | `--sound-delay=<ms>` | How much later the sound is heard than the sound card says |
 | `--cpu-viewer` | Uses the CPU viewer instead of the GPU shader |
+
+Set `CANNOTCUT_FRAME_LOG` to a file name to log every frame the window draws: milliseconds since
+the frame before, how long building the widgets took, and how long laying them out and drawing
+them took. Useful for finding what makes a frame late.
 
 ## How it is put together
 
@@ -190,7 +199,7 @@ It is built on the work of others, and ships their licences with it (also readab
 app under *Menu → About and licences*):
 
 - **FFmpeg**: GNU LGPL 3.0, as shared DLLs beside the program; source at [ffmpeg.org](https://ffmpeg.org)
-- **Fonts** Anton SC, Antonio and Oswald: SIL Open Font License 1.1
+- **Fonts** Anton SC, Antonio, Oswald, Inter and Roboto: SIL Open Font License 1.1
 - **Icons**: [Tabler Icons](https://tabler.io/icons), MIT
 - **Rust libraries**: listed with their licences in
   [`rust-libraries.txt`](crates/cannotcut-app/licences/rust-libraries.txt)
