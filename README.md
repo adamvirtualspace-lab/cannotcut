@@ -10,7 +10,7 @@
   <img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024_edition-e43717?logo=rust">
   <img alt="FFmpeg 8.1 LGPL" src="https://img.shields.io/badge/FFmpeg-8.1_LGPL-007808?logo=ffmpeg">
   <img alt="Project files: OpenTimelineIO" src="https://img.shields.io/badge/projects-OpenTimelineIO-2b6cb0">
-  <a href="#licences"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue"></a>
+  <a href="#licences"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
 </p>
 
 <p align="center">
@@ -181,14 +181,7 @@ cannotcut [project.otio] [media files…] [options]
 
 ## Licences
 
-cannotcut is licensed under either of
-
-- [Apache License, Version 2.0](LICENSE-APACHE)
-- [MIT license](LICENSE-MIT)
-
-at your option. Unless you explicitly state otherwise, any contribution you intentionally submit
-for inclusion in cannotcut, as defined in the Apache-2.0 license, is dual licensed as above,
-without any additional terms or conditions.
+cannotcut is released under the [MIT license](LICENSE).
 
 It is built on the work of others, and ships their licences with it (also readable in the
 app under *Menu → About and licences*):
