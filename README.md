@@ -62,6 +62,8 @@
 **Workspace**
 - Dockable panels: drag any panel by its title bar to rearrange the layout, or pop it out into a
   window of its own, which reopens where you left it
+- Hide either side panel with the button at its end of the top bar (<kbd>Ctrl</kbd>+<kbd>[</kbd> /
+  <kbd>Ctrl</kbd>+<kbd>]</kbd>) to give the viewer the room; it comes back where it was
 - Fits small screens down to 640p: side panels slide out over the viewer instead of crowding it
 - Full-screen viewer (<kbd>F11</kbd> on a popped-out viewer)
 - Pick the sound output, with a per-output delay you can set by eye or measure with the microphone
@@ -82,6 +84,7 @@
 | <kbd>Ctrl</kbd>+<kbd>Y</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | Redo |
 | <kbd>Ctrl</kbd>+<kbd>N</kbd> / <kbd>O</kbd> / <kbd>S</kbd> | New / open / save project |
 | <kbd>Ctrl</kbd>+wheel | Zoom the timeline |
+| <kbd>Ctrl</kbd>+<kbd>[</kbd> / <kbd>]</kbd> | Hide or show the media / details panel |
 | <kbd>F11</kbd> | Full-screen viewer (when popped out) |
 | <kbd>Esc</kbd> | Close a dialog, leave full screen, or step out of a nested project |
 

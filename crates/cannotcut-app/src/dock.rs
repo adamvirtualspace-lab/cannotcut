@@ -358,6 +358,30 @@ mod tests {
     }
 
     #[test]
+    fn both_side_panels_hidden_keep_the_arrangement_as_it_was() {
+        let starting_value = kept(&starting());
+        let mut dock = starting();
+        let media = take_out(&mut dock, Part::Media).expect("there are other panels");
+        let details = take_out(&mut dock, Part::Details).expect("there are other panels");
+        // The viewer over the timeline, with the room of both.
+        assert_eq!(dock.len(), 2);
+        // Kept as the app keeps it: the last taken out goes back first.
+        let hidden = [(Part::Details, &details), (Part::Media, &media)];
+        assert_eq!(to_value(&dock, hidden), starting_value);
+        // The media panel shown first, as the app does it: the details panel, hidden after it,
+        // comes back for the while, so the media panel finds its neighbours, and goes again.
+        put_back(&mut dock, Part::Details, &details);
+        put_back(&mut dock, Part::Media, &media);
+        let details = take_out(&mut dock, Part::Details).expect("there are other panels");
+        let value = kept(&dock);
+        assert_eq!(value["split"], "rows");
+        assert_eq!(value["a"]["a"], "media");
+        assert_eq!(value["a"]["b"], "viewer");
+        put_back(&mut dock, Part::Details, &details);
+        assert_eq!(kept(&dock), starting_value);
+    }
+
+    #[test]
     fn the_last_panel_cannot_be_taken_out() {
         let mut dock = from_value(&json!({
             "split": "rows", "ratio": 0.5,

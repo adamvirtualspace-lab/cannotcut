@@ -386,6 +386,12 @@ enum Message {
     /// Slide a side panel out over the viewer, or put it away.
     DrawerToggled(Side),
     DrawerClosed,
+    /// A docked side panel hidden from a wide window, or shown again where it was.
+    SideHidden(Side),
+    /// A side panel's key pressed: hidden or shown in a wide window, slid out in a narrow one.
+    SideKey(Side),
+    /// The main window's size, asked for when a side panel's key was pressed.
+    SideKeyAt(Side, Size),
     /// A divider between panels taken hold of, to drag.
     DividerPressed(Divider),
     /// The window's size, asked for when a divider is taken hold of.
@@ -798,6 +804,9 @@ struct App {
     main_window: window::Id,
     /// Panels in windows of their own.
     away: Vec<Away>,
+    /// Side panels hidden from the dock by their buttons in the top bar, and where each goes
+    /// back to; in the order they were hidden.
+    hidden: Vec<(Side, dock::Back)>,
     /// How the panels are docked in a wide window.
     dock: pane_grid::State<Part>,
     /// A gap between docked panels is being dragged.
@@ -997,6 +1006,7 @@ impl App {
             // Until the window is opened, at the end of the start.
             main_window: window::Id::unique(),
             away: Vec::new(),
+            hidden: Vec::new(),
             dock: dock::starting(),
             dock_resizing: false,
             layout_moved: false,
@@ -1048,6 +1058,11 @@ impl App {
         let (main_window, opened) = window::open(main_window_settings());
         app.main_window = main_window;
         let away = app.reopen_away(layout.away.as_ref());
+        for side in [Side::Media, Side::Details] {
+            if layout.hidden.iter().any(|key| key == side.part().key()) {
+                app.hide_side(side);
+            }
+        }
         let mut task = Task::batch([opened.then(title_bar::dress), away, app.add_next()]);
         if let Some(film) = export {
             task = Task::batch([task, app.export(film)]);
@@ -2071,6 +2086,26 @@ impl App {
                 self.drawer = (self.drawer != Some(side)).then_some(side);
             }
             Message::DrawerClosed => self.drawer = None,
+            Message::SideHidden(side) => {
+                if !self.show_side(side) {
+                    self.hide_side(side);
+                }
+                self.keep_layout();
+            }
+            Message::SideKey(side) => {
+                return window::size(self.main_window)
+                    .map(move |size| Message::SideKeyAt(side, size));
+            }
+            Message::SideKeyAt(side, size) => {
+                if self.is_away(side.part()) {
+                    return Task::none();
+                }
+                return self.update(if size.width >= panels::DOCKED_WIDTH {
+                    Message::SideHidden(side)
+                } else {
+                    Message::DrawerToggled(side)
+                });
+            }
             Message::DividerPressed(divider) => {
                 self.dividing = Some(divider);
                 self.dividing_window = None;
@@ -2118,6 +2153,7 @@ impl App {
                 let closing: Vec<Task<Message>> =
                     self.away.drain(..).map(|away| window::close(away.window)).collect();
                 self.scale_factor = None;
+                self.hidden.clear();
                 self.dock = dock::starting();
                 self.keep_layout();
                 return Task::batch(closing);
@@ -2751,6 +2787,8 @@ impl App {
                     _ if letter("s") => Some(Message::SaveRequested),
                     _ if letter("o") => Some(Message::OpenRequested),
                     _ if letter("n") => Some(Message::NewRequested),
+                    _ if letter("[") => Some(Message::SideKey(Side::Media)),
+                    _ if letter("]") => Some(Message::SideKey(Side::Details)),
                     _ => None,
                 };
                 if let Some(message) = meant {
@@ -3666,6 +3704,40 @@ impl App {
         }
     }
 
+    /// Whether `side` is hidden from the dock by its button in the top bar.
+    fn is_hidden(&self, side: Side) -> bool {
+        self.hidden.iter().any(|(hidden, _)| *hidden == side)
+    }
+
+    /// Takes `side` out of the dock, the panels beside it taking its room, unless it is in a
+    /// window of its own or hidden already.
+    fn hide_side(&mut self, side: Side) {
+        if self.is_away(side.part()) || self.is_hidden(side) {
+            return;
+        }
+        if let Some(back) = dock::take_out(&mut self.dock, side.part()) {
+            self.hidden.push((side, back));
+        }
+    }
+
+    /// Puts `side` back in the dock where it was hidden from; whether it was hidden. Those
+    /// hidden after it come back first, so that what was beside it is as it was, and go again.
+    fn show_side(&mut self, side: Side) -> bool {
+        let Some(index) = self.hidden.iter().position(|(hidden, _)| *hidden == side) else {
+            return false;
+        };
+        let later: Vec<(Side, dock::Back)> = self.hidden.drain(index + 1..).collect();
+        for (later_side, back) in later.iter().rev() {
+            dock::put_back(&mut self.dock, later_side.part(), back);
+        }
+        let (_, back) = self.hidden.remove(index);
+        dock::put_back(&mut self.dock, side.part(), &back);
+        for (later_side, _) in later {
+            self.hide_side(later_side);
+        }
+        true
+    }
+
     /// Whether `part` is in a window of its own.
     fn is_away(&self, part: Part) -> bool {
         self.away.iter().any(|away| away.part == part)
@@ -3754,9 +3826,11 @@ impl App {
             media_width: Some(self.media_width),
             details_width: Some(self.details_width),
             timeline_share: self.timeline_share,
+            // As if every panel were docked: the last taken out goes back first.
             dock: Some(dock::to_value(
                 &self.dock,
-                self.away.iter().map(|away| (away.part, &away.back)),
+                (self.hidden.iter().rev().map(|(side, back)| (side.part(), back)))
+                    .chain(self.away.iter().rev().map(|away| (away.part, &away.back))),
             )),
             away: Some(serde_json::Value::Array(
                 self.away
@@ -3770,6 +3844,9 @@ impl App {
                     })
                     .collect(),
             )),
+            hidden: (self.hidden.iter())
+                .map(|(side, _)| side.part().key().to_string())
+                .collect(),
         };
         self.settings.save_layout();
     }

@@ -18,6 +18,7 @@ const DETAILS_WIDTH: &str = "details_width";
 const TIMELINE_SHARE: &str = "timeline_share";
 const DOCK: &str = "dock";
 const AWAY: &str = "away";
+const HIDDEN: &str = "hidden";
 
 /// How the panels were sized and arranged; none where they were left as they start.
 #[derive(Clone, Default)]
@@ -32,6 +33,9 @@ pub struct Layout {
     /// The panels in windows of their own, and where those windows were: a list of
     /// `{"part", "placement", "full_screen"}`.
     pub away: Option<Value>,
+    /// The side panels hidden from a wide window by their buttons in the top bar, by their
+    /// keys: `["media"]`, say.
+    pub hidden: Vec<String>,
 }
 
 #[derive(Default)]
@@ -84,6 +88,11 @@ impl Settings {
                 timeline_share: size(TIMELINE_SHARE).filter(|share| *share < 1.0),
                 dock: layout.get(DOCK).cloned(),
                 away: layout.get(AWAY).cloned(),
+                hidden: layout
+                    .get(HIDDEN)
+                    .and_then(Value::as_array)
+                    .map(|keys| keys.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_default(),
             };
         }
         settings
@@ -131,6 +140,9 @@ impl Settings {
         }
         if let Some(away) = &self.layout.away {
             layout.insert(AWAY.to_string(), away.clone());
+        }
+        if !self.layout.hidden.is_empty() {
+            layout.insert(HIDDEN.to_string(), json!(self.layout.hidden));
         }
         save(LAYOUT, Value::Object(layout));
     }

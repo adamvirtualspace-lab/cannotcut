@@ -3,8 +3,9 @@
 //! along the bottom under its tools. In a wide window the panels are docked (see `dock`): each
 //! can be taken up by its title bar and dropped beside or in place of another, and the gaps
 //! between them dragged to share the room differently. In a narrow window the side panels slide
-//! out over the viewer instead, from buttons in the top bar, and the gap over the timeline can
-//! be dragged; double-clicking it puts it back.
+//! out over the viewer instead, and the gap over the timeline can be dragged; double-clicking it
+//! puts it back. Either way a button at each end of the top bar, on the side its panel is on,
+//! hides or shows that panel: in a wide window the panels beside it take its room meanwhile.
 
 use std::cell::Cell;
 
@@ -40,7 +41,7 @@ const DIVIDER_REACH: f32 = 4.0;
 /// The line drawn in a divider the pointer is over, or that is being dragged.
 const DIVIDER_LINE: f32 = 2.0;
 /// Narrower than this, the side panels slide out instead of being docked.
-const DOCKED_WIDTH: f32 = 1000.0;
+pub(crate) const DOCKED_WIDTH: f32 = 1000.0;
 /// The bar of tools above the tracks.
 const TOOLS_HEIGHT: f32 = 40.0;
 const VIEWER_TITLE_HEIGHT: f32 = 30.0;
@@ -82,7 +83,7 @@ pub(crate) enum Side {
 }
 
 impl Side {
-    fn part(self) -> Part {
+    pub(crate) fn part(self) -> Part {
         match self {
             Self::Media => Part::Media,
             Self::Details => Part::Details,
@@ -517,8 +518,33 @@ impl App {
         row![self.track_headers(height), panel].into()
     }
 
-    /// The bar along the top, fitted to `room`: the menu, where the project is, the side
-    /// panels' buttons while they slide out, and Export.
+    /// The button that hides or shows a side panel, at the end of the top bar on its side:
+    /// none while the panel is in a window of its own.
+    fn side_toggle(&self, side: Side, docked: bool) -> Option<Control<'_, Message>> {
+        if self.is_away(side.part()) {
+            return None;
+        }
+        let (which, name, key) = match side {
+            Side::Media => (Icon::Media, "media", "Ctrl+["),
+            Side::Details => (Icon::Details, "details", "Ctrl+]"),
+        };
+        // Slid out over the viewer, it shows as on, as the panel covers part of it.
+        let slid_out = !docked && self.drawer == Some(side);
+        let shown = if docked { !self.is_hidden(side) } else { slid_out };
+        let ink = if slid_out { theme::ON_ACCENT } else { theme::TEXT };
+        let toggle = icon_button(which, ink)
+            .style(if slid_out { theme::on } else { theme::quiet })
+            .on_press(if docked {
+                Message::SideHidden(side)
+            } else {
+                Message::DrawerToggled(side)
+            });
+        let words = format!("{} {name} panel  {key}", if shown { "Hide" } else { "Show" });
+        Some(Control::new(hint_below(toggle, words), ICON_BUTTON_WIDTH))
+    }
+
+    /// The bar along the top, fitted to `room`: the media panel's button, the menu, where the
+    /// project is, Export, and the details panel's button.
     fn top_bar(&self, room: f32, docked: bool) -> Fitted<'_, Message> {
         let open = self.more == Some(Bar::Menu);
         let ink = if open { theme::ON_ACCENT } else { theme::ON_BUTTON };
@@ -529,7 +555,8 @@ impl App {
             } else {
                 Message::MoreOpened(Bar::Menu)
             });
-        let mut controls = vec![Control::new(menu, labelled_width(MENU_LABEL))];
+        let mut controls: Vec<_> = self.side_toggle(Side::Media, docked).into_iter().collect();
+        controls.push(Control::new(menu, labelled_width(MENU_LABEL)));
         // Whatever room the rest leave: the path, and whether there is anything to save.
         let path = responsive(|room| {
             let unsaved = !self.unsaved().is_empty();
@@ -546,23 +573,8 @@ impl App {
         })
         .height(iced::Length::Shrink);
         controls.push(Control::new(path, self.path_least_width()));
-        if !docked {
-            for (side, which, words) in [
-                (Side::Media, Icon::Media, "Media"),
-                (Side::Details, Icon::Details, "Details"),
-            ] {
-                if self.is_away(side.part()) {
-                    continue;
-                }
-                let open = self.drawer == Some(side);
-                let ink = if open { theme::ON_ACCENT } else { theme::TEXT };
-                let toggle = icon_button(which, ink)
-                    .style(if open { theme::on } else { theme::quiet })
-                    .on_press(Message::DrawerToggled(side));
-                controls.push(Control::new(hint_below(toggle, words), ICON_BUTTON_WIDTH));
-            }
-        }
         controls.push(self.export_control());
+        controls.extend(self.side_toggle(Side::Details, docked));
         fit(controls, room, ROW_SPACING, nothing(), 0.0, 0)
     }
 
