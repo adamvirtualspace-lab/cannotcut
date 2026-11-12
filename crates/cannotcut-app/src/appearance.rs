@@ -17,6 +17,8 @@ const FONT_ABOUT_SIZE: f32 = 13.0;
 const SECTION_SIZE: f32 = 14.0;
 /// The words on the buttons for sizes.
 const STEP_TEXT_SIZE: f32 = 14.0;
+/// Wider than other dialogs, for the fonts two by two.
+const CARD_WIDTH: f32 = 460.0;
 /// The room the card leaves around itself in a small window.
 const CARD_MARGIN: f32 = 16.0;
 
@@ -74,7 +76,7 @@ impl App {
         .spacing(10);
 
         // Each shown in its own fonts, so it can be judged before it is chosen.
-        let fonts = UiFont::ALL.map(|font| {
+        let mut fonts = UiFont::ALL.map(|font| {
             let lit = font == look.font;
             let about = ui_text(font.about())
                 .size(theme::text_size(FONT_ABOUT_SIZE))
@@ -85,14 +87,36 @@ impl App {
                 .style(if lit { theme::on } else { theme::normal })
                 .on_press(Message::UiFontChosen(font))
                 .into()
-        });
-        let fonts = column![section("Font"), Column::with_children(fonts).spacing(8)].spacing(10);
+        })
+        .into_iter()
+        .map(|font: Element<'_, Message>| font);
+        // Two by two, so the card fits a short window.
+        let mut grid = Column::new().spacing(8);
+        while let Some(first) = fonts.next() {
+            let mut pair = Row::new().spacing(8).push(first);
+            if let Some(second) = fonts.next() {
+                pair = pair.push(second);
+            }
+            grid = grid.push(pair);
+        }
+        let fonts = column![section("Font"), grid].spacing(10);
 
         let sizes = column![
             section("Size of everything"),
             steps(&theme::UI_SCALES, look.ui_scale, Message::UiScaleChosen),
             section("Text size"),
             steps(&theme::TEXT_SCALES, look.text_scale, Message::TextScaleChosen),
+            section("Motion"),
+            row![
+                switch("On", look.motion, Message::MotionChosen(true)),
+                switch("Off", !look.motion, Message::MotionChosen(false)),
+                ui_text("Clicks splash; panels, menus and dialogs ease in and out")
+                    .size(theme::text_size(STATUS_TEXT_SIZE))
+                    .font(theme::small_font())
+                    .color(theme::TEXT_DIM),
+            ]
+            .spacing(6)
+            .align_y(Center),
         ]
         .spacing(10);
 
@@ -120,7 +144,7 @@ impl App {
         .spacing(16);
         container(card)
             .padding(20)
-            .width(DIALOG_WIDTH)
+            .width(CARD_WIDTH)
             .max_height((window.height - 2.0 * CARD_MARGIN).max(0.0))
             .style(theme::card)
             .into()
@@ -142,6 +166,15 @@ fn steps<'a>(
             .into()
     });
     Row::with_children(buttons).spacing(6).into()
+}
+
+/// A button for one of two ways, lit up while it is the one in use.
+fn switch<'a>(words: &'a str, lit: bool, pick: Message) -> Element<'a, Message> {
+    button(ui_text(words).size(theme::text_size(STEP_TEXT_SIZE)))
+        .padding([4, 10])
+        .style(if lit { theme::on } else { theme::normal })
+        .on_press(pick)
+        .into()
 }
 
 /// Whether two colours are the same to the eye: as stored, to the byte.

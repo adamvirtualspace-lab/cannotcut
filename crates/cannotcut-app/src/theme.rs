@@ -17,7 +17,7 @@ use std::sync::RwLock;
 
 use iced::gradient::Linear;
 use iced::theme::Palette;
-use iced::widget::button::{self, Button};
+use iced::widget::button::{self};
 use iced::widget::text::{IntoFragment, Text};
 use iced::widget::{container, pane_grid, text};
 use iced::font::Weight;
@@ -134,7 +134,7 @@ impl UiFont {
     /// What it is, under its name.
     pub fn about(self) -> &'static str {
         match self {
-            Self::Condensed => "Oswald, Antonio and Anton SC: narrow, fits the most in",
+            Self::Condensed => "Narrow: fits the most in",
             Self::SegoeUi => "Windows' own",
             Self::Inter => "Clear at small sizes",
             Self::Roboto => "Android's own",
@@ -196,6 +196,8 @@ pub struct Look {
     pub ui_scale: f32,
     /// How large words are drawn, on top of `ui_scale`.
     pub text_scale: f32,
+    /// Whether things move (see `motion`), or arrive at once.
+    pub motion: bool,
 }
 
 impl Look {
@@ -204,6 +206,7 @@ impl Look {
         font: UiFont::Condensed,
         ui_scale: 1.0,
         text_scale: 1.0,
+        motion: true,
     };
 }
 
@@ -412,9 +415,11 @@ fn shaded(face: Color, ink: Color, status: button::Status) -> button::Style {
     }
 }
 
-/// A button, ordinary until given another style.
-pub fn button<'a, Message>(content: impl Into<Element<'a, Message>>) -> Button<'a, Message> {
-    iced::widget::button(content).style(normal)
+/// A button, ordinary until given another style. It eases into its looks (see `motion`).
+pub fn button<'a, Message>(
+    content: impl Into<Element<'a, Message>>,
+) -> crate::motion::Button<'a, Message> {
+    crate::motion::Button::new(content)
 }
 
 /// An ordinary button.

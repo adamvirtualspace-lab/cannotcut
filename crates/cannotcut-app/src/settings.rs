@@ -100,6 +100,9 @@ impl Settings {
             if let Some(text_scale) = scale("text_scale", &theme::TEXT_SCALES) {
                 settings.look.text_scale = text_scale;
             }
+            if let Some(motion) = appearance.get("motion").and_then(Value::as_bool) {
+                settings.look.motion = motion;
+            }
         }
         if let Some(layout) = saved.get(LAYOUT) {
             let size = |name: &str| {
@@ -141,6 +144,7 @@ impl Settings {
                 "font": self.look.font.key(),
                 "ui_scale": self.look.ui_scale,
                 "text_scale": self.look.text_scale,
+                "motion": self.look.motion,
             }),
         );
     }

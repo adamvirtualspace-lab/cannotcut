@@ -70,6 +70,9 @@
 - Choose the accent colour (eight to pick from, or any as `#rrggbb`), the fonts (Condensed,
   Segoe UI, Inter or Roboto), the size of everything (80% to 150%) and the text size (90% to
   125%) under *Menu → Appearance*
+- Buttons answer at once and flash a white splash round them when clicked; side panels glide shut
+  and open, menus wipe open and closed and dialogs ease in, at the display's own frame rate.
+  Motion can be turned off under *Appearance*
 - Live readouts of decode latency, layers, how smoothly the window is drawn (UI fps) and memory
   along the bottom
 

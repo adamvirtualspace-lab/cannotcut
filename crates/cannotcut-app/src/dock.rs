@@ -216,6 +216,32 @@ pub(crate) fn take_out(dock: &mut pane_grid::State<Part>, part: Part) -> Option<
     Some(back)
 }
 
+/// The split with `part` on one side of it, as it is in `dock`: its ratio, and whether `part`
+/// is its first side (left of the other, or over it).
+pub(crate) fn split_beside(
+    dock: &pane_grid::State<Part>,
+    part: Part,
+) -> Option<(pane_grid::Split, f32, bool)> {
+    fn walk(
+        node: &Node,
+        dock: &pane_grid::State<Part>,
+        part: Part,
+    ) -> Option<(pane_grid::Split, f32, bool)> {
+        let Node::Split { id, ratio, a, b, .. } = node else {
+            return None;
+        };
+        let holds = |node: &Node| matches!(node, Node::Pane(pane) if dock.get(*pane) == Some(&part));
+        if holds(a) {
+            return Some((*id, *ratio, true));
+        }
+        if holds(b) {
+            return Some((*id, *ratio, false));
+        }
+        walk(a, dock, part).or_else(|| walk(b, dock, part))
+    }
+    walk(dock.layout(), dock, part)
+}
+
 /// Puts `part` back in `dock` where `back` says it was.
 pub(crate) fn put_back(dock: &mut pane_grid::State<Part>, part: Part, back: &Back) {
     let mut tree = Tree::of(dock);
@@ -379,6 +405,15 @@ mod tests {
         assert_eq!(value["a"]["b"], "viewer");
         put_back(&mut dock, Part::Details, &details);
         assert_eq!(kept(&dock), starting_value);
+    }
+
+    #[test]
+    fn the_split_beside_a_panel_is_found_with_its_side() {
+        let dock = starting();
+        let (_, ratio, first) = split_beside(&dock, Part::Media).expect("beside the rest");
+        assert_eq!((ratio, first), (0.25, true));
+        let (_, ratio, first) = split_beside(&dock, Part::Details).expect("beside the viewer");
+        assert_eq!((ratio, first), (0.65, false));
     }
 
     #[test]

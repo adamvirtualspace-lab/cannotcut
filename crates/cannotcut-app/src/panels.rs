@@ -11,10 +11,11 @@ use std::cell::Cell;
 
 use super::*;
 use crate::dock::Part;
+use crate::motion::{Edge, wipe};
 use crate::icons::{ICON_BUTTON_WIDTH, ICON_GAP, ICON_SIZE, Icon, glyph, icon, ink};
 use cannotcut_timeline::{Clip, Item, Title, TitleFont};
 use iced::widget::{Row, column, pane_grid, row, scrollable, stack, text_editor};
-use iced::{Padding, Point, Rectangle, mouse};
+use iced::{Padding, Point, Rectangle, Vector, mouse};
 
 /// The bar along the top of the window.
 const TOP_BAR_HEIGHT: f32 = 44.0;
@@ -66,6 +67,10 @@ const DETAIL_LABEL_WIDTH: f32 = 84.0;
 const SECTION_TEXT_SIZE: f32 = 15.0;
 /// Room left beside a slid-out panel, to tap away from it.
 const DRAWER_MARGIN: f32 = 48.0;
+/// How dark the window goes behind a slid-out panel.
+const DRAWER_DIM: f32 = 0.3;
+/// How far below its place a dialog starts as it rises.
+const DIALOG_RISE: f32 = 16.0;
 const MENU_LABEL: &str = "Menu";
 
 /// A divider between panels in a narrow window; docked panels have the dock's own.
@@ -284,8 +289,12 @@ impl App {
         let mut layers: Vec<Element<'_, Message>> = vec![page.into()];
         layers.extend(dividers);
 
-        // A side panel slid out over the viewer; tapping beside it puts it away.
-        if let Some(side) = self.drawer.filter(|side| !docked && !self.is_away(side.part())) {
+        // A side panel slid out over the viewer, or sliding out or back; tapping beside it
+        // puts it away.
+        let now = std::time::Instant::now();
+        let out = self.drawer_out.value(now);
+        let drawer = self.drawer_shown.filter(|side| !docked && !self.is_away(side.part()));
+        if let Some(side) = drawer.filter(|_| out > 0.0) {
             let heights = self.heights(window);
             let most = window.width - DRAWER_MARGIN;
             let (panel, width) = match side {
@@ -295,8 +304,14 @@ impl App {
                 }
                 Side::Details => (self.details_panel(), self.details_width.min(most)),
             };
-            let away = mouse_area(space().width(Fill).height(Fill)).on_press(Message::DrawerClosed);
-            layers.push(away.into());
+            let dim = Color { a: DRAWER_DIM * out, ..Color::BLACK };
+            let dim = container(space().width(Fill).height(Fill))
+                .style(move |_| container::background(dim));
+            // Sliding back, it no longer holds the pointer.
+            layers.push(match self.drawer {
+                Some(_) => mouse_area(dim).on_press(Message::DrawerClosed).into(),
+                None => dim.into(),
+            });
             let placed = container(opaque(panel.width(width).height(heights.upper)))
                 .padding(iced::Padding {
                     top: TOP_BAR_HEIGHT + GUTTER,
@@ -306,15 +321,17 @@ impl App {
                 })
                 .width(Fill)
                 .height(Fill);
-            let placed = match side {
-                Side::Media => placed.align_left(Fill),
-                Side::Details => placed.align_right(Fill),
+            let (placed, toward) = match side {
+                Side::Media => (placed.align_left(Fill), -1.0),
+                Side::Details => (placed.align_right(Fill), 1.0),
             };
-            layers.push(placed.into());
+            let off = toward * (1.0 - out) * (width + GUTTER);
+            layers.push(slid(placed, Vector::new(off, 0.0)));
         }
 
         // The main menu opens under its button; the tools' menu by their bar.
-        let menu = match self.more {
+        // Also while it wipes away, after it was closed.
+        let menu = match self.menu_shown {
             Some(Bar::Menu) => {
                 let place = Padding {
                     top: TOP_BAR_HEIGHT - BAR_PADDING + MENU_GAP,
@@ -329,14 +346,22 @@ impl App {
             _ => None,
         };
         if let Some((entries, place, from_bottom)) = menu {
-            let placed = container(more_menu(entries)).padding(place);
+            // Wiped into view from the edge by its bar, down from above or up from below, and
+            // back into that edge when it closes. Closing, it no longer answers the pointer.
+            let open = self.more.is_some();
+            let edge = if from_bottom { Edge::Bottom } else { Edge::Top };
+            let shown = wipe(more_menu(entries), self.menu_in.value(now), edge, open);
+            let placed = container(shown).padding(place);
             let placed = if from_bottom {
                 placed.align_bottom(Fill)
             } else {
                 placed
             };
-            let away = mouse_area(space().width(Fill).height(Fill)).on_press(Message::MoreClosed);
-            layers.push(away.into());
+            if open {
+                let away =
+                    mouse_area(space().width(Fill).height(Fill)).on_press(Message::MoreClosed);
+                layers.push(away.into());
+            }
             layers.push(placed.width(Fill).height(Fill).into());
         }
 
@@ -360,14 +385,20 @@ impl App {
             None
         };
         if let Some((card, cancel)) = dialog {
+            let risen = self.dialog_in.value(now);
+            let backdrop = Color {
+                a: DIALOG_BACKDROP.a * risen,
+                ..DIALOG_BACKDROP
+            };
             let dim = container(space().width(Fill).height(Fill))
-                .style(|_| container::background(DIALOG_BACKDROP));
+                .style(move |_| container::background(backdrop));
             let backdrop: Element<'_, Message> = match cancel {
                 Some(cancel) => mouse_area(dim).on_press(cancel).into(),
                 None => dim.into(),
             };
             layers.push(opaque(backdrop));
-            layers.push(center(opaque(card)).into());
+            let rise = (1.0 - risen) * DIALOG_RISE;
+            layers.push(slid(center(opaque(card)), Vector::new(0.0, rise)));
         }
         // Last, so that it is drawn after everything else.
         layers.push(frame_meter::frame_meter());
@@ -381,7 +412,9 @@ impl App {
             window.width - 2.0 * GUTTER,
             window.height - TOP_BAR_HEIGHT - STATUS_HEIGHT - 2.0 * GUTTER,
         );
-        let regions = self.dock.layout().pane_regions(GUTTER, MIN_PANE, area);
+        // While a side panel closes or opens, it is narrower than a panel can be dragged to.
+        let min_pane = if self.panel_motion.is_some() { 0.0 } else { MIN_PANE };
+        let regions = self.dock.layout().pane_regions(GUTTER, min_pane, area);
         let timeline = self
             .dock
             .iter()
@@ -422,12 +455,14 @@ impl App {
                     .controls(pane_grid::Controls::new(pop_out(*part, height)))
                     .always_show_controls();
             }
+            // Cut off at its edges while it closes or opens, as it has less room than it needs.
+            let body = container(body).width(Fill).height(Fill).clip(true);
             pane_grid::Content::new(body)
                 .title_bar(title)
                 .style(theme::panel)
         })
         .spacing(GUTTER)
-        .min_size(MIN_PANE)
+        .min_size(min_pane)
         .on_drag(Message::PaneDragged)
         .on_resize(DIVIDER_REACH, Message::PaneResized)
         .style(theme::dock);
@@ -1424,6 +1459,15 @@ impl App {
     }
 }
 
+/// `element`, moved by `by` while that is not nothing: drawn over the rest as it moves.
+fn slid<'a>(element: impl Into<Element<'a, Message>>, by: Vector) -> Element<'a, Message> {
+    if by == Vector::ZERO {
+        element.into()
+    } else {
+        iced::widget::float(element).translate(move |_, _| by).into()
+    }
+}
+
 /// The `tools` above the tracks, as tall as their bar.
 fn tools_strip(tools: Element<'_, Message>) -> Element<'_, Message> {
     container(tools)
@@ -1568,7 +1612,7 @@ pub(crate) fn labelled_width(words: &str) -> f32 {
 }
 
 /// A button with nothing on it but an icon in `ink`.
-pub(crate) fn icon_button<'a>(which: Icon, ink: Color) -> button::Button<'a, Message> {
+pub(crate) fn icon_button<'a>(which: Icon, ink: Color) -> crate::motion::Button<'a, Message> {
     button(glyph(which, ink)).padding(crate::icons::ICON_PADDING)
 }
 

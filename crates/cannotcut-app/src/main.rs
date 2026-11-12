@@ -9,6 +9,7 @@ mod appearance;
 mod dock;
 mod fit;
 mod frame_meter;
+mod motion;
 mod icons;
 mod panels;
 mod placement;
@@ -221,6 +222,29 @@ fn panel_window_settings() -> window::Settings {
     }
 }
 
+/// A docked side panel closing or opening: the gap beside it glides to the window's edge, or
+/// back from it. A closing panel leaves the dock once there.
+struct PanelMotion {
+    side: Side,
+    hiding: bool,
+    /// The split with the panel on one side, its ratio while the panel is open, and its ratio
+    /// with the panel shut (0 or 1, as the panel is on its first side or its second).
+    split: pane_grid::Split,
+    open: f32,
+    shut: f32,
+    /// How far along, 0 to 1.
+    progress: motion::Tween,
+}
+
+/// What is open over the window, to tell when something new opens and should ease in.
+#[derive(Clone, Copy, PartialEq)]
+struct Overlays {
+    menu: Option<Bar>,
+    drawer: Option<Side>,
+    /// Which dialog, by a number of its own.
+    dialog: Option<u8>,
+}
+
 /// A panel in a window of its own.
 struct Away {
     window: window::Id,
@@ -409,6 +433,10 @@ enum Message {
     DrawerClosed,
     /// A docked side panel hidden from a wide window, or shown again where it was.
     SideHidden(Side),
+    /// A frame drawn while something moves.
+    MotionFrame,
+    /// Whether things move, chosen under Appearance.
+    MotionChosen(bool),
     /// A side panel's key pressed: hidden or shown in a wide window, slid out in a narrow one.
     SideKey(Side),
     /// The main window's size, asked for when a side panel's key was pressed.
@@ -835,6 +863,17 @@ struct App {
     /// Side panels hidden from the dock by their buttons in the top bar, and where each goes
     /// back to; in the order they were hidden.
     hidden: Vec<(Side, dock::Back)>,
+    /// A docked side panel closing or opening, while it does.
+    panel_motion: Option<PanelMotion>,
+    /// The side panel shown over the viewer in a narrow window, also while it slides back, and
+    /// how far out it is (0 to 1).
+    drawer_shown: Option<Side>,
+    drawer_out: motion::Tween,
+    /// The menu shown, also while it wipes away, and how far into view it is (0 to 1).
+    menu_shown: Option<Bar>,
+    menu_in: motion::Tween,
+    /// How far into place the dialog open now is (0 to 1).
+    dialog_in: motion::Tween,
     /// How the panels are docked in a wide window.
     dock: pane_grid::State<Part>,
     /// A gap between docked panels is being dragged.
@@ -1038,6 +1077,12 @@ impl App {
             main_window: window::Id::unique(),
             away: Vec::new(),
             hidden: Vec::new(),
+            panel_motion: None,
+            drawer_shown: None,
+            drawer_out: motion::Tween::at(0.0),
+            menu_shown: None,
+            menu_in: motion::Tween::at(0.0),
+            dialog_in: motion::Tween::at(1.0),
             dock: dock::starting(),
             dock_resizing: false,
             layout_moved: false,
@@ -1946,7 +1991,10 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let before = self.overlays();
         let task = self.handle(message);
+        // Whatever opened eases in.
+        self.ease_in(before);
         self.follow_title_editor();
         // Whatever happened may have put a new file on the timeline.
         Task::batch([task, self.read_waveforms()])
@@ -2120,10 +2168,43 @@ impl App {
             }
             Message::DrawerClosed => self.drawer = None,
             Message::SideHidden(side) => {
-                if !self.show_side(side) {
+                self.finish_panel_motion();
+                if self.is_hidden(side) {
+                    self.show_side(side);
+                    self.start_panel_motion(side, false);
+                } else if !self.start_panel_motion(side, true) {
                     self.hide_side(side);
                 }
-                self.keep_layout();
+                if self.panel_motion.is_none() {
+                    self.keep_layout();
+                }
+            }
+            Message::MotionFrame => {
+                let now = Instant::now();
+                if let Some(motion) = &self.panel_motion {
+                    let along = motion.progress.value(now);
+                    let (from, to) = if motion.hiding {
+                        (motion.open, motion.shut)
+                    } else {
+                        (motion.shut, motion.open)
+                    };
+                    self.dock.resize(motion.split, from + (to - from) * along);
+                    if !motion.progress.moving(now) {
+                        self.finish_panel_motion();
+                    }
+                }
+                if self.drawer.is_none() && !self.drawer_out.moving(now) {
+                    self.drawer_shown = None;
+                }
+                if self.more.is_none() && !self.menu_in.moving(now) {
+                    self.menu_shown = None;
+                }
+            }
+            Message::MotionChosen(on) => {
+                self.set_look(theme::Look {
+                    motion: on,
+                    ..theme::look()
+                });
             }
             Message::SideKey(side) => {
                 return window::size(self.main_window)
@@ -2168,6 +2249,7 @@ impl App {
             }
             Message::DividerHovered(divider) => self.divider_hover = divider,
             Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
+                self.finish_panel_motion();
                 self.dock.drop(pane, target);
                 self.keep_layout();
             }
@@ -2182,6 +2264,7 @@ impl App {
                 }
             }
             Message::DockReset => {
+                self.panel_motion = None;
                 self.more = None;
                 let closing: Vec<Task<Message>> =
                     self.away.drain(..).map(|away| window::close(away.window)).collect();
@@ -2192,6 +2275,7 @@ impl App {
                 return Task::batch(closing);
             }
             Message::PopOut(part) => {
+                self.finish_panel_motion();
                 if self.is_away(part) {
                     return Task::none();
                 }
@@ -3747,6 +3831,10 @@ impl App {
         if self.resized_at.is_some() {
             subscriptions.push(time::every(RESIZE_POLL).map(|_| Message::ResizeTick));
         }
+        if self.moving(Instant::now()) {
+            // One for every frame the display shows, while something moves.
+            subscriptions.push(window::frames().map(|_| Message::MotionFrame));
+        }
         if self.dividing.is_some() {
             // Wherever the pointer goes while a divider is held, not only over the divider.
             subscriptions.push(iced::event::listen_with(|event, _status, _window| {
@@ -3795,6 +3883,115 @@ impl App {
             }
             None => responsive(move |size| self.layout(size)).into(),
         }
+    }
+
+    /// What is open over the window now.
+    fn overlays(&self) -> Overlays {
+        let dialog = if self.leaving.is_some() {
+            Some(1)
+        } else if self.export_dialog {
+            Some(2)
+        } else if self.compound_dialog {
+            Some(3)
+        } else if self.about.is_some() {
+            Some(4)
+        } else if self.appearance.is_some() {
+            Some(5)
+        } else if self.sound_outputs.is_some() {
+            Some(6)
+        } else {
+            None
+        };
+        Overlays {
+            menu: self.more,
+            drawer: self.drawer,
+            dialog,
+        }
+    }
+
+    /// Eases in what has opened since `before`, and eases the side panel and the menu back if
+    /// they were put away.
+    fn ease_in(&mut self, before: Overlays) {
+        let now = Instant::now();
+        let after = self.overlays();
+        if after.menu != before.menu {
+            match after.menu {
+                Some(bar) => {
+                    if self.menu_shown != Some(bar) {
+                        // Another menu, if one was wiping away, gives way at once.
+                        self.menu_in = motion::Tween::at(0.0);
+                        self.menu_shown = Some(bar);
+                    }
+                    self.menu_in.go(1.0, motion::MENU, now);
+                }
+                None => self.menu_in.go(0.0, motion::MENU, now),
+            }
+        }
+        if after.dialog != before.dialog && after.dialog.is_some() {
+            self.dialog_in = motion::Tween::new(0.0, 1.0, motion::DIALOG);
+        }
+        if after.drawer != before.drawer {
+            match after.drawer {
+                Some(side) => {
+                    if self.drawer_shown != Some(side) {
+                        // The other panel, if it was out, is swapped at once.
+                        self.drawer_out = motion::Tween::at(0.0);
+                        self.drawer_shown = Some(side);
+                    }
+                    self.drawer_out.go(1.0, motion::DRAWER, now);
+                }
+                None => self.drawer_out.go(0.0, motion::DRAWER, now),
+            }
+        }
+    }
+
+    /// Whether anything of the app's own is moving at `now`, so the window is drawn every
+    /// frame. Buttons ask for their own frames.
+    fn moving(&self, now: Instant) -> bool {
+        self.panel_motion.is_some()
+            || self.drawer_out.moving(now)
+            || (self.drawer.is_none() && self.drawer_shown.is_some())
+            || self.menu_in.moving(now)
+            || (self.more.is_none() && self.menu_shown.is_some())
+            || self.dialog_in.moving(now)
+    }
+
+    /// Starts `side` closing (`hiding`) or opening, if things move and it is docked beside
+    /// another; whether it started. An opening panel is in the dock already, and starts shut.
+    fn start_panel_motion(&mut self, side: Side, hiding: bool) -> bool {
+        if !motion::on() {
+            return false;
+        }
+        let Some((split, open, first)) = dock::split_beside(&self.dock, side.part()) else {
+            return false;
+        };
+        let shut = if first { 0.0 } else { 1.0 };
+        if !hiding {
+            self.dock.resize(split, shut);
+        }
+        self.panel_motion = Some(PanelMotion {
+            side,
+            hiding,
+            split,
+            open,
+            shut,
+            progress: motion::Tween::new(0.0, 1.0, motion::PANEL),
+        });
+        true
+    }
+
+    /// Brings a side panel closing or opening to its end at once: open where it was, or out of
+    /// the dock.
+    fn finish_panel_motion(&mut self) {
+        let Some(motion) = self.panel_motion.take() else {
+            return;
+        };
+        // Taken out as it was open, so that it comes back the same.
+        self.dock.resize(motion.split, motion.open);
+        if motion.hiding {
+            self.hide_side(motion.side);
+        }
+        self.keep_layout();
     }
 
     /// Whether `side` is hidden from the dock by its button in the top bar.
