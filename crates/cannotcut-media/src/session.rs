@@ -132,7 +132,8 @@ impl DecoderSource {
 
 pub(crate) struct Session {
     input: format::context::Input,
-    decoder: decoder::Video,
+    /// None while resting ([`Session::rest`]); the next seek opens one again.
+    decoder: Option<decoder::Video>,
     source: DecoderSource,
     stream: usize,
     time_base: ffi::AVRational,
@@ -220,7 +221,7 @@ impl Session {
         };
         Ok(Self {
             input,
-            decoder,
+            decoder: Some(decoder),
             source,
             stream: stream_index,
             time_base,
@@ -338,15 +339,19 @@ impl Session {
         if result < 0 {
             return Err(Error::new("seek", ffmpeg::Error::from(result)));
         }
-        if self.source.device.is_some() {
+        match &mut self.decoder {
             // On the GPU a flush is not enough. A decoder that was flushed and then started in
             // the middle of an open GOP kept numbering its frames correctly while their pictures
             // stopped changing some hundred frames on, without an error (seen with D3D11VA on a
             // Radeon 760M). A decoder that has seen nothing else of the file does not do that.
-            self.decoded = frame::Video::empty();
-            self.decoder = self.source.open()?;
-        } else {
-            self.decoder.flush();
+            Some(decoder) if self.source.device.is_none() => decoder.flush(),
+            _ => {
+                // The old decoder and the frame it lent out go first, so their pictures are
+                // freed before the new decoder sets aside its own.
+                self.decoded = frame::Video::empty();
+                self.decoder = None;
+                self.decoder = Some(self.source.open()?);
+            }
         }
         self.current = None;
         self.drained = false;
@@ -355,8 +360,11 @@ impl Session {
 
     /// Decodes the next frame in presentation order. Returns false at the end of the stream.
     pub(crate) fn advance(&mut self) -> Result<bool, Error> {
+        let Some(decoder) = self.decoder.as_mut() else {
+            return Err(Error("the decoder is resting: seek first".to_string()));
+        };
         loop {
-            match self.decoder.receive_frame(&mut self.decoded) {
+            match decoder.receive_frame(&mut self.decoded) {
                 Ok(()) => {
                     let pts = self
                         .decoded
@@ -388,7 +396,7 @@ impl Session {
             let mut packet = Packet::empty();
             match packet.read(&mut self.input) {
                 Ok(()) if packet.stream() == self.stream => {
-                    match self.decoder.send_packet(&packet) {
+                    match decoder.send_packet(&packet) {
                         // A damaged packet costs a frame, not the whole clip.
                         Ok(()) | Err(ffmpeg::Error::InvalidData) => {}
                         Err(error) => return Err(Error::new("decode", error)),
@@ -396,12 +404,25 @@ impl Session {
                 }
                 Ok(()) => {}
                 Err(ffmpeg::Error::Eof) => {
-                    let _ = self.decoder.send_eof();
+                    let _ = decoder.send_eof();
                     self.drained = true;
                 }
                 Err(error) => return Err(Error::new("read clip", error)),
             }
         }
+    }
+
+    /// Lets go of what decoding holds: the decoder with its pictures, the scalers, and all but
+    /// `keep_bytes` of the cached pictures nearest the focus. The next seek starts it again.
+    pub(crate) fn rest(&mut self, keep_bytes: usize) {
+        self.cache.trim(keep_bytes);
+        self.decoded = frame::Video::empty();
+        self.transfer = frame::Video::empty();
+        self.decoder = None;
+        self.preview_scaler = None;
+        self.rgba_scaler = None;
+        self.current = None;
+        self.drained = false;
     }
 
     /// Start of the frame held by the decoder, if it holds one.
@@ -421,6 +442,11 @@ impl Session {
             self.preview_size = size;
             self.cache.clear();
         }
+    }
+
+    /// Caps how many pictures are cached, on top of the memory budget; None lifts the cap.
+    pub(crate) fn set_frame_limit(&mut self, limit: Option<usize>) {
+        self.cache.frame_limit = limit;
     }
 
     /// Cached pictures are dropped farthest from this timestamp first.
@@ -679,6 +705,8 @@ struct PictureCache {
     frames: BTreeMap<i64, Cached>,
     bytes: usize,
     budget: usize,
+    /// At most this many pictures, when set.
+    frame_limit: Option<usize>,
     focus: i64,
 }
 
@@ -688,6 +716,7 @@ impl PictureCache {
             frames: BTreeMap::new(),
             bytes: 0,
             budget,
+            frame_limit: None,
             focus: 0,
         }
     }
@@ -719,7 +748,14 @@ impl PictureCache {
         if let Some(replaced) = replaced {
             self.bytes -= picture_bytes(&replaced.picture);
         }
-        while self.bytes > self.budget && self.frames.len() > 1 {
+        self.trim(self.budget);
+    }
+
+    /// Drops the pictures farthest from the focus until they take at most `limit` bytes and
+    /// are within the frame limit; the nearest one stays whatever its size.
+    fn trim(&mut self, limit: usize) {
+        let too_many = |frames: usize| self.frame_limit.is_some_and(|most| frames > most);
+        while (self.bytes > limit || too_many(self.frames.len())) && self.frames.len() > 1 {
             let (Some((&first, _)), Some((&last, _))) =
                 (self.frames.first_key_value(), self.frames.last_key_value())
             else {

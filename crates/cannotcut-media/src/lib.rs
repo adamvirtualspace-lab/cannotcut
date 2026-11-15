@@ -29,6 +29,13 @@ const LOOKBEHIND_FRAMES: u64 = 48;
 const STEP_BACK_REACH: u64 = 8;
 /// How long the playhead must rest before the frames behind it are decoded.
 const SETTLE_TIME: Duration = Duration::from_millis(150);
+/// How long a scrubber told to rest waits for another request before it lets go of its decoder.
+/// Coming back sooner, as when stepping to and fro across a cut, finds everything as it was.
+const REST_DELAY: Duration = Duration::from_secs(6);
+/// How many of the frames just played are kept while playing. Playback never looks back; these
+/// make the first steps back after a pause instant, and the rest come in when it settles (see
+/// [`Worker::look_behind`]).
+const PLAYING_CACHE_FRAMES: usize = 12;
 
 #[derive(Debug)]
 pub struct Error(String);
@@ -102,6 +109,9 @@ pub struct Options {
     pub max_preview: (u32, u32),
     /// Memory for pictures of frames near the playhead, which makes revisiting them instant.
     pub cache_bytes: usize,
+    /// What a resting scrubber keeps of those: the pictures nearest where it was last asked for
+    /// ([`Scrubber::rest`]).
+    pub resting_cache_bytes: usize,
 }
 
 impl Default for Options {
@@ -111,6 +121,7 @@ impl Default for Options {
             output: Output::Rgba,
             max_preview: (1280, 720),
             cache_bytes: 256 * 1024 * 1024,
+            resting_cache_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -166,12 +177,15 @@ struct Request {
     frame: u64,
     output: Output,
     max_preview: (u32, u32),
+    playing: bool,
     at: Instant,
 }
 
 #[derive(Default)]
 struct Slot {
     pending: Option<Request>,
+    /// Asked to rest, and not asked for a picture since.
+    rest: bool,
     closed: bool,
 }
 
@@ -184,8 +198,19 @@ struct Mailbox {
 
 impl Mailbox {
     fn post(&self, request: Request) {
-        self.slot.lock().expect("mailbox lock poisoned").pending = Some(request);
+        let mut slot = self.slot.lock().expect("mailbox lock poisoned");
+        slot.pending = Some(request);
+        slot.rest = false;
         self.arrived.notify_one();
+    }
+
+    fn rest(&self) {
+        self.slot.lock().expect("mailbox lock poisoned").rest = true;
+        self.arrived.notify_one();
+    }
+
+    fn rest_wanted(&self) -> bool {
+        self.slot.lock().expect("mailbox lock poisoned").rest
     }
 
     fn close(&self) {
@@ -197,15 +222,19 @@ impl Mailbox {
         self.slot.lock().expect("mailbox lock poisoned").pending.take()
     }
 
-    /// Blocks until a request arrives; `None` once the scrubber is dropped.
-    fn wait(&self) -> Option<Request> {
+    /// Blocks until a request arrives or the scrubber is asked to rest.
+    fn wait(&self) -> Woken {
         let mut slot = self.slot.lock().expect("mailbox lock poisoned");
         loop {
             if slot.closed {
-                return None;
+                return Woken::Closed;
             }
             if let Some(request) = slot.pending.take() {
-                return Some(request);
+                return Woken::Request(request);
+            }
+            if slot.rest {
+                slot.rest = false;
+                return Woken::Rest;
             }
             slot = self.arrived.wait(slot).expect("mailbox lock poisoned");
         }
@@ -238,6 +267,12 @@ impl Mailbox {
     }
 }
 
+enum Woken {
+    Request(Request),
+    Rest,
+    Closed,
+}
+
 enum Waited {
     Request(Request),
     Quiet,
@@ -249,6 +284,7 @@ pub struct Scrubber {
     next_request: u64,
     output: Output,
     max_preview: (u32, u32),
+    playing: bool,
 }
 
 impl Scrubber {
@@ -270,7 +306,7 @@ impl Scrubber {
                 move || match Session::open(&path, options) {
                     Ok(session) => {
                         sink(Event::Opened(session.info().clone()));
-                        Worker::new(session, mailbox, Box::new(sink)).run();
+                        Worker::new(session, mailbox, Box::new(sink), options).run();
                     }
                     Err(error) => sink(Event::Failed(error.to_string())),
                 }
@@ -281,6 +317,7 @@ impl Scrubber {
             next_request: 0,
             output: options.output,
             max_preview: options.max_preview,
+            playing: false,
         })
     }
 
@@ -295,6 +332,19 @@ impl Scrubber {
         self.max_preview = max;
     }
 
+    /// Says whether the requests made from now on are for playback, which asks for each frame
+    /// once, in order: then only the last few frames are cached.
+    pub fn set_playing(&mut self, playing: bool) {
+        self.playing = playing;
+    }
+
+    /// Lets go of the decoder and most cached pictures once no request has come for a moment,
+    /// for a clip that is off screen but may be back soon. The next request takes it up again,
+    /// from a seek.
+    pub fn rest(&self) {
+        self.mailbox.rest();
+    }
+
     /// Asks for `frame`, replacing any request the decoder has not started on yet.
     pub fn request(&mut self, frame: u64) -> u64 {
         self.next_request += 1;
@@ -303,6 +353,7 @@ impl Scrubber {
             frame,
             output: self.output,
             max_preview: self.max_preview,
+            playing: self.playing,
             at: Instant::now(),
         });
         self.next_request
@@ -338,16 +389,23 @@ struct Worker {
     previous: Option<u64>,
     /// Where the playhead came to rest: the timestamp whose exact frame was last delivered.
     rested_at: Option<i64>,
+    resting_cache_bytes: usize,
 }
 
 impl Worker {
-    fn new(session: Session, mailbox: Arc<Mailbox>, sink: Box<dyn FnMut(Event) + Send>) -> Self {
+    fn new(
+        session: Session,
+        mailbox: Arc<Mailbox>,
+        sink: Box<dyn FnMut(Event) + Send>,
+        options: Options,
+    ) -> Self {
         Self {
             session,
             mailbox,
             sink,
             previous: None,
             rested_at: None,
+            resting_cache_bytes: options.resting_cache_bytes,
         }
     }
 
@@ -357,8 +415,17 @@ impl Worker {
             let request = match next.take() {
                 Some(request) => request,
                 None => match self.mailbox.wait() {
-                    Some(request) => request,
-                    None => return,
+                    Woken::Request(request) => request,
+                    Woken::Closed => return,
+                    Woken::Rest => match self.mailbox.wait_for(REST_DELAY) {
+                        Waited::Request(request) => request,
+                        Waited::Closed => return,
+                        Waited::Quiet => {
+                            self.session.rest(self.resting_cache_bytes);
+                            self.rested_at = None;
+                            continue;
+                        }
+                    },
                 },
             };
             match self.serve(&request) {
@@ -377,6 +444,8 @@ impl Worker {
             match self.mailbox.wait_for(SETTLE_TIME) {
                 Waited::Request(request) => next = Some(request),
                 Waited::Closed => return,
+                // A scrubber about to rest has no use for the frames behind.
+                Waited::Quiet if self.mailbox.rest_wanted() => {}
                 Waited::Quiet => match self.look_behind() {
                     Ok(interrupted_by) => next = interrupted_by,
                     Err(error) => (self.sink)(Event::Failed(error.to_string())),
@@ -427,6 +496,8 @@ impl Worker {
         self.rested_at = None;
         self.session.set_max_preview(request.max_preview);
         self.session.set_focus(target);
+        self.session
+            .set_frame_limit(request.playing.then_some(PLAYING_CACHE_FRAMES));
 
         let started = Instant::now();
         if let Some(converted) = self.session.recall(target, request.output)? {

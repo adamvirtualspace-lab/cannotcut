@@ -140,8 +140,9 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 const RESIZE_POLL: Duration = Duration::from_millis(50);
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm", "m4v", "avi", "ts"];
 const BYTES_PER_MB: usize = 1024 * 1024;
-/// Media files kept open at once. Each holds a decoder and its cached pictures, so going back
-/// and forth across a cut stays quick without every file of the project staying in memory.
+/// Media files kept open at once, so going back and forth across a cut stays quick without every
+/// file of the project staying in memory. Those off screen rest after a moment, keeping only a
+/// few pictures; the decoder and the rest of the cache are for those at work.
 const MAX_OPEN_SOURCES: usize = 4;
 const SOURCE_CACHE_BYTES: usize = 96 * BYTES_PER_MB;
 /// How long before playback reaches a cut the decoder for the clip after it is got ready.
@@ -1012,10 +1013,14 @@ struct Source {
     form: Option<Form>,
     /// The frame last asked for: where its decoder is, or is heading.
     last_frame: Option<u64>,
+    /// Told to rest, being off screen, and not asked for a picture since.
+    resting: bool,
 }
 
 impl Source {
-    fn request(&mut self, frame: u64, form: Form) -> u64 {
+    fn request(&mut self, frame: u64, form: Form, playing: bool) -> u64 {
+        self.resting = false;
+        self.scrubber.set_playing(playing);
         if self.form != Some(form) {
             self.form = Some(form);
             self.scrubber.set_output(form.output);
@@ -1722,6 +1727,7 @@ impl App {
                     info: None,
                     form: None,
                     last_frame: None,
+                    resting: false,
                 });
                 task = Task::run(events, move |event| Message::Media(generation, event.into()));
                 // Closing a source ends its decode thread and frees its pictures. Those at work
@@ -1820,7 +1826,7 @@ impl App {
             tasks.push(task);
             let source = &mut self.sources[index];
             let generation = source.generation;
-            let request = source.request(wanted.media_frame, form);
+            let request = source.request(wanted.media_frame, form, playing);
             used.push(generation);
             self.warming.retain(|warming| *warming != generation);
             if let Some(playback) = &mut self.playback {
@@ -1904,6 +1910,7 @@ impl App {
         };
         let after = pictures(cut);
         let before = pictures(cut - 1);
+        let playing = self.playback.is_some();
         let mut at_work = self.layers_at_work();
         let mut tasks = Vec::new();
         for (key, frame, location) in after {
@@ -1927,7 +1934,7 @@ impl App {
                 at_work.push(source.generation);
                 self.warming.push(source.generation);
                 // Its picture is not shown; asking for it is what puts the decoder in place.
-                source.request(frame, form);
+                source.request(frame, form, playing);
                 tasks.push(task);
             }
         }
@@ -2096,6 +2103,7 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         let before = self.overlays();
         let task = self.handle(message);
+        self.rest_idle_sources();
         // Whatever opened eases in.
         self.ease_in(before);
         self.follow_title_editor();
@@ -3496,6 +3504,24 @@ impl App {
             frames.filter(|frame| *frame > self.playhead).min()
         } else {
             frames.filter(|frame| *frame < self.playhead).max()
+        }
+    }
+
+    /// Lets the sources that are off screen give up their decoders and most of their pictures,
+    /// which they do after a moment unless asked for a picture again.
+    fn rest_idle_sources(&mut self) {
+        let mut at_work = self.layers_at_work();
+        at_work.extend(self.opening);
+        // Got ready for a cut that playback is heading for; once it stops, they wait like the
+        // rest.
+        if self.playback.is_some() {
+            at_work.extend(self.warming.iter().copied());
+        }
+        for source in &mut self.sources {
+            if !source.resting && !at_work.contains(&source.generation) {
+                source.resting = true;
+                source.scrubber.rest();
+            }
         }
     }
 
