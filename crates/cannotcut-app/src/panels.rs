@@ -927,12 +927,20 @@ impl App {
             Some(part) => container(pop_out(part, TRANSPORT_HEIGHT)).align_right(Fill).into(),
             None => space().width(Fill).into(),
         };
-        row![container(time).width(Fill).clip(true), buttons, end]
-        .spacing(ROW_SPACING)
-        .align_y(Center)
-        .padding([0.0, BAR_PADDING])
-        .height(TRANSPORT_HEIGHT)
-        .into()
+        let bar = row![container(time).width(Fill).clip(true), buttons, end]
+            .spacing(ROW_SPACING)
+            .align_y(Center)
+            .padding([0.0, BAR_PADDING])
+            .height(TRANSPORT_HEIGHT);
+        // Docked, the viewer has no bar over it: it is taken up by this one, wherever no button
+        // is, to move it among the panels or out of the window.
+        match pops_out {
+            Some(_) => mouse_area(bar)
+                .interaction(mouse::Interaction::Grab)
+                .on_press(Message::ViewerBarPressed)
+                .into(),
+            None => bar.into(),
+        }
     }
 
     /// The panel left of the viewer: the media the project uses, and later text, transitions

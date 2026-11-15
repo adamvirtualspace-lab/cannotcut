@@ -496,6 +496,11 @@ enum Message {
     PointerReleased(window::Id),
     /// One of the panels in a panel window, shown.
     AwayTabChosen(window::Id, usize),
+    /// The docked viewer's play bar taken hold of, to move the viewer.
+    ViewerBarPressed,
+    /// The pointer over a window while the viewer is being moved, and let go.
+    ViewerDraggedTo(window::Id, iced::Point),
+    ViewerReleased,
     /// A docked panel dragged out of the main window and let go there, at this place on the
     /// screens (none if it was let go inside).
     TornOff(Part, Option<iced::Point>),
@@ -944,6 +949,8 @@ struct App {
     /// A window's title bar pressed, until the pointer moves (which moves the window) or the
     /// button is let go.
     bar_pressed: Option<window::Id>,
+    /// The docked viewer is being moved by its play bar.
+    viewer_moving: bool,
     /// The windows maximized, for the button that maximizes them or puts them back.
     maximized: HashSet<window::Id>,
     /// A panel window being moved by its title bar, and where it would go if let go now.
@@ -1170,6 +1177,7 @@ impl App {
             bar_pointer: HashMap::new(),
             bar_pressed: None,
             maximized: HashSet::new(),
+            viewer_moving: false,
             moving_away: None,
             drop_target: None,
             panel_motion: None,
@@ -2347,6 +2355,41 @@ impl App {
                     std::mem::swap(&mut away.back, back);
                     self.scale_factor = None;
                     self.keep_layout();
+                }
+            }
+            Message::ViewerBarPressed => {
+                self.viewer_moving = true;
+                self.drop_target = None;
+                let main = self.main_window;
+                return window::size(main).map(move |size| Message::WindowSizeIs(main, size));
+            }
+            Message::ViewerDraggedTo(window, at) => {
+                if self.viewer_moving && window == self.main_window {
+                    let viewer = self.viewer_pane();
+                    self.drop_target = self
+                        .window_size
+                        .get(&self.main_window)
+                        .and_then(|size| self.dock_region_at(*size, at))
+                        .filter(|(pane, _)| Some(*pane) != viewer)
+                        .map(|(pane, edge)| DropTarget::Pane(pane, edge));
+                }
+            }
+            Message::ViewerReleased => {
+                if !std::mem::take(&mut self.viewer_moving) {
+                    return Task::none();
+                }
+                match (self.drop_target.take(), self.viewer_pane()) {
+                    (Some(DropTarget::Pane(target, edge)), Some(viewer)) => {
+                        let region = pane_grid::Region::Edge(edge);
+                        self.dock.drop(viewer, pane_grid::Target::Pane(target, region));
+                        self.scale_factor = None;
+                        self.keep_layout();
+                    }
+                    // Let go outside the window: the viewer in a window of its own, there.
+                    _ => {
+                        return placement::pointer_outside(self.main_window)
+                            .map(|at| Message::TornOff(Part::Viewer, at));
+                    }
                 }
             }
             Message::TornOff(part, at) => {
@@ -4058,6 +4101,21 @@ impl App {
             // One for every frame the display shows, while something moves.
             subscriptions.push(window::frames().map(|_| Message::MotionFrame));
         }
+        if self.viewer_moving {
+            // Wherever the pointer goes while the viewer is moved, until the button is let go.
+            subscriptions.push(iced::event::listen_with(|event, _status, window| {
+                use iced::{Event, mouse};
+                match event {
+                    Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                        Some(Message::ViewerDraggedTo(window, position))
+                    }
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                        Some(Message::ViewerReleased)
+                    }
+                    _ => None,
+                }
+            }));
+        }
         if self.dividing.is_some() {
             // Wherever the pointer goes while a divider is held, not only over the divider.
             subscriptions.push(iced::event::listen_with(|event, _status, _window| {
@@ -4215,6 +4273,14 @@ impl App {
             self.hide_side(motion.side);
         }
         self.keep_layout();
+    }
+
+    /// The viewer's place in the dock, while it is docked.
+    fn viewer_pane(&self) -> Option<pane_grid::Pane> {
+        self.dock
+            .iter()
+            .find(|(_, part)| **part == Part::Viewer)
+            .map(|(pane, _)| *pane)
     }
 
     /// Whether `side` is hidden from the dock by its button in the top bar.
