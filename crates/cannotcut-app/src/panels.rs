@@ -1719,11 +1719,15 @@ fn window_controls<'a>(
     };
     row![
         control(Icon::WindowMinimize, "Minimise", Message::WindowMinimized(window), false),
-        if maximized {
-            control(Icon::WindowRestore, "Restore", Message::WindowMaximized(window), false)
-        } else {
-            control(Icon::WindowMaximize, "Maximise", Message::WindowMaximized(window), false)
-        },
+        // Where Windows 11 offers its snap layouts.
+        title_bar::MaximizeSpot::new(
+            window,
+            if maximized {
+                control(Icon::WindowRestore, "Restore", Message::WindowMaximized(window), false)
+            } else {
+                control(Icon::WindowMaximize, "Maximise", Message::WindowMaximized(window), false)
+            },
+        ),
         control(Icon::WindowClose, "Close", close, true),
     ]
     .spacing(2)
