@@ -133,16 +133,18 @@ impl MediaTab {
 pub(crate) enum DetailsTab {
     #[default]
     Video,
+    Colour,
     Audio,
     Speed,
 }
 
 impl DetailsTab {
-    const ALL: [DetailsTab; 3] = [Self::Video, Self::Audio, Self::Speed];
+    const ALL: [DetailsTab; 4] = [Self::Video, Self::Colour, Self::Audio, Self::Speed];
 
     fn name(self) -> &'static str {
         match self {
             Self::Video => "Video",
+            Self::Colour => "Colour",
             Self::Audio => "Audio",
             Self::Speed => "Speed",
         }
@@ -267,7 +269,9 @@ impl App {
         let room = window.width - 2.0 * GUTTER;
         let top = self.top_bar(room - 2.0 * BAR_PADDING - WINDOW_CONTROLS_WIDTH, docked);
         let main = self.main_window;
-        let top = row![top.row, window_controls(main, Message::CloseRequested(main))]
+        let maximized = self.maximized.contains(&main);
+        let controls = window_controls(main, maximized, Message::CloseRequested(main));
+        let top = row![top.row, controls]
             .spacing(ROW_SPACING)
             .align_y(Center);
         let top = container(top)
@@ -508,8 +512,8 @@ impl App {
             let (title, body) = match part {
                 Part::Media => (self.media_tabs(title_room), self.media_body()),
                 Part::Viewer => (
-                    self.viewer_title(title_room),
-                    self.viewer_body(size.width, None),
+                    space().into(),
+                    self.viewer_body(size.width, None, leaves.then_some(Part::Viewer)),
                 ),
                 Part::Details => (self.details_title(), self.details_body()),
                 Part::Timeline => {
@@ -532,9 +536,13 @@ impl App {
             }
             // Cut off at its edges while it closes or opens, as it has less room than it needs.
             let body = container(body).width(Fill).height(Fill).clip(true);
-            pane_grid::Content::new(body)
-                .title_bar(title)
-                .style(theme::panel)
+            let content = pane_grid::Content::new(body).style(theme::panel);
+            // The viewer has no bar over it: all the room goes to the picture.
+            if *part == Part::Viewer {
+                content
+            } else {
+                content.title_bar(title)
+            }
         })
         .spacing(GUTTER)
         .min_size(min_pane)
@@ -710,7 +718,12 @@ impl App {
 
     /// The picture, over the buttons to play it; `room` wide. `double_click` is what
     /// double-clicking the picture does, if anything.
-    fn viewer_body(&self, room: f32, double_click: Option<Message>) -> Element<'_, Message> {
+    fn viewer_body(
+        &self,
+        room: f32,
+        double_click: Option<Message>,
+        pops_out: Option<Part>,
+    ) -> Element<'_, Message> {
         let timeline = self.history.timeline();
         // On the GPU, every layer, placed in the frame; drawn otherwise, the top one alone.
         let top = self.top_shown().map(|shown| &shown.picture);
@@ -736,7 +749,7 @@ impl App {
         if let Some(double_click) = double_click {
             picture = mouse_area(picture).on_double_click(double_click).into();
         }
-        column![picture, self.transport(room - 2.0 * BAR_PADDING)].into()
+        column![picture, self.transport(room - 2.0 * BAR_PADDING, pops_out)].into()
     }
 
     /// A panel in a window of its own, `size` big: its title bar with the buttons to fill the
@@ -751,7 +764,7 @@ impl App {
     ) -> Element<'_, Message> {
         let screen = Message::FullScreenToggled(window);
         let body = match part {
-            Part::Viewer => self.viewer_body(size.width, Some(screen.clone())),
+            Part::Viewer => self.viewer_body(size.width, Some(screen.clone()), None),
             Part::Media => self.media_body(),
             Part::Details => self.details_body(),
             // Never away: the main window keeps it.
@@ -791,7 +804,8 @@ impl App {
         ]
         .spacing(4)
         .align_y(Center);
-        let controls = window_controls(window, Message::PutBack(window));
+        let maximized = self.maximized.contains(&window);
+        let controls = window_controls(window, maximized, Message::PutBack(window));
         let bar = row![title, space().width(Fill), buttons, controls]
             .spacing(ROW_SPACING)
             .align_y(Center)
@@ -851,7 +865,7 @@ impl App {
         if titled {
             panel = panel.push(across(self.viewer_title(room)));
         }
-        container(panel.push(self.viewer_body(room, None)))
+        container(panel.push(self.viewer_body(room, None, None)))
             .width(Fill)
             .height(Fill)
             .style(theme::panel)
@@ -859,7 +873,9 @@ impl App {
     }
 
     /// Where the playhead is, and the buttons to play, in the middle of `room`.
-    fn transport(&self, room: f32) -> Element<'_, Message> {
+    /// The play bar under the picture, `room` wide; with the button to open `pops_out` in a
+    /// window of its own at its end, if given.
+    fn transport(&self, room: f32, pops_out: Option<Part>) -> Element<'_, Message> {
         let timeline = self.history.timeline();
         let playing = self.playback.is_some();
         let has_clips = timeline.duration() > 0;
@@ -907,11 +923,11 @@ impl App {
                 format!("{position}{length}"),
             )
         };
-        row![
-            container(time).width(Fill).clip(true),
-            buttons,
-            space().width(Fill)
-        ]
+        let end: Element<'_, Message> = match pops_out {
+            Some(part) => container(pop_out(part, TRANSPORT_HEIGHT)).align_right(Fill).into(),
+            None => space().width(Fill).into(),
+        };
+        row![container(time).width(Fill).clip(true), buttons, end]
         .spacing(ROW_SPACING)
         .align_y(Center)
         .padding([0.0, BAR_PADDING])
@@ -944,7 +960,7 @@ impl App {
             MediaTab::Media => self.media_list(),
             MediaTab::Text => self.text_list(),
             MediaTab::Transitions => self.transition_list(),
-            MediaTab::Effects => coming("Colour and filters come in a later step."),
+            MediaTab::Effects => self.look_list(),
         }
     }
 
@@ -1073,6 +1089,7 @@ impl App {
                 }
                 DetailsTab::Audio => self.clip_sound(track),
                 DetailsTab::Speed => self.speed_controls(clip),
+                DetailsTab::Colour => self.grade_controls(clip),
             },
             (0, _) => self.project_details(),
             (count, _) => {
@@ -1174,6 +1191,116 @@ impl App {
             ui_text(about).size(theme::text_size(DETAIL_TEXT_SIZE)).font(theme::small_font()).color(theme::TEXT_DIM),
         ]
         .spacing(8)
+        .padding(PANEL_PADDING)
+        .into()
+    }
+
+    /// The selected clip's colour and filters, as it is shown: a slider for each, and a way back
+    /// to the picture as recorded.
+    fn grade_controls(&self, clip: &Clip) -> Element<'_, Message> {
+        if clip.media.title.is_some() {
+            let about = "Words keep the colour picked for them in the Video tab.";
+            return column![
+                section("Colour".to_string()),
+                ui_text(about)
+                    .size(theme::text_size(DETAIL_TEXT_SIZE))
+                    .font(theme::small_font())
+                    .color(theme::TEXT_DIM),
+            ]
+            .spacing(8)
+            .padding(PANEL_PADDING)
+            .into();
+        }
+        // While a slider is dragged, as it is being set.
+        let grade = match &self.grade_drag {
+            Some(Edit::SetGrade { grade, .. }) => *grade,
+            _ => clip.grade,
+        };
+        let slider_row = |setting: cannotcut_timeline::Setting| -> Element<'_, Message> {
+            let value = setting.get(&grade);
+            let slider = iced::widget::slider(setting.min..=setting.max, value, move |value| {
+                Message::GradeChanged(setting.set(&grade, value))
+            })
+            .step(0.01_f32)
+            .on_release(Message::GradeReleased);
+            let shown = if setting.neutral == 1.0 {
+                format!("{:.0}%", value * 100.0)
+            } else {
+                format!("{:+.0}", value * 100.0)
+            };
+            row![
+                ui_text(setting.name)
+                    .size(theme::text_size(DETAIL_TEXT_SIZE))
+                    .font(theme::small_font())
+                    .color(theme::TEXT_DIM)
+                    .width(DETAIL_LABEL_WIDTH),
+                slider,
+                ui_text(shown)
+                    .size(theme::text_size(DETAIL_TEXT_SIZE))
+                    .width(TRANSFORM_VALUE_WIDTH),
+            ]
+            .spacing(8)
+            .align_y(Center)
+            .into()
+        };
+        let settings = cannotcut_timeline::Grade::SETTINGS;
+        let (colour, filters) = settings.split_at(5);
+        let reset = button(theme::display("Reset"))
+            .style(theme::normal)
+            .on_press_maybe(
+                (!clip.grade.is_neutral())
+                    .then_some(Message::GradeChosen(cannotcut_timeline::Grade::NEUTRAL)),
+            );
+        let about = "Looks to start from are in the Effects tab.";
+        column![
+            section("Colour".to_string()),
+            Column::with_children(colour.iter().map(|setting| slider_row(*setting))).spacing(6),
+            section("Filters".to_string()),
+            Column::with_children(filters.iter().map(|setting| slider_row(*setting))).spacing(6),
+            row![reset].spacing(8),
+            ui_text(about)
+                .size(theme::text_size(DETAIL_TEXT_SIZE))
+                .font(theme::small_font())
+                .color(theme::TEXT_DIM),
+        ]
+        .spacing(10)
+        .padding(PANEL_PADDING)
+        .into()
+    }
+
+    /// The Effects tab: looks to give the selected clips, the one they have lit up.
+    fn look_list(&self) -> Element<'_, Message> {
+        let timeline = self.history.timeline();
+        let current = self
+            .selected_clip()
+            .and_then(|id| timeline.clip(id))
+            .filter(|(_, clip, _)| clip.media.title.is_none())
+            .map(|(_, clip, _)| clip.grade);
+        let can = !self.selected.is_empty();
+        let looks = cannotcut_timeline::LOOKS.map(|(name, look)| {
+            let lit = current == Some(look);
+            let entry = row![icon(Icon::Effects, ENTRY_ICON_SIZE, theme::TEXT_DIM), ui_text(name)]
+                .spacing(BAR_PADDING)
+                .align_y(Center);
+            button(entry)
+                .width(Fill)
+                .style(if lit { theme::on } else { theme::quiet })
+                .on_press_maybe(can.then_some(Message::GradeChosen(look)))
+                .into()
+        });
+        let about = if can {
+            "Pick a look for the selected clips. Fine-tune it in the Colour tab of Details."
+        } else {
+            "Select clips, then pick a look for them. Fine-tune it in the Colour tab of Details."
+        };
+        column![
+            ui_text(about)
+                .size(theme::text_size(DETAIL_TEXT_SIZE))
+                .font(theme::small_font())
+                .color(theme::TEXT_DIM),
+            Column::with_children(looks).spacing(2),
+        ]
+        .spacing(PANEL_PADDING)
         .padding(PANEL_PADDING)
         .into()
     }
@@ -1578,7 +1705,11 @@ fn text_tab<'a>(name: &'a str, shown: bool, show: Option<Message>) -> Element<'a
 const WINDOW_CONTROL_PADDING: [f32; 2] = [7.0, 12.0];
 const WINDOW_CONTROLS_WIDTH: f32 = 3.0 * (ICON_SIZE + 2.0 * WINDOW_CONTROL_PADDING[1]) + 4.0;
 
-fn window_controls<'a>(window: iced::window::Id, close: Message) -> Element<'a, Message> {
+fn window_controls<'a>(
+    window: iced::window::Id,
+    maximized: bool,
+    close: Message,
+) -> Element<'a, Message> {
     let control = |which: Icon, words: &'static str, does: Message, closes: bool| {
         let pressed = button(glyph(which, theme::TEXT))
             .padding(WINDOW_CONTROL_PADDING)
@@ -1588,7 +1719,11 @@ fn window_controls<'a>(window: iced::window::Id, close: Message) -> Element<'a, 
     };
     row![
         control(Icon::WindowMinimize, "Minimise", Message::WindowMinimized(window), false),
-        control(Icon::WindowMaximize, "Maximise", Message::WindowMaximized(window), false),
+        if maximized {
+            control(Icon::WindowRestore, "Restore", Message::WindowMaximized(window), false)
+        } else {
+            control(Icon::WindowMaximize, "Maximise", Message::WindowMaximized(window), false)
+        },
         control(Icon::WindowClose, "Close", close, true),
     ]
     .spacing(2)
@@ -1741,13 +1876,6 @@ fn tab_row<'a, const N: usize>(
         .padding([0.0, 4.0])
         .height(TAB_HEIGHT)
         .center_y(TAB_HEIGHT)
-        .into()
-}
-
-/// A panel's word on what is not built yet.
-fn coming<'a>(words: &'a str) -> Element<'a, Message> {
-    container(ui_text(words).size(theme::text_size(DETAIL_TEXT_SIZE)).font(theme::small_font()).color(theme::TEXT_DIM))
-        .padding(PANEL_PADDING)
         .into()
 }
 

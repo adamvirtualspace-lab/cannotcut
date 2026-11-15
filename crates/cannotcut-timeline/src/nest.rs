@@ -410,7 +410,7 @@ impl Timeline {
                     clip,
                     media_frame: clip.media_frame(0, self.rate),
                     folder: None,
-                    framing: Framing(vec![clip.transform_at(0)]),
+                    framing: Framing(vec![clip.transform_at(0)], clip.picture_grade()),
                     reveal: Reveal::FULL,
                 }),
                 Some(nested) => {
@@ -529,7 +529,7 @@ fn shots_through<'a>(
             clip,
             media_frame: frame,
             folder: None,
-            framing: Framing(vec![clip.transform_at(offset)]),
+            framing: Framing(vec![clip.transform_at(offset)], clip.picture_grade()),
             reveal,
         });
         return;

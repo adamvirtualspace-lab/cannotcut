@@ -78,6 +78,7 @@ icons! {
     WindowClose = "window-close",
     WindowMaximize = "window-maximize",
     WindowMinimize = "window-minimize",
+    WindowRestore = "window-restore",
 }
 
 /// `icon` in `color`, `size` logical pixels square.

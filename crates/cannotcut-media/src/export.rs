@@ -114,6 +114,127 @@ impl FilmPicture {
         self.alpha = Some(alpha);
     }
 
+    /// Changes the part `area` of the picture (left, top, width, height, in pixels; even): blurs
+    /// it `blur` pixels round; sharpens its luma, when `sharpen` is given, against the average of
+    /// the four pixels next to each; maps each pixel's luma and chroma (0 to 1) through `color`;
+    /// and darkens it by `vignette`, given its place across the area (-1 to 1 each way). Luma is
+    /// mapped with its pixel's chroma, chroma with its block's; `color` is to change luma by
+    /// luma alone and chroma by chroma alone.
+    pub fn adjust(
+        &mut self,
+        area: [u32; 4],
+        blur: f32,
+        sharpen: Option<&dyn Fn(f32, f32) -> f32>,
+        color: &dyn Fn(f32, f32, f32) -> (f32, f32, f32),
+        vignette: &dyn Fn(f32, f32) -> f32,
+    ) {
+        let [left, top, width, height] = area.map(|side| side as usize & !1);
+        if width == 0 || height == 0 {
+            return;
+        }
+        let (chroma_width, chroma_height) = (width / 2, height / 2);
+        let nv12 = self.frame.format() == Pixel::NV12;
+        // Out of the frame, 0 to 1.
+        let mut luma = vec![0.0f32; width * height];
+        let mut blue = vec![0.0f32; chroma_width * chroma_height];
+        let mut red = vec![0.0f32; chroma_width * chroma_height];
+        {
+            let stride = self.frame.stride(0);
+            let data = self.frame.data(0);
+            for row in 0..height {
+                let line = &data[(top + row) * stride + left..][..width];
+                for (out, value) in luma[row * width..][..width].iter_mut().zip(line) {
+                    *out = f32::from(*value) / 255.0;
+                }
+            }
+            for row in 0..chroma_height {
+                for column in 0..chroma_width {
+                    let (x, y) = (left / 2 + column, top / 2 + row);
+                    let (cb, cr) = if nv12 {
+                        let at = y * self.frame.stride(1) + 2 * x;
+                        (self.frame.data(1)[at], self.frame.data(1)[at + 1])
+                    } else {
+                        (
+                            self.frame.data(1)[y * self.frame.stride(1) + x],
+                            self.frame.data(2)[y * self.frame.stride(2) + x],
+                        )
+                    };
+                    blue[row * chroma_width + column] = f32::from(cb) / 255.0;
+                    red[row * chroma_width + column] = f32::from(cr) / 255.0;
+                }
+            }
+        }
+        if blur >= 0.5 {
+            box_blur(&mut luma, width, height, blur);
+            box_blur(&mut blue, chroma_width, chroma_height, blur / 2.0);
+            box_blur(&mut red, chroma_width, chroma_height, blur / 2.0);
+        }
+        if let Some(sharpen) = sharpen {
+            let source = luma.clone();
+            let at = |x: usize, y: usize| source[y.min(height - 1) * width + x.min(width - 1)];
+            for y in 0..height {
+                for x in 0..width {
+                    let around = (at(x.saturating_sub(1), y)
+                        + at(x + 1, y)
+                        + at(x, y.saturating_sub(1))
+                        + at(x, y + 1))
+                        / 4.0;
+                    luma[y * width + x] = sharpen(at(x, y), around);
+                }
+            }
+        }
+        // Across the area, -1 to 1 each way, at the middle of a pixel.
+        let across = |x: f32, y: f32| (x / width as f32 * 2.0 - 1.0, y / height as f32 * 2.0 - 1.0);
+        for y in 0..height {
+            for x in 0..width {
+                let block = (y / 2) * chroma_width + x / 2;
+                let (graded, _, _) = color(luma[y * width + x], blue[block], red[block]);
+                let (u, v) = across(x as f32 + 0.5, y as f32 + 0.5);
+                luma[y * width + x] = graded * vignette(u, v);
+            }
+        }
+        for y in 0..chroma_height {
+            for x in 0..chroma_width {
+                let at = y * chroma_width + x;
+                let (_, cb, cr) = color(0.5, blue[at], red[at]);
+                let (u, v) = across(2.0 * x as f32 + 1.0, 2.0 * y as f32 + 1.0);
+                let kept = vignette(u, v);
+                blue[at] = (cb - 0.5) * kept + 0.5;
+                red[at] = (cr - 0.5) * kept + 0.5;
+            }
+        }
+        // Back into the frame.
+        let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let stride = self.frame.stride(0);
+        let data = self.frame.data_mut(0);
+        for row in 0..height {
+            let line = &mut data[(top + row) * stride + left..][..width];
+            for (out, value) in line.iter_mut().zip(&luma[row * width..][..width]) {
+                *out = byte(*value);
+            }
+        }
+        for row in 0..chroma_height {
+            for column in 0..chroma_width {
+                let (x, y) = (left / 2 + column, top / 2 + row);
+                let (cb, cr) = (
+                    byte(blue[row * chroma_width + column]),
+                    byte(red[row * chroma_width + column]),
+                );
+                if nv12 {
+                    let at = y * self.frame.stride(1) + 2 * x;
+                    let data = self.frame.data_mut(1);
+                    data[at] = cb;
+                    data[at + 1] = cr;
+                } else {
+                    let at = y * self.frame.stride(1) + x;
+                    self.frame.data_mut(1)[at] = cb;
+                    let at = y * self.frame.stride(2) + x;
+                    self.frame.data_mut(2)[at] = cr;
+                }
+            }
+        }
+    }
+
     /// Lays a layer over this picture: the part `area` of `layer` (left, top, width, height in
     /// pixels: where a [`ClipReader`] drew its picture, fitted inside the frame), placed by
     /// `corners` (a 2x2 matrix column by column and an offset, from -1 to 1 across the picture
@@ -251,6 +372,31 @@ impl FilmPicture {
 }
 
 /// The value between four samples at `(x, y)`, read by `read` at whole positions.
+/// Blurs `values`, a `width` by `height` plane, about `radius` samples round: a box blur across
+/// and then down, twice, which comes close to a soft (Gaussian) one. Edges repeat outwards.
+fn box_blur(values: &mut [f32], width: usize, height: usize, radius: f32) {
+    // Two boxes of half-width `reach` spread about as far as `radius`.
+    let reach = (radius / 1.4).round().max(1.0) as usize;
+    let mut line = Vec::new();
+    for _ in 0..2 {
+        for (count, step, lines, line_step) in [(width, 1, height, width), (height, width, width, 1)]
+        {
+            for index in 0..lines {
+                let start = index * line_step;
+                line.clear();
+                line.extend((0..count).map(|at| values[start + at * step]));
+                let read = |at: isize| line[at.clamp(0, count as isize - 1) as usize];
+                let span = (2 * reach + 1) as f32;
+                let mut sum: f32 = (-(reach as isize)..=reach as isize).map(read).sum();
+                for at in 0..count {
+                    values[start + at * step] = sum / span;
+                    sum += read(at as isize + reach as isize + 1) - read(at as isize - reach as isize);
+                }
+            }
+        }
+    }
+}
+
 fn bilinear(read: impl Fn(f32, f32) -> f32, x: f32, y: f32) -> f32 {
     let (base_x, base_y) = (x.floor(), y.floor());
     let (fraction_x, fraction_y) = (x - base_x, y - base_y);

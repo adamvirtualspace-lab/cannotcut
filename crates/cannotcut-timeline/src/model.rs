@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
+use crate::Grade;
 use crate::nest::Nested;
 use crate::title::Title;
 use crate::transform::{Keyframe, Transform, transform_at};
@@ -264,6 +265,8 @@ pub struct Clip {
     /// How fast its media plays: 1 as recorded, 2 twice as fast, 0.5 half as fast. Its sound
     /// plays as fast, and goes up or down in pitch with it.
     pub speed: f64,
+    /// Its colour and filters (see [`Grade`]).
+    pub grade: Grade,
     pub extras: Extras,
 }
 
@@ -271,6 +274,16 @@ pub struct Clip {
 pub const SPEEDS: std::ops::RangeInclusive<f64> = 0.1..=10.0;
 
 impl Clip {
+    /// The colour and filters its picture is drawn with: its own, but none for words, which
+    /// are drawn in the colour chosen for them.
+    pub fn picture_grade(&self) -> Grade {
+        if self.media.title.is_some() {
+            Grade::NEUTRAL
+        } else {
+            self.grade
+        }
+    }
+
     /// Where the clip's picture sits `offset` timeline frames into the clip.
     pub fn transform_at(&self, offset: i64) -> Transform {
         transform_at(self.transform, &self.keyframes, self.source_at(offset))

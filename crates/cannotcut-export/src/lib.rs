@@ -242,6 +242,18 @@ fn make(
                 .draw(frame, drawn_into)
                 .map_err(|error| format!("{}: {error}", clip.name))?;
             if !plain && let Some(area) = reader.drawn_area() {
+                // Its colour and filters, worked out here as the viewer works them on the GPU.
+                let grade = shot.framing.1;
+                if !grade.is_neutral() {
+                    let sharpen = |y: f32, around: f32| grade.sharpened(y, around);
+                    spare.adjust(
+                        area,
+                        grade.blur_radius(area[3]),
+                        (grade.sharpen > 0.0).then_some(&sharpen as &dyn Fn(f32, f32) -> f32),
+                        &|y, cb, cr| grade.color(y, cb, cr),
+                        &|x, y| grade.vignette_at(x, y),
+                    );
+                }
                 let corners = shot.framing.corners(film_size, (area[2], area[3])).0;
                 let opacity = shot.framing.opacity() * shot.reveal.fade;
                 let wipe = shot.reveal.wipe.map(|wipe| (wipe.direction, wipe.threshold));

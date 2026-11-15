@@ -4,6 +4,7 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::Grade;
 use crate::model::{
     Clip, ClipId, Extras, Item, MAX_FRAMES, Media, Rate, SPEEDS, Timeline, Track, TrackKind,
     new_id,
@@ -80,6 +81,11 @@ pub enum Edit {
         clip: ClipId,
         transform: Transform,
     },
+    /// Changes a clip's colour and filters (see [`Grade`]); every setting within its range.
+    SetGrade {
+        clip: ClipId,
+        grade: Grade,
+    },
     /// Plays a clip's media faster or slower (see [`Clip::speed`]), within [`SPEEDS`]. The
     /// clip gets longer or shorter to play the same stretch of it, as far as the media lasts;
     /// on a magnetic track what follows moves along, elsewhere a longer clip needs the room.
@@ -142,6 +148,7 @@ impl Edit {
             Self::SetKeyframes { .. } => "Keyframes",
             Self::SetTransition { .. } => "Transition",
             Self::SetSpeed { .. } => "Speed",
+            Self::SetGrade { .. } => "Colour",
             Self::SetMagnetic { magnetic: true, .. } => "Magnetic track",
             Self::SetMagnetic { magnetic: false, .. } => "Free track",
             Self::Compound { .. } => "Compound clip",
@@ -286,6 +293,7 @@ impl Timeline {
                     keyframes: Vec::new(),
                     transition_in: None,
                     speed: 1.0,
+                    grade: Grade::NEUTRAL,
                     extras: Extras::default(),
                 };
                 let id = clip.id;
@@ -376,6 +384,16 @@ impl Timeline {
                 let (track, index) = self.locate(*clip)?;
                 if let Item::Clip(clip) = &mut Arc::make_mut(&mut self.tracks[track]).items[index] {
                     clip.transform = *transform;
+                }
+                Ok(None)
+            }
+            Edit::SetGrade { clip, grade } => {
+                if !grade.is_valid() {
+                    return Err(EditError::OutOfBounds);
+                }
+                let (track, index) = self.locate(*clip)?;
+                if let Item::Clip(clip) = &mut Arc::make_mut(&mut self.tracks[track]).items[index] {
+                    clip.grade = *grade;
                 }
                 Ok(None)
             }
@@ -472,6 +490,7 @@ impl Timeline {
                     keyframes: Vec::new(),
                     transition_in: None,
                     speed: 1.0,
+                    grade: Grade::NEUTRAL,
                     extras: Extras::default(),
                 };
                 let id = clip.id;

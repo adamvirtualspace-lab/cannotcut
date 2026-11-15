@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
+use crate::Grade;
 use crate::Error;
 use crate::model::{
     Clip, Extras, FrameRange, Item, Media, Rate, SPEEDS, Timeline, Track, TrackKind, new_id,
@@ -428,6 +429,7 @@ fn read_clip(clip: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error
     };
     let mut extras = extras(clip);
     let speed = take_speed(&mut extras.effects);
+    let grade = take_grade(&mut extras.effects);
     let own = extras.metadata.remove(OWN_METADATA);
     let volume = own
         .as_ref()
@@ -455,6 +457,7 @@ fn read_clip(clip: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Error
         keyframes,
         transition_in: None,
         speed,
+        grade,
         extras,
     })
 }
@@ -464,6 +467,7 @@ fn read_inside(stack: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Er
     let name = text_of(stack, "name");
     let mut extras = extras(stack);
     let speed = take_speed(&mut extras.effects);
+    let grade = take_grade(&mut extras.effects);
     let own = extras.metadata.remove(OWN_METADATA).unwrap_or(Value::Null);
     let inner_rate = read_own_rate(&own)
         .or_else(|| first_rate(stack))
@@ -530,6 +534,7 @@ fn read_inside(stack: &Object, rate: Rate, next_id: &mut u64) -> Result<Clip, Er
         keyframes,
         transition_in: None,
         speed,
+        grade,
         extras,
     })
 }
@@ -672,9 +677,50 @@ fn take_speed(effects: &mut Vec<Value>) -> f64 {
     }
 }
 
-/// A clip's effects as written: those read with it, and its speed when it has one.
+/// The name cannotcut's own colour and filters go by among a clip's effects.
+const GRADE_EFFECT: &str = "cannotcut.grade";
+
+/// A clip's colour and filters, from cannotcut's own effect, taken out of its effects; neutral
+/// when it has none, or one that does not make sense.
+fn take_grade(effects: &mut Vec<Value>) -> Grade {
+    let is_grade = |effect: &Value| {
+        effect.get("effect_name").and_then(Value::as_str) == Some(GRADE_EFFECT)
+    };
+    let Some(index) = effects.iter().position(is_grade) else {
+        return Grade::NEUTRAL;
+    };
+    let effect = effects.remove(index);
+    let mut grade = Grade::NEUTRAL;
+    if let Some(metadata) = effect.get("metadata") {
+        for setting in Grade::SETTINGS {
+            let key = setting.name.to_lowercase();
+            if let Some(value) = metadata.get(&key).and_then(Value::as_f64) {
+                grade = setting.set(&grade, value as f32);
+            }
+        }
+    }
+    if grade.is_valid() { grade } else { Grade::NEUTRAL }
+}
+
+/// A clip's effects as written: those read with it, its colour and filters when it has any,
+/// and its speed when it has one.
 fn effects_with_speed(clip: &Clip) -> Vec<Value> {
     let mut effects = clip.extras.effects.clone();
+    if !clip.grade.is_neutral() {
+        let settings: serde_json::Map<String, Value> = Grade::SETTINGS
+            .iter()
+            .map(|setting| {
+                let value = (f64::from(setting.get(&clip.grade)) * 1000.0).round() / 1000.0;
+                (setting.name.to_lowercase(), json!(value))
+            })
+            .collect();
+        effects.push(json!({
+            "OTIO_SCHEMA": "Effect.1",
+            "name": "",
+            "effect_name": GRADE_EFFECT,
+            "metadata": settings,
+        }));
+    }
     if clip.speed != 1.0 {
         effects.push(json!({
             "OTIO_SCHEMA": "LinearTimeWarp.1",
@@ -970,6 +1016,40 @@ mod tests {
         let text = timeline.to_otio();
         assert!(text.contains("LinearTimeWarp.1"), "{text}");
         assert_eq!(Timeline::from_otio(&text).unwrap(), timeline);
+    }
+
+    #[test]
+    fn colour_and_filters_are_kept_reach_the_picture_and_undo() {
+        let rate = Rate::new(30, 1);
+        let media = Arc::new(Media::from_path(Path::new("a.mp4"), rate, 300));
+        let mut history = crate::History::new(Timeline::new("graded", rate));
+        let place = Edit::Place {
+            track: 0,
+            at: 0,
+            clip: crate::NewClip {
+                name: "a".to_string(),
+                media,
+                source_start: 0,
+                duration: 60,
+            },
+            mode: crate::Placement::Insert,
+        };
+        let id = history.apply(&place).unwrap().unwrap();
+        let (_, film) = crate::LOOKS[6];
+        history.apply(&Edit::SetGrade { clip: id, grade: film }).unwrap();
+        let timeline = history.timeline();
+        // Seen by the viewer and the export, through the picture's framing.
+        assert_eq!(timeline.shots_at(10)[0].framing.1, film);
+        // Kept in the file as an effect of its own, and read back as it was.
+        let text = timeline.to_otio();
+        assert!(text.contains("cannotcut.grade"), "{text}");
+        assert_eq!(Timeline::from_otio(&text).unwrap(), *timeline);
+        // Out of range is refused; undo puts it back as recorded.
+        let wild = crate::Grade { saturation: 5.0, ..film };
+        assert!(history.apply(&Edit::SetGrade { clip: id, grade: wild }).is_err());
+        assert!(history.undo());
+        assert!(history.timeline().clip(id).unwrap().1.grade.is_neutral());
+        assert!(!history.timeline().to_otio().contains("cannotcut.grade"));
     }
 
     #[test]

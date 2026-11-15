@@ -414,6 +414,11 @@ enum Message {
     TransitionRemoved,
     /// A text clip put in at the playhead, over the clips there.
     TextAdded,
+    /// The selected clip's colour, while one of its sliders is dragged: shown, not yet an edit.
+    GradeChanged(cannotcut_timeline::Grade),
+    GradeReleased,
+    /// The selected clips to take this colour and filters.
+    GradeChosen(cannotcut_timeline::Grade),
     /// The selected clip's speed slider, dragged: the speed's base-ten logarithm.
     SpeedChanged(f32),
     SpeedReleased,
@@ -478,6 +483,8 @@ enum Message {
     WindowDragged(window::Id),
     /// The pointer over a window's title bar, from the window's corner.
     BarPointer(window::Id, iced::Point),
+    /// Whether a window is maximized, as asked after it changed size.
+    MaximizedIs(window::Id, bool),
     /// A window's title bar pressed: it moves the window once the pointer moves, so that a
     /// click or a double-click on it stays one.
     BarPressed(window::Id),
@@ -879,6 +886,8 @@ struct App {
     /// Files waiting for their waveform to be read, one at a time.
     waveform_queue: VecDeque<(String, PathBuf)>,
     reading_waveform: bool,
+    /// The colour edit a slider makes, shown before it is made.
+    grade_drag: Option<Edit>,
     /// The volume the slider stands at while it is dragged.
     volume_drag: Option<f32>,
     /// The length being dragged for the selected clip's transition, in frames.
@@ -935,6 +944,8 @@ struct App {
     /// A window's title bar pressed, until the pointer moves (which moves the window) or the
     /// button is let go.
     bar_pressed: Option<window::Id>,
+    /// The windows maximized, for the button that maximizes them or puts them back.
+    maximized: HashSet<window::Id>,
     /// A panel window being moved by its title bar, and where it would go if let go now.
     moving_away: Option<MovingAway>,
     drop_target: Option<DropTarget>,
@@ -1129,6 +1140,7 @@ impl App {
             waveform_queue: VecDeque::new(),
             reading_waveform: false,
             volume_drag: None,
+            grade_drag: None,
             transform_drag: None,
             transition_drag: None,
             title_drag: None,
@@ -1157,6 +1169,7 @@ impl App {
             window_size: HashMap::new(),
             bar_pointer: HashMap::new(),
             bar_pressed: None,
+            maximized: HashSet::new(),
             moving_away: None,
             drop_target: None,
             panel_motion: None,
@@ -2814,6 +2827,53 @@ impl App {
                 }
             }
             Message::TextAdded => return self.add_text(),
+            Message::GradeChanged(grade) => {
+                // Shown in the viewer while dragging; made an edit once let go.
+                if let Some(clip) = self.selected_clip() {
+                    let edit = Edit::SetGrade { clip, grade };
+                    let mut timeline = self.history.timeline().clone();
+                    if timeline.apply(&edit).is_ok() {
+                        self.grade_drag = Some(edit);
+                        self.preview = Some(Preview {
+                            timeline,
+                            look_at: None,
+                        });
+                        self.place_again();
+                    }
+                }
+            }
+            Message::GradeReleased => {
+                self.preview = None;
+                if let Some(edit) = self.grade_drag.take() {
+                    let task = self.edit(&edit);
+                    self.place_again();
+                    return task;
+                }
+            }
+            Message::GradeChosen(grade) => {
+                let timeline = self.history.timeline();
+                // Every selected clip with a picture of its own; words keep their colour.
+                let edits: Vec<Edit> = self
+                    .selected
+                    .iter()
+                    .filter(|id| {
+                        timeline
+                            .clip(**id)
+                            .is_some_and(|(_, clip, _)| clip.media.title.is_none())
+                    })
+                    .map(|&clip| Edit::SetGrade { clip, grade })
+                    .collect();
+                if edits.is_empty() {
+                    self.notice = Some("Select a clip first, then pick its look".to_string());
+                    return Task::none();
+                }
+                let task = self.edit(&Edit::Many {
+                    label: "Colour",
+                    edits,
+                });
+                self.place_again();
+                return task;
+            }
             Message::SpeedChanged(power) => {
                 let speed = 10f64.powf(f64::from(power));
                 self.speed_drag = Some(round_speed(speed));
@@ -3100,7 +3160,17 @@ impl App {
             }
             Message::WindowResizedTo(window, size) => {
                 self.window_size.insert(window, size);
-                return self.update(Message::WindowMoved(window));
+                let moved = self.update(Message::WindowMoved(window));
+                let maximized = window::is_maximized(window)
+                    .map(move |maximized| Message::MaximizedIs(window, maximized));
+                return Task::batch([moved, maximized]);
+            }
+            Message::MaximizedIs(window, maximized) => {
+                if maximized {
+                    self.maximized.insert(window);
+                } else {
+                    self.maximized.remove(&window);
+                }
             }
             Message::WindowMoved(window) => {
                 // Over the whole screen it is where it was before; that is what is kept.

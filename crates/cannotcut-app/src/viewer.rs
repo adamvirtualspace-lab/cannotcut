@@ -14,7 +14,7 @@ use iced::widget::shader::{self, Viewport};
 use iced::{Element, Event, Length, Rectangle, Size, mouse, wgpu};
 
 /// A 4x4 matrix and four vectors of four; see `Uniforms` in the shader.
-const UNIFORM_FLOATS: usize = 32;
+const UNIFORM_FLOATS: usize = 44;
 const UNIFORM_BYTES: usize = UNIFORM_FLOATS * size_of::<f32>();
 /// The value 8-bit chroma samples take for "no colour", as sampled from a texture.
 const NEUTRAL_CHROMA: f32 = 128.0 / 255.0;
@@ -119,6 +119,7 @@ impl shader::Primitive for Composite {
                 wipe: reveal.wipe.map_or([0.0, 0.0, 1.0], |wipe| {
                     [wipe.direction[0], wipe.direction[1], wipe.threshold]
                 }),
+                grade: framing.1.uniforms(),
             };
             pipeline.load(device, queue, slot, &picture.0, placed);
         }
@@ -163,6 +164,8 @@ struct Placed {
     opacity: f32,
     /// A wipe's direction and threshold (see `Wipe`).
     wipe: [f32; 3],
+    /// Its colour and filters, as `Grade::uniforms` gives them.
+    grade: [f32; 8],
 }
 
 /// GPU state of the viewer. iced keeps one for all pictures, which is right while there is a
@@ -379,6 +382,10 @@ impl Pipeline {
         uniforms[24] = placed.opacity;
         uniforms[25] = f32::from(u8::from(self.linear_target));
         uniforms[28..31].copy_from_slice(&placed.wipe);
+        uniforms[32..40].copy_from_slice(&placed.grade);
+        // For blurring and sharpening: the picture's height over its width, and a pixel's size.
+        let (width, height) = (picture.width.max(1) as f32, picture.height.max(1) as f32);
+        uniforms[40..43].copy_from_slice(&[height / width, 1.0 / width, 1.0 / height]);
         let mut bytes = [0; UNIFORM_BYTES];
         for (chunk, value) in bytes.chunks_exact_mut(size_of::<f32>()).zip(uniforms) {
             chunk.copy_from_slice(&value.to_ne_bytes());

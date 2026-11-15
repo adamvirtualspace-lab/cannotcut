@@ -3,6 +3,8 @@
 
 use serde_json::{Value, json};
 
+use crate::Grade;
+
 /// A clip's picture in the frame. The picture is first fitted inside the frame, keeping its
 /// shape, centred; then it is slanted, scaled and turned about its centre, and moved.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -183,7 +185,7 @@ impl Affine {
 /// and its own clip's last. Each nested project's whole frame is placed in the frame around it
 /// as a picture is.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Framing(pub Vec<Transform>);
+pub struct Framing(pub Vec<Transform>, pub Grade);
 
 impl Framing {
     /// Where a picture of `picture` pixels goes in a frame of `frame` pixels. Nested projects
@@ -204,7 +206,7 @@ impl Framing {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.0.iter().all(Transform::is_identity)
+        self.0.iter().all(Transform::is_identity) && self.1.is_neutral()
     }
 
     /// The picture's own clip's transform.
@@ -343,7 +345,7 @@ mod tests {
             opacity: 0.8,
             ..Transform::IDENTITY
         };
-        let placement = Framing(vec![outer, inner]);
+        let placement = Framing(vec![outer, inner], Grade::NEUTRAL);
         // The inner picture's centre is half a frame right in the nested project; that project
         // is half as big and a quarter of the width right: a half plus a quarter of the width.
         let corners = placement.corners(frame, frame);
@@ -351,7 +353,7 @@ mod tests {
         assert_near(corners.apply([1.0, 1.0]), [1.25, 0.25]);
         assert!((placement.opacity() - 0.4).abs() < 1e-6);
         assert_eq!(placement.own(), inner);
-        assert!(Framing(vec![Transform::IDENTITY]).is_identity());
+        assert!(Framing(vec![Transform::IDENTITY], Grade::NEUTRAL).is_identity());
     }
 
     #[test]

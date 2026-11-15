@@ -8,6 +8,7 @@
 //! Nothing here touches media files or the screen; project files are read and written here.
 
 mod edit;
+mod grade;
 mod model;
 mod nest;
 mod otio;
@@ -18,6 +19,7 @@ mod transition;
 use std::fmt;
 
 pub use edit::{Edge, Edit, EditError, History, NewClip, Placement};
+pub use grade::{Grade, LOOKS, Setting};
 pub use model::{
     Clip, ClipId, Extras, FrameRange, Item, Media, Rate, SPEEDS, Timeline, Track, TrackKind,
 };

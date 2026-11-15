@@ -33,6 +33,8 @@
 - Animate those changes with keyframes
 - Add text titles and transitions (fade or wipe)
 - Speed clips up or slow them down (0.1× to 10×)
+- Change colour (brightness, contrast, saturation, warmth, tint) and add blur, sharpen or a vignette
+- Start from a ready-made look: black & white, warm, cool, vivid, faded, film or dream
 
 **Finish**
 - Export to MP4, up to 4K
@@ -46,8 +48,6 @@
 <p align="center">
   <img src="docs/images/compact.png" alt="cannotcut in a small window, halfway through a wipe transition" width="60%">
 </p>
-
-**Coming soon:** colour correction and filters.
 
 ## Keyboard shortcuts
 
